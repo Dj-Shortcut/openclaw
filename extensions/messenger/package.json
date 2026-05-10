@@ -1,0 +1,43 @@
+{
+  "name": "@openclaw/messenger",
+  "version": "2026.5.10-beta.1",
+  "private": true,
+  "description": "OpenClaw Messenger channel plugin",
+  "type": "module",
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@openclaw/plugin-sdk": "workspace:*",
+    "openclaw": "workspace:*"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "setupEntry": "./setup-entry.ts",
+    "channel": {
+      "id": "messenger",
+      "label": "Messenger",
+      "selectionLabel": "Messenger (Facebook Page)",
+      "detailLabel": "Messenger Page",
+      "docsPath": "/channels/messenger",
+      "docsLabel": "messenger",
+      "blurb": "Facebook Page Messenger DMs via Meta webhooks.",
+      "systemImage": "message.fill",
+      "quickstartAllowFrom": true,
+      "configuredState": {
+        "env": {
+          "allOf": [
+            "MESSENGER_PAGE_ID",
+            "MESSENGER_PAGE_ACCESS_TOKEN",
+            "MESSENGER_APP_SECRET",
+            "MESSENGER_VERIFY_TOKEN"
+          ]
+        },
+        "specifier": "./configured-state",
+        "exportName": "hasMessengerConfiguredState"
+      }
+    }
+  }
+}

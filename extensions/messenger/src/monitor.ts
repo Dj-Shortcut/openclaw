@@ -1,0 +1,360 @@
+import { createChannelPairingChallengeIssuer } from "openclaw/plugin-sdk/channel-pairing";
+import { shouldComputeCommandAuthorized } from "openclaw/plugin-sdk/command-auth-native";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { resolveStableChannelMessageIngress } from "openclaw/plugin-sdk/channel-ingress-runtime";
+import { hasFinalChannelTurnDispatch } from "openclaw/plugin-sdk/channel-message";
+import {
+  formatInboundEnvelope,
+  resolveInboundSessionEnvelopeContext,
+} from "openclaw/plugin-sdk/channel-inbound";
+import { finalizeInboundContext } from "openclaw/plugin-sdk/reply-dispatch-runtime";
+import { resolveAgentRoute } from "openclaw/plugin-sdk/routing";
+import { danger, logVerbose, waitForAbortSignal, type RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  beginWebhookRequestPipelineOrReject,
+  createWebhookInFlightLimiter,
+} from "openclaw/plugin-sdk/webhook-request-guards";
+import {
+  normalizePluginHttpPath,
+  registerWebhookTargetWithPluginRoute,
+  resolveSingleWebhookTarget,
+} from "openclaw/plugin-sdk/webhook-ingress";
+import {
+  readChannelAllowFromStore,
+  upsertChannelPairingRequest,
+} from "openclaw/plugin-sdk/conversation-runtime";
+import { resolveDefaultMessengerAccountId } from "./accounts.js";
+import { getMessengerRuntime } from "./runtime.js";
+import { sendMessengerText } from "./send.js";
+import {
+  extractMessengerTextMessages,
+  handleMessengerWebhookVerification,
+  readVerifiedMessengerWebhookBody,
+} from "./webhook.js";
+import type { MessengerWebhookMessaging, ResolvedMessengerAccount } from "./types.js";
+
+export interface MonitorMessengerProviderOptions {
+  account: ResolvedMessengerAccount;
+  config: OpenClawConfig;
+  runtime: RuntimeEnv;
+  abortSignal?: AbortSignal;
+  webhookPath?: string;
+}
+
+type MessengerWebhookTarget = {
+  account: ResolvedMessengerAccount;
+  path: string;
+  runtime: RuntimeEnv;
+};
+
+const messengerWebhookTargets = new Map<string, MessengerWebhookTarget[]>();
+const messengerWebhookInFlightLimiter = createWebhookInFlightLimiter();
+
+async function sendMessengerPairingReply(params: {
+  senderId: string;
+  account: ResolvedMessengerAccount;
+  cfg: OpenClawConfig;
+}) {
+  await createChannelPairingChallengeIssuer({
+    channel: "messenger",
+    upsertPairingRequest: async ({ id, meta }) =>
+      await upsertChannelPairingRequest({
+        channel: "messenger",
+        id,
+        accountId: params.account.accountId,
+        meta,
+      }),
+  })({
+    senderId: params.senderId,
+    senderIdLine: `Your Messenger PSID: ${params.senderId}`,
+    onCreated: () => logVerbose(`messenger pairing request sender=${params.senderId}`),
+    sendPairingReply: async (text) => {
+      await sendMessengerText(params.senderId, text, {
+        cfg: params.cfg,
+        accountId: params.account.accountId,
+      });
+    },
+  });
+}
+
+async function shouldProcessMessengerEvent(params: {
+  event: MessengerWebhookMessaging;
+  cfg: OpenClawConfig;
+  account: ResolvedMessengerAccount;
+}) {
+  const senderId = params.event.sender?.id ?? "";
+  const rawText = params.event.message?.text ?? "";
+  const access = await resolveStableChannelMessageIngress({
+    channelId: "messenger",
+    accountId: params.account.accountId,
+    identity: {
+      key: "messenger-psid",
+      normalize: (value) => value.trim().replace(/^messenger:(?:user:)?/i, ""),
+      sensitivity: "pii",
+      entryIdPrefix: "messenger-entry",
+    },
+    cfg: params.cfg,
+    readStoreAllowFrom: async () =>
+      await readChannelAllowFromStore("messenger", undefined, params.account.accountId),
+    subject: { stableId: senderId },
+    conversation: {
+      kind: "direct",
+      id: senderId || "unknown",
+    },
+    event: { kind: "message" },
+    dmPolicy: params.account.config.dmPolicy ?? "pairing",
+    groupPolicy: "disabled",
+    policy: {
+      activation: {
+        requireMention: false,
+        allowTextCommands: true,
+      },
+    },
+    allowFrom: (params.account.config.allowFrom ?? []).map((value) => String(value)),
+    groupAllowFrom: [],
+    command: {
+      hasControlCommand: shouldComputeCommandAuthorized(rawText, params.cfg),
+      groupOwnerAllowFrom: "none",
+    },
+  });
+
+  if (access.senderAccess.decision === "allow") {
+    return true;
+  }
+  if (access.senderAccess.decision === "pairing") {
+    if (senderId) {
+      await sendMessengerPairingReply({ senderId, account: params.account, cfg: params.cfg });
+    }
+    return false;
+  }
+  logVerbose(
+    `Blocked messenger sender ${senderId || "unknown"} (dmPolicy: ${
+      params.account.config.dmPolicy ?? "pairing"
+    })`,
+  );
+  return false;
+}
+
+async function processMessengerEvent(params: {
+  event: MessengerWebhookMessaging;
+  cfg: OpenClawConfig;
+  account: ResolvedMessengerAccount;
+  runtime: RuntimeEnv;
+}) {
+  if (!(await shouldProcessMessengerEvent(params))) {
+    return;
+  }
+  const senderId = params.event.sender?.id ?? "";
+  const text = params.event.message?.text ?? "";
+  const route = resolveAgentRoute({
+    cfg: params.cfg,
+    channel: "messenger",
+    accountId: params.account.accountId,
+    peer: { kind: "direct", id: senderId },
+  });
+  const { storePath, envelopeOptions, previousTimestamp } = resolveInboundSessionEnvelopeContext({
+    cfg: params.cfg,
+    agentId: route.agentId,
+    sessionKey: route.sessionKey,
+  });
+  const timestamp = params.event.timestamp ?? Date.now();
+  const body = formatInboundEnvelope({
+    channel: "Messenger",
+    from: `messenger:${senderId}`,
+    timestamp,
+    body: text,
+    chatType: "direct",
+    sender: { id: senderId },
+    previousTimestamp,
+    envelope: envelopeOptions,
+  });
+  const ctxPayload = finalizeInboundContext({
+    Body: body,
+    BodyForAgent: text,
+    RawBody: text,
+    CommandBody: text,
+    From: `messenger:${senderId}`,
+    To: `messenger:${senderId}`,
+    SessionKey: route.sessionKey,
+    AccountId: route.accountId,
+    ChatType: "direct",
+    ConversationLabel: `messenger:${senderId}`,
+    SenderId: senderId,
+    Provider: "messenger",
+    Surface: "messenger",
+    MessageSid: normalizeOptionalString(params.event.message?.mid) ?? `${senderId}:${timestamp}`,
+    Timestamp: timestamp,
+    CommandAuthorized: shouldComputeCommandAuthorized(text, params.cfg),
+    OriginatingChannel: "messenger" as const,
+    OriginatingTo: `messenger:${senderId}`,
+  });
+  const core = getMessengerRuntime();
+  const turnResult = await core.channel.turn.run({
+    channel: "messenger",
+    accountId: route.accountId,
+    raw: params.event,
+    adapter: {
+      ingest: () => ({
+        id: ctxPayload.MessageSid ?? `${senderId}:${timestamp}`,
+        rawText: text,
+      }),
+      resolveTurn: () => ({
+        cfg: params.cfg,
+        channel: "messenger",
+        accountId: route.accountId,
+        agentId: route.agentId,
+        routeSessionKey: route.sessionKey,
+        storePath,
+        ctxPayload,
+        recordInboundSession: core.channel.session.recordInboundSession,
+        dispatchReplyWithBufferedBlockDispatcher:
+          core.channel.reply.dispatchReplyWithBufferedBlockDispatcher,
+        record: {
+          updateLastRoute: {
+            sessionKey: route.mainSessionKey,
+            channel: "messenger",
+            to: senderId,
+            accountId: route.accountId,
+          },
+          onRecordError: (err: unknown) =>
+            logVerbose(`messenger: failed updating session meta: ${String(err)}`),
+        },
+        replyPipeline: {},
+        delivery: {
+          deliver: async (payload) => {
+            if (!payload.text?.trim()) {
+              return;
+            }
+            await sendMessengerText(senderId, payload.text, {
+              cfg: params.cfg,
+              accountId: params.account.accountId,
+            });
+          },
+          onError: (err, info) => {
+            params.runtime.error?.(danger(`messenger ${info.kind} reply failed: ${String(err)}`));
+          },
+        },
+      }),
+    },
+  });
+  const dispatchResult = turnResult.dispatched ? turnResult.dispatchResult : undefined;
+  if (!hasFinalChannelTurnDispatch(dispatchResult)) {
+    logVerbose(`messenger: no response generated for message from ${senderId}`);
+  }
+}
+
+export async function monitorMessengerProvider(
+  opts: MonitorMessengerProviderOptions,
+): Promise<{ stop: () => void }> {
+  const accountId = opts.account.accountId ?? resolveDefaultMessengerAccountId(opts.config);
+  const normalizedPath =
+    normalizePluginHttpPath(opts.webhookPath ?? opts.account.config.webhookPath, "/messenger/webhook") ??
+    "/messenger/webhook";
+
+  const { unregister } = registerWebhookTargetWithPluginRoute({
+    targetsByPath: messengerWebhookTargets,
+    target: {
+      account: opts.account,
+      path: normalizedPath,
+      runtime: opts.runtime,
+    },
+    route: {
+      auth: "plugin",
+      pluginId: "messenger",
+      accountId,
+      log: (message) => logVerbose(message),
+      handler: async (req, res) => {
+        const targets = messengerWebhookTargets.get(normalizedPath) ?? [];
+        if (req.method === "GET") {
+          const firstTarget = targets[0];
+          if (!firstTarget) {
+            res.statusCode = 404;
+            res.end("Not Found");
+            return;
+          }
+          handleMessengerWebhookVerification({
+            url: new URL(req.url ?? "", "http://localhost"),
+            verifyToken: firstTarget.account.verifyToken,
+            res,
+          });
+          return;
+        }
+        const requestLifecycle = beginWebhookRequestPipelineOrReject({
+          req,
+          res,
+          allowMethods: ["GET", "POST"],
+          inFlightLimiter: messengerWebhookInFlightLimiter,
+          inFlightKey: `messenger:${normalizedPath}`,
+          requireJsonContentType: true,
+        });
+        if (!requestLifecycle.ok) {
+          return;
+        }
+        try {
+          const signatureHeader = req.headers["x-hub-signature-256"];
+          const signature =
+            typeof signatureHeader === "string"
+              ? signatureHeader
+              : Array.isArray(signatureHeader)
+                ? (signatureHeader[0] ?? "")
+                : "";
+          const match = resolveSingleWebhookTarget(targets, (target) => {
+            void target;
+            return Boolean(signature.trim());
+          });
+          if (match.kind === "none") {
+            res.statusCode = 404;
+            res.end("Not Found");
+            return;
+          }
+          const target = match.kind === "ambiguous" ? targets[0] : match.target;
+          const verified = await readVerifiedMessengerWebhookBody({
+            req,
+            res,
+            appSecret: target.account.appSecret,
+          });
+          if (!verified.ok) {
+            return;
+          }
+          for (const event of extractMessengerTextMessages(verified.body)) {
+            await processMessengerEvent({
+              event,
+              cfg: opts.config,
+              account: target.account,
+              runtime: target.runtime,
+            });
+          }
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ status: "ok" }));
+        } catch (error) {
+          opts.runtime.error?.(danger(`messenger webhook error: ${String(error)}`));
+          if (!res.headersSent) {
+            res.statusCode = 500;
+            res.end("Internal Server Error");
+          }
+        } finally {
+          requestLifecycle.release();
+        }
+      },
+    },
+  });
+
+  logVerbose(`messenger: registered webhook handler at ${normalizedPath}`);
+  let stopped = false;
+  const stop = () => {
+    if (stopped) {
+      return;
+    }
+    stopped = true;
+    unregister();
+  };
+  if (opts.abortSignal?.aborted) {
+    stop();
+  } else if (opts.abortSignal) {
+    opts.abortSignal.addEventListener("abort", stop, { once: true });
+    await waitForAbortSignal(opts.abortSignal);
+  }
+  return { stop };
+}
