@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "codex/**"
+      - "feat/**"
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.16.0"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+
+      - name: Docs list
+        run: pnpm docs:list
+
+      - name: Check changed files
+        run: pnpm check:changed
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+
+      - name: Messenger tests
+        run: |
+          if [ -d extensions/messenger ]; then
+            pnpm test extensions/messenger
+          else
+            echo "extensions/messenger does not exist yet; skipping"
+          fi
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+
+      - name: Build
+        run: pnpm build
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
