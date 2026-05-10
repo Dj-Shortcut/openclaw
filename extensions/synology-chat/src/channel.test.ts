@@ -30,8 +30,18 @@ function expectIncludesSubstring(values: readonly string[], expected: string): v
   expect(values.some((value) => value.includes(expected))).toBe(true);
 }
 
+function stringifyMockMessage(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value === null || value === undefined) {
+    return "";
+  }
+  return JSON.stringify(value) ?? "";
+}
+
 function mockStringMessages(mock: { mock: { calls: unknown[][] } }): string[] {
-  return mock.mock.calls.map((call) => String(call[0] ?? ""));
+  return mock.mock.calls.map((call) => stringifyMockMessage(call[0]));
 }
 
 const clientModule = await import("./client.js");
