@@ -104,8 +104,18 @@ function createConfigWithDiscordAccount(overrides: Record<string, unknown> = {})
 
 type MockCallReader = { mock: { calls: unknown[][] } };
 
+function stringifyMockMessage(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value === null || value === undefined) {
+    return "";
+  }
+  return JSON.stringify(value) ?? "";
+}
+
 function mockMessages(mock: unknown): string[] {
-  return (mock as MockCallReader).mock.calls.map((call) => String(call[0] ?? ""));
+  return (mock as MockCallReader).mock.calls.map((call) => stringifyMockMessage(call[0]));
 }
 
 function expectMockLogContains(mock: unknown, expected: string): void {
