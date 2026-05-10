@@ -120,6 +120,16 @@ function resetTelegramWebhookMocks(): void {
 
 type MockCallReader = { mock: { calls: unknown[][] } };
 
+function stringifyMockMessage(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value === null || value === undefined) {
+    return "";
+  }
+  return JSON.stringify(value) ?? "";
+}
+
 function requireRecord(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`expected ${label} to be an object`);
@@ -136,7 +146,7 @@ function requireMockCall(mock: unknown, index: number, label: string): unknown[]
 }
 
 function mockMessages(mock: unknown): string[] {
-  return (mock as MockCallReader).mock.calls.map((call) => String(call[0] ?? ""));
+  return (mock as MockCallReader).mock.calls.map((call) => stringifyMockMessage(call[0]));
 }
 
 function expectMockMessageContains(mock: unknown, expected: string): void {
