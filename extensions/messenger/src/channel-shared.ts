@@ -46,10 +46,18 @@ export const messengerChannelPluginCommon = {
     isConfigured: (account: ResolvedMessengerAccount) => hasMessengerCredentials(account),
     unconfiguredReason: (account: ResolvedMessengerAccount) => {
       const missing = [];
-      if (!account.pageId.trim()) missing.push("pageId");
-      if (!account.pageAccessToken.trim()) missing.push("pageAccessToken");
-      if (!account.appSecret.trim()) missing.push("appSecret");
-      if (!account.verifyToken.trim()) missing.push("verifyToken");
+      if (!account.pageId.trim()) {
+        missing.push("pageId");
+      }
+      if (!account.pageAccessToken.trim()) {
+        missing.push("pageAccessToken");
+      }
+      if (!account.appSecret.trim()) {
+        missing.push("appSecret");
+      }
+      if (!account.verifyToken.trim()) {
+        missing.push("verifyToken");
+      }
       return missing.length ? `not configured: missing ${missing.join(", ")}` : "not configured";
     },
     describeAccount: (account: ResolvedMessengerAccount) =>

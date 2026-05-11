@@ -72,11 +72,12 @@ export async function sendMessengerText(
       }),
     });
   } catch (error) {
-    throw new Error(`Messenger send failed: ${formatErrorMessage(error)}`);
+    throw new Error(`Messenger send failed: ${formatErrorMessage(error)}`, { cause: error });
   }
-  const body = (await response.json().catch(() => null)) as
-    | { message_id?: string; recipient_id?: string }
-    | unknown;
+  const body = (await response.json().catch(() => null)) as {
+    message_id?: string;
+    recipient_id?: string;
+  } | null;
   if (!response.ok) {
     throw new Error(formatMessengerApiError(body));
   }

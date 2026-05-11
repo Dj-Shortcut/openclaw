@@ -36,7 +36,8 @@ describe("sendMessengerText", () => {
       }),
     );
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    const body = JSON.parse(String(init.body));
+    expect(typeof init.body).toBe("string");
+    const body = JSON.parse(init.body as string);
     expect(body).toEqual({
       recipient: { id: "psid-1" },
       messaging_type: "RESPONSE",
