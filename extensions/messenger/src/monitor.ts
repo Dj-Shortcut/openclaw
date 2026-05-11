@@ -1,38 +1,44 @@
-import { createChannelPairingChallengeIssuer } from "openclaw/plugin-sdk/channel-pairing";
-import { shouldComputeCommandAuthorized } from "openclaw/plugin-sdk/command-auth-native";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import { resolveStableChannelMessageIngress } from "openclaw/plugin-sdk/channel-ingress-runtime";
-import { hasFinalChannelTurnDispatch } from "openclaw/plugin-sdk/channel-message";
 import {
   formatInboundEnvelope,
   resolveInboundSessionEnvelopeContext,
 } from "openclaw/plugin-sdk/channel-inbound";
-import { finalizeInboundContext } from "openclaw/plugin-sdk/reply-dispatch-runtime";
-import { resolveAgentRoute } from "openclaw/plugin-sdk/routing";
-import { danger, logVerbose, waitForAbortSignal, type RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
-import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
-import {
-  beginWebhookRequestPipelineOrReject,
-  createWebhookInFlightLimiter,
-} from "openclaw/plugin-sdk/webhook-request-guards";
-import {
-  normalizePluginHttpPath,
-  registerWebhookTargetWithPluginRoute,
-  resolveSingleWebhookTarget,
-} from "openclaw/plugin-sdk/webhook-ingress";
+import { resolveStableChannelMessageIngress } from "openclaw/plugin-sdk/channel-ingress-runtime";
+import { hasFinalChannelTurnDispatch } from "openclaw/plugin-sdk/channel-message";
+import { createChannelPairingChallengeIssuer } from "openclaw/plugin-sdk/channel-pairing";
+import { shouldComputeCommandAuthorized } from "openclaw/plugin-sdk/command-auth-native";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   readChannelAllowFromStore,
   upsertChannelPairingRequest,
 } from "openclaw/plugin-sdk/conversation-runtime";
+import { finalizeInboundContext } from "openclaw/plugin-sdk/reply-dispatch-runtime";
+import { resolveAgentRoute } from "openclaw/plugin-sdk/routing";
+import {
+  danger,
+  logVerbose,
+  waitForAbortSignal,
+  type RuntimeEnv,
+} from "openclaw/plugin-sdk/runtime-env";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  normalizePluginHttpPath,
+  registerWebhookTargetWithPluginRoute,
+} from "openclaw/plugin-sdk/webhook-ingress";
+import {
+  beginWebhookRequestPipelineOrReject,
+  createWebhookInFlightLimiter,
+  readWebhookBodyOrReject,
+} from "openclaw/plugin-sdk/webhook-request-guards";
 import { resolveDefaultMessengerAccountId } from "./accounts.js";
 import { getMessengerRuntime } from "./runtime.js";
 import { sendMessengerText } from "./send.js";
-import {
-  extractMessengerTextMessages,
-  handleMessengerWebhookVerification,
-  readVerifiedMessengerWebhookBody,
-} from "./webhook.js";
-import type { MessengerWebhookMessaging, ResolvedMessengerAccount } from "./types.js";
+import { validateMessengerSignature } from "./signature.js";
+import type {
+  MessengerWebhookBody,
+  MessengerWebhookMessaging,
+  ResolvedMessengerAccount,
+} from "./types.js";
+import { extractMessengerTextMessages, handleMessengerWebhookVerification } from "./webhook.js";
 
 export interface MonitorMessengerProviderOptions {
   account: ResolvedMessengerAccount;
@@ -50,6 +56,20 @@ type MessengerWebhookTarget = {
 
 const messengerWebhookTargets = new Map<string, MessengerWebhookTarget[]>();
 const messengerWebhookInFlightLimiter = createWebhookInFlightLimiter();
+
+export function resolveMessengerEventTarget(
+  targets: MessengerWebhookTarget[],
+  event: MessengerWebhookMessaging,
+): MessengerWebhookTarget | null {
+  const pageId = event.recipient?.id?.trim();
+  if (!pageId) {
+    return targets.length === 1 ? (targets[0] ?? null) : null;
+  }
+  return (
+    targets.find((target) => target.account.pageId === pageId) ??
+    (targets.length === 1 ? (targets[0] ?? null) : null)
+  );
+}
 
 async function sendMessengerPairingReply(params: {
   senderId: string;
@@ -249,8 +269,10 @@ export async function monitorMessengerProvider(
 ): Promise<{ stop: () => void }> {
   const accountId = opts.account.accountId ?? resolveDefaultMessengerAccountId(opts.config);
   const normalizedPath =
-    normalizePluginHttpPath(opts.webhookPath ?? opts.account.config.webhookPath, "/messenger/webhook") ??
-    "/messenger/webhook";
+    normalizePluginHttpPath(
+      opts.webhookPath ?? opts.account.config.webhookPath,
+      "/messenger/webhook",
+    ) ?? "/messenger/webhook";
 
   const { unregister } = registerWebhookTargetWithPluginRoute({
     targetsByPath: messengerWebhookTargets,
@@ -299,25 +321,39 @@ export async function monitorMessengerProvider(
               : Array.isArray(signatureHeader)
                 ? (signatureHeader[0] ?? "")
                 : "";
-          const match = resolveSingleWebhookTarget(targets, (target) => {
-            void target;
-            return Boolean(signature.trim());
-          });
-          if (match.kind === "none") {
-            res.statusCode = 404;
-            res.end("Not Found");
-            return;
-          }
-          const target = match.kind === "ambiguous" ? targets[0] : match.target;
-          const verified = await readVerifiedMessengerWebhookBody({
+          const raw = await readWebhookBodyOrReject({
             req,
             res,
-            appSecret: target.account.appSecret,
+            profile: "pre-auth",
+            invalidBodyMessage: "Invalid webhook body",
           });
-          if (!verified.ok) {
+          if (!raw.ok) {
             return;
           }
-          for (const event of extractMessengerTextMessages(verified.body)) {
+          const matchingTargets = targets.filter((target) =>
+            validateMessengerSignature(raw.value, signature, target.account.appSecret),
+          );
+          if (matchingTargets.length === 0) {
+            res.statusCode = 401;
+            res.end("Invalid signature");
+            return;
+          }
+          let body: unknown;
+          try {
+            body = JSON.parse(raw.value);
+          } catch {
+            res.statusCode = 400;
+            res.end("Invalid webhook payload");
+            return;
+          }
+          for (const event of extractMessengerTextMessages(body as MessengerWebhookBody)) {
+            const target = resolveMessengerEventTarget(matchingTargets, event);
+            if (!target) {
+              logVerbose(
+                `messenger: skipped event for unmatched page ${event.recipient?.id ?? "unknown"}`,
+              );
+              continue;
+            }
             await processMessengerEvent({
               event,
               cfg: opts.config,

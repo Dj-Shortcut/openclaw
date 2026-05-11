@@ -1,6 +1,6 @@
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
-import type { OpenClawConfig } from "./channel-api.js";
 import { resolveMessengerAccount } from "./accounts.js";
+import type { OpenClawConfig } from "./channel-api.js";
 import { createMessengerSendReceipt } from "./send-receipt.js";
 import type { MessengerSendResult } from "./types.js";
 
@@ -81,8 +81,13 @@ export async function sendMessengerText(
     throw new Error(formatMessengerApiError(body));
   }
   const result = body as { message_id?: string; recipient_id?: string };
-  const messageId = result.message_id?.trim() || "messenger-message";
-  const recipientId = result.recipient_id?.trim() || to;
+  const messageId = result.message_id?.trim();
+  const recipientId = result.recipient_id?.trim();
+  if (!messageId || !recipientId) {
+    throw new Error(
+      "Messenger send succeeded but response did not include message_id and recipient_id.",
+    );
+  }
   return {
     messageId,
     recipientId,

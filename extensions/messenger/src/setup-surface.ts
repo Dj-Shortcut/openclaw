@@ -3,13 +3,6 @@ import {
   createStandardChannelSetupStatus,
   mergeAllowFromEntries,
 } from "openclaw/plugin-sdk/setup";
-import { resolveDefaultMessengerAccountId, resolveMessengerAccount } from "./accounts.js";
-import {
-  isMessengerConfigured,
-  listMessengerAccountIds,
-  parseMessengerAllowFromId,
-  patchMessengerAccountConfig,
-} from "./setup-core.js";
 import {
   DEFAULT_ACCOUNT_ID,
   formatDocsLink,
@@ -18,6 +11,13 @@ import {
   type ChannelSetupDmPolicy,
   type ChannelSetupWizard,
 } from "openclaw/plugin-sdk/setup";
+import { resolveDefaultMessengerAccountId, resolveMessengerAccount } from "./accounts.js";
+import {
+  isMessengerConfigured,
+  listMessengerAccountIds,
+  parseMessengerAllowFromId,
+  patchMessengerAccountConfig,
+} from "./setup-core.js";
 
 const channel = "messenger" as const;
 
@@ -65,7 +65,17 @@ const messengerDmPolicy: ChannelSetupDmPolicy = {
                 ["*"],
               ),
             }
-          : { dmPolicy: policy },
+          : policy === "allowlist"
+            ? {
+                dmPolicy: "allowlist",
+                allowFrom: (
+                  resolveMessengerAccount({
+                    cfg,
+                    accountId: accountId ?? resolveDefaultMessengerAccountId(cfg),
+                  }).config.allowFrom ?? []
+                ).filter((entry) => String(entry).trim() !== "*"),
+              }
+            : { dmPolicy: policy },
       clearFields: policy === "pairing" || policy === "disabled" ? ["allowFrom"] : undefined,
     }),
 };

@@ -1047,6 +1047,19 @@ importers:
         specifier: workspace:*
         version: link:../..
 
+  extensions/messenger:
+    dependencies:
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
+    devDependencies:
+      '@openclaw/plugin-sdk':
+        specifier: workspace:*
+        version: link:../../packages/plugin-sdk
+      openclaw:
+        specifier: workspace:*
+        version: link:../..
+
   extensions/microsoft:
     dependencies:
       node-edge-tts:
