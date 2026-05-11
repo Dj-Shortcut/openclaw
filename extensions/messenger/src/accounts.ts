@@ -142,14 +142,9 @@ export function resolveMessengerAccount(params: {
   });
   const pageId = resolvePageId({ accountId, baseConfig: messengerConfig, accountConfig });
 
-  const {
-    accounts: _ignoredAccounts,
-    defaultAccount: _ignoredDefaultAccount,
-    ...baseConfig
-  } = (messengerConfig ?? {}) as MessengerConfig & {
-    accounts?: unknown;
-    defaultAccount?: unknown;
-  };
+  const baseConfig = { ...messengerConfig };
+  delete baseConfig.accounts;
+  delete baseConfig.defaultAccount;
   const mergedConfig: MessengerConfig & MessengerAccountConfig = {
     ...baseConfig,
     ...accountConfig,

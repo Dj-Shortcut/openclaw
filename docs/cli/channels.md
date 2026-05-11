@@ -69,7 +69,7 @@ Common non-interactive add surfaces include:
 - bot-token channels: `--token`, `--bot-token`, `--app-token`, `--token-file`
 - Signal/iMessage transport fields: `--signal-number`, `--cli-path`, `--http-url`, `--http-host`, `--http-port`, `--db-path`, `--service`, `--region`
 - Google Chat fields: `--webhook-path`, `--webhook-url`, `--audience-type`, `--audience`
-- Messenger fields: `--webhook-path`, Page ID, Page access token, app secret, and verify token
+- Messenger fields: `--webhook-path`, `--page-id`, `--page-access-token`, `--app-secret`, and `--verify-token`
 - Matrix fields: `--homeserver`, `--user-id`, `--access-token`, `--password`, `--device-name`, `--initial-sync-limit`
 - Nostr fields: `--private-key`, `--relay-urls`
 - Tlon fields: `--ship`, `--url`, `--code`, `--group-channels`, `--dm-allowlist`, `--auto-discover-channels`

@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { resolveMessengerEventTarget } from "./monitor.js";
+import {
+  redactMessengerIdentifier,
+  resolveMessengerEventTarget,
+  resolveMessengerVerificationTarget,
+} from "./monitor.js";
 
-function messengerTarget(accountId: string, pageId: string) {
+function messengerTarget(accountId: string, pageId: string, verifyToken = "verify") {
   return {
     account: {
       accountId,
@@ -9,7 +13,7 @@ function messengerTarget(accountId: string, pageId: string) {
       pageId,
       pageAccessToken: "token",
       appSecret: "secret",
-      verifyToken: "verify",
+      verifyToken,
       tokenSource: "config",
       config: {},
     },
@@ -33,5 +37,27 @@ describe("resolveMessengerEventTarget", () => {
         recipient: { id: "page-3" },
       }),
     ).toBeNull();
+  });
+});
+
+describe("resolveMessengerVerificationTarget", () => {
+  it("matches GET verification tokens across same-path accounts", () => {
+    const first = messengerTarget("first", "page-1", "first-token");
+    const second = messengerTarget("second", "page-2", "second-token");
+    const url = new URL(
+      "https://example.test/messenger/webhook?hub.mode=subscribe&hub.verify_token=second-token&hub.challenge=ok",
+    );
+
+    expect(resolveMessengerVerificationTarget([first, second], url)).toBe(second);
+  });
+});
+
+describe("redactMessengerIdentifier", () => {
+  it("redacts stable ids without exposing the raw value", () => {
+    const redacted = redactMessengerIdentifier("1234567890");
+
+    expect(redacted).toMatch(/^sha256:[a-f0-9]{12}$/);
+    expect(redacted).not.toContain("1234567890");
+    expect(redactMessengerIdentifier("1234567890")).toBe(redacted);
   });
 });

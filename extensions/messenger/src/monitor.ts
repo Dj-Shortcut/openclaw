@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   formatInboundEnvelope,
   resolveInboundSessionEnvelopeContext,
@@ -57,6 +58,14 @@ type MessengerWebhookTarget = {
 const messengerWebhookTargets = new Map<string, MessengerWebhookTarget[]>();
 const messengerWebhookInFlightLimiter = createWebhookInFlightLimiter();
 
+export function redactMessengerIdentifier(value: string | undefined): string {
+  const normalized = value?.trim();
+  if (!normalized) {
+    return "unknown";
+  }
+  return `sha256:${createHash("sha256").update(normalized).digest("hex").slice(0, 12)}`;
+}
+
 export function resolveMessengerEventTarget(
   targets: MessengerWebhookTarget[],
   event: MessengerWebhookMessaging,
@@ -69,6 +78,17 @@ export function resolveMessengerEventTarget(
     targets.find((target) => target.account.pageId === pageId) ??
     (targets.length === 1 ? (targets[0] ?? null) : null)
   );
+}
+
+export function resolveMessengerVerificationTarget(
+  targets: MessengerWebhookTarget[],
+  url: URL,
+): MessengerWebhookTarget | null {
+  if (url.searchParams.get("hub.mode") !== "subscribe") {
+    return null;
+  }
+  const verifyToken = url.searchParams.get("hub.verify_token") ?? "";
+  return targets.find((target) => target.account.verifyToken === verifyToken) ?? null;
 }
 
 async function sendMessengerPairingReply(params: {
@@ -88,7 +108,8 @@ async function sendMessengerPairingReply(params: {
   })({
     senderId: params.senderId,
     senderIdLine: `Your Messenger PSID: ${params.senderId}`,
-    onCreated: () => logVerbose(`messenger pairing request sender=${params.senderId}`),
+    onCreated: () =>
+      logVerbose(`messenger pairing request sender=${redactMessengerIdentifier(params.senderId)}`),
     sendPairingReply: async (text) => {
       await sendMessengerText(params.senderId, text, {
         cfg: params.cfg,
@@ -149,7 +170,7 @@ async function shouldProcessMessengerEvent(params: {
     return false;
   }
   logVerbose(
-    `Blocked messenger sender ${senderId || "unknown"} (dmPolicy: ${
+    `Blocked messenger sender ${redactMessengerIdentifier(senderId)} (dmPolicy: ${
       params.account.config.dmPolicy ?? "pairing"
     })`,
   );
@@ -260,7 +281,9 @@ async function processMessengerEvent(params: {
   });
   const dispatchResult = turnResult.dispatched ? turnResult.dispatchResult : undefined;
   if (!hasFinalChannelTurnDispatch(dispatchResult)) {
-    logVerbose(`messenger: no response generated for message from ${senderId}`);
+    logVerbose(
+      `messenger: no response generated for message from ${redactMessengerIdentifier(senderId)}`,
+    );
   }
 }
 
@@ -295,9 +318,16 @@ export async function monitorMessengerProvider(
             res.end("Not Found");
             return;
           }
+          const url = new URL(req.url ?? "", "http://localhost");
+          const target = resolveMessengerVerificationTarget(targets, url);
+          if (!target) {
+            res.statusCode = 403;
+            res.end("Forbidden");
+            return;
+          }
           handleMessengerWebhookVerification({
-            url: new URL(req.url ?? "", "http://localhost"),
-            verifyToken: firstTarget.account.verifyToken,
+            url,
+            verifyToken: target.account.verifyToken,
             res,
           });
           return;
@@ -350,7 +380,9 @@ export async function monitorMessengerProvider(
             const target = resolveMessengerEventTarget(matchingTargets, event);
             if (!target) {
               logVerbose(
-                `messenger: skipped event for unmatched page ${event.recipient?.id ?? "unknown"}`,
+                `messenger: skipped event for unmatched page ${redactMessengerIdentifier(
+                  event.recipient?.id,
+                )}`,
               );
               continue;
             }
