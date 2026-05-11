@@ -5,6 +5,7 @@ import { createMessengerSendReceipt } from "./send-receipt.js";
 import type { MessengerSendResult } from "./types.js";
 
 const DEFAULT_GRAPH_API_VERSION = "v20.0";
+const MESSENGER_SEND_TIMEOUT_MS = 10_000;
 
 type FetchLike = typeof fetch;
 
@@ -57,10 +58,13 @@ export async function sendMessengerText(
   const fetchImpl = opts.fetch ?? fetch;
   const version = resolveGraphApiVersion(account.config.graphApiVersion);
   const url = `https://graph.facebook.com/${version}/${encodeURIComponent(account.pageId)}/messages`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MESSENGER_SEND_TIMEOUT_MS);
   let response: Response;
   try {
     response = await fetchImpl(url, {
       method: "POST",
+      signal: controller.signal,
       headers: {
         Authorization: `Bearer ${account.pageAccessToken}`,
         "Content-Type": "application/json",
@@ -73,6 +77,8 @@ export async function sendMessengerText(
     });
   } catch (error) {
     throw new Error(`Messenger send failed: ${formatErrorMessage(error)}`, { cause: error });
+  } finally {
+    clearTimeout(timeout);
   }
   const body = (await response.json().catch(() => null)) as {
     message_id?: string;

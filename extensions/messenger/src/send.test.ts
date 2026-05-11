@@ -1,7 +1,11 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { sendMessengerText } from "./send.js";
 
 describe("sendMessengerText", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("sends RESPONSE messages to the Page messages endpoint", async () => {
     const fetchMock = vi.fn(
       async (_url: string, _init?: RequestInit) =>
@@ -103,5 +107,37 @@ describe("sendMessengerText", () => {
         fetch: fetchMock as never,
       }),
     ).rejects.toThrow("response did not include message_id and recipient_id");
+  });
+
+  it("aborts stalled Graph API sends", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(
+      async (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        }),
+    );
+
+    const result = sendMessengerText("psid-1", "hello", {
+      cfg: {
+        channels: {
+          messenger: {
+            pageId: "page-1",
+            pageAccessToken: "token-1",
+            appSecret: "secret-1",
+            verifyToken: "verify-1",
+          },
+        },
+      } as never,
+      fetch: fetchMock as never,
+    });
+
+    const expectedFailure = expect(result).rejects.toThrow("Messenger send failed");
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expectedFailure;
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(init.signal?.aborted).toBe(true);
   });
 });
