@@ -3,9 +3,14 @@ import {
   redactMessengerIdentifier,
   resolveMessengerEventTarget,
   resolveMessengerVerificationTarget,
+  type MessengerWebhookTarget,
 } from "./monitor.js";
 
-function messengerTarget(accountId: string, pageId: string, verifyToken = "verify") {
+function messengerTarget(
+  accountId: string,
+  pageId: string,
+  verifyToken = "verify",
+): MessengerWebhookTarget {
   return {
     account: {
       accountId,
@@ -18,8 +23,12 @@ function messengerTarget(accountId: string, pageId: string, verifyToken = "verif
       config: {},
     },
     path: "/messenger/webhook",
-    runtime: {},
-  } as never;
+    runtime: {
+      log: () => {},
+      error: () => {},
+      exit: () => {},
+    },
+  };
 }
 
 describe("resolveMessengerEventTarget", () => {

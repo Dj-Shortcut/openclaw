@@ -49,7 +49,7 @@ export interface MonitorMessengerProviderOptions {
   webhookPath?: string;
 }
 
-type MessengerWebhookTarget = {
+export type MessengerWebhookTarget = {
   account: ResolvedMessengerAccount;
   path: string;
   runtime: RuntimeEnv;
