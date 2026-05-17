@@ -50,10 +50,10 @@ jobs:
 
       - name: Messenger tests
         run: |
-          if [ -d extensions/messenger ]; then
-            pnpm test extensions/messenger
+          if [ -d extensions/facebook ]; then
+            pnpm test extensions/facebook
           else
-            echo "extensions/messenger does not exist yet; skipping"
+            echo "extensions/facebook does not exist yet; skipping"
           fi
         env:
           NODE_OPTIONS: --max-old-space-size=8192

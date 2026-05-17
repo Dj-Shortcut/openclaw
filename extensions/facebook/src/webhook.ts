@@ -1,9 +1,11 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import {
-  readWebhookBodyOrReject,
-} from "openclaw/plugin-sdk/webhook-request-guards";
+import { readWebhookBodyOrReject } from "openclaw/plugin-sdk/webhook-request-guards";
 import { validateMessengerSignature } from "./signature.js";
-import type { MessengerWebhookBody, MessengerWebhookMessaging } from "./types.js";
+import {
+  MessengerWebhookBodySchema,
+  type MessengerWebhookBody,
+  type MessengerWebhookMessaging,
+} from "./types.js";
 
 export function handleMessengerWebhookVerification(params: {
   url: URL;
@@ -58,13 +60,34 @@ export async function readVerifiedMessengerWebhookBody(params: {
     return { ok: false };
   }
   try {
-    const body = JSON.parse(raw.value) as MessengerWebhookBody;
-    return { ok: true, body };
+    const parsed = parseMessengerWebhookBody(raw.value);
+    if (!parsed.ok) {
+      params.res.statusCode = 400;
+      params.res.end("Invalid webhook payload");
+      return { ok: false };
+    }
+    return { ok: true, body: parsed.body };
   } catch {
     params.res.statusCode = 400;
     params.res.end("Invalid webhook payload");
     return { ok: false };
   }
+}
+
+export function parseMessengerWebhookBody(
+  raw: string,
+): { ok: true; body: MessengerWebhookBody } | { ok: false } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { ok: false };
+  }
+  const result = MessengerWebhookBodySchema.safeParse(parsed);
+  if (!result.success) {
+    return { ok: false };
+  }
+  return { ok: true, body: result.data };
 }
 
 export function extractMessengerTextMessages(

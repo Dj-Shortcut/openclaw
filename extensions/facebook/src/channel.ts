@@ -36,7 +36,10 @@ export const messengerPlugin: ChannelPlugin<ResolvedMessengerAccount> = createCh
     messaging: {
       targetPrefixes: ["messenger", "fbm"],
       normalizeTarget: (target) =>
-        target.trim().replace(/^messenger:(?:user:)?/i, "").replace(/^fbm:/i, "") || undefined,
+        target
+          .trim()
+          .replace(/^messenger:(?:user:)?/i, "")
+          .replace(/^fbm:/i, "") || undefined,
       targetResolver: {
         looksLikeId: (id) => {
           const trimmed = id?.trim();
@@ -63,7 +66,7 @@ export const messengerPlugin: ChannelPlugin<ResolvedMessengerAccount> = createCh
             cfg,
             accountId: accountId ?? undefined,
           }) ?? resolveMessengerAccount({ cfg, accountId: accountId ?? undefined });
-        if (!account.pageAccessToken) {
+        if (!account.pageAccessToken.trim()) {
           throw new Error("Messenger Page access token not configured");
         }
         const sendText =

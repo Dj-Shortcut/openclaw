@@ -14,12 +14,7 @@ import {
 } from "openclaw/plugin-sdk/conversation-runtime";
 import { finalizeInboundContext } from "openclaw/plugin-sdk/reply-dispatch-runtime";
 import { resolveAgentRoute } from "openclaw/plugin-sdk/routing";
-import {
-  danger,
-  logVerbose,
-  waitForAbortSignal,
-  type RuntimeEnv,
-} from "openclaw/plugin-sdk/runtime-env";
+import { danger, logVerbose, type RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   normalizePluginHttpPath,
@@ -34,12 +29,12 @@ import { resolveDefaultMessengerAccountId } from "./accounts.js";
 import { getMessengerRuntime } from "./runtime.js";
 import { sendMessengerText } from "./send.js";
 import { validateMessengerSignature } from "./signature.js";
-import type {
-  MessengerWebhookBody,
-  MessengerWebhookMessaging,
-  ResolvedMessengerAccount,
-} from "./types.js";
-import { extractMessengerTextMessages, handleMessengerWebhookVerification } from "./webhook.js";
+import type { MessengerWebhookMessaging, ResolvedMessengerAccount } from "./types.js";
+import {
+  extractMessengerTextMessages,
+  handleMessengerWebhookVerification,
+  parseMessengerWebhookBody,
+} from "./webhook.js";
 
 export interface MonitorMessengerProviderOptions {
   account: ResolvedMessengerAccount;
@@ -152,7 +147,7 @@ async function shouldProcessMessengerEvent(params: {
         allowTextCommands: true,
       },
     },
-    allowFrom: (params.account.config.allowFrom ?? []).map((value) => String(value)),
+    allowFrom: params.account.config.allowFrom ?? [],
     groupAllowFrom: [],
     command: {
       hasControlCommand: shouldComputeCommandAuthorized(rawText, params.cfg),
@@ -368,15 +363,13 @@ export async function monitorMessengerProvider(
             res.end("Invalid signature");
             return;
           }
-          let body: unknown;
-          try {
-            body = JSON.parse(raw.value);
-          } catch {
+          const parsed = parseMessengerWebhookBody(raw.value);
+          if (!parsed.ok) {
             res.statusCode = 400;
             res.end("Invalid webhook payload");
             return;
           }
-          for (const event of extractMessengerTextMessages(body as MessengerWebhookBody)) {
+          for (const event of extractMessengerTextMessages(parsed.body)) {
             const target = resolveMessengerEventTarget(matchingTargets, event);
             if (!target) {
               logVerbose(
@@ -422,7 +415,6 @@ export async function monitorMessengerProvider(
     stop();
   } else if (opts.abortSignal) {
     opts.abortSignal.addEventListener("abort", stop, { once: true });
-    await waitForAbortSignal(opts.abortSignal);
   }
   return { stop };
 }

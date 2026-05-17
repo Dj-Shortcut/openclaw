@@ -27,7 +27,7 @@ const MESSENGER_SETUP_HELP_LINES = [
   "3) Copy the app secret and choose a webhook verify token",
   "4) In the Meta Dashboard, set the callback URL to https://<gateway-host>/messenger/webhook",
   "5) Subscribe the Page webhook to the messages field",
-  `Docs: ${formatDocsLink("/channels/messenger", "channels/messenger")}`,
+  `Docs: ${formatDocsLink("/channels/facebook", "channels/facebook")}`,
 ];
 
 const messengerDmPolicy: ChannelSetupDmPolicy = {
@@ -111,7 +111,7 @@ export const messengerSetupWizard: ChannelSetupWizard = {
       "Allowlist Messenger DMs by Page-scoped ID (PSID).",
       "Example: 1234567890123456",
       "Multiple entries: comma-separated.",
-      `Docs: ${formatDocsLink("/channels/messenger", "channels/messenger")}`,
+      `Docs: ${formatDocsLink("/channels/facebook", "channels/facebook")}`,
     ],
     message: "Messenger allowFrom (PSID)",
     placeholder: "1234567890123456",
@@ -133,7 +133,7 @@ export const messengerSetupWizard: ChannelSetupWizard = {
       "Configure the webhook in the Meta Dashboard after saving credentials.",
       "Default webhook URL: https://<gateway-host>/messenger/webhook",
       "Subscribe to the messages field. OpenClaw does not call /subscribed_apps automatically.",
-      `Docs: ${formatDocsLink("/channels/messenger", "channels/messenger")}`,
+      `Docs: ${formatDocsLink("/channels/facebook", "channels/facebook")}`,
     ],
   },
   disable: (cfg) => setSetupChannelEnabled(cfg, channel, false),

@@ -1047,7 +1047,7 @@ importers:
         specifier: workspace:*
         version: link:../..
 
-  extensions/messenger:
+  extensions/facebook:
     dependencies:
       zod:
         specifier: ^4.4.3

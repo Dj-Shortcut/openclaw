@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   redactMessengerIdentifier,
+  monitorMessengerProvider,
   resolveMessengerEventTarget,
   resolveMessengerVerificationTarget,
   type MessengerWebhookTarget,
@@ -68,5 +69,23 @@ describe("redactMessengerIdentifier", () => {
     expect(redacted).toMatch(/^sha256:[a-f0-9]{12}$/);
     expect(redacted).not.toContain("1234567890");
     expect(redactMessengerIdentifier("1234567890")).toBe(redacted);
+  });
+});
+
+describe("monitorMessengerProvider", () => {
+  it("returns the stop handle without waiting for abort", async () => {
+    const abortController = new AbortController();
+    const target = messengerTarget("default", "page-1");
+
+    const handle = await monitorMessengerProvider({
+      account: target.account,
+      config: { channels: {} } as never,
+      runtime: target.runtime,
+      abortSignal: abortController.signal,
+    });
+
+    expect(handle.stop).toEqual(expect.any(Function));
+    handle.stop();
+    abortController.abort();
   });
 });

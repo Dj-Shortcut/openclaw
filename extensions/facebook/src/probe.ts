@@ -26,18 +26,27 @@ export async function probeMessengerPage(params: {
         signal: controller.signal,
       },
     );
-    const body = (await response.json().catch(() => null)) as { id?: string; name?: string } | null;
+    const body = (await response.json().catch(() => null)) as {
+      id?: unknown;
+      name?: unknown;
+    } | null;
     if (!response.ok) {
       return {
         ok: false,
         error: `Messenger Page probe failed with HTTP ${response.status}`,
       };
     }
+    if (!body || typeof body.id !== "string" || !body.id.trim()) {
+      return {
+        ok: false,
+        error: "Messenger Page probe returned an invalid response",
+      };
+    }
     return {
       ok: true,
       page: {
-        id: body?.id,
-        name: body?.name,
+        id: body.id,
+        name: typeof body.name === "string" ? body.name : undefined,
       },
     };
   } catch (error) {

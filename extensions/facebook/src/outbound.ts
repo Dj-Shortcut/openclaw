@@ -20,10 +20,14 @@ export const messengerOutboundAdapter: NonNullable<
   textChunkLimit: MESSENGER_TEXT_CHUNK_LIMIT,
   chunker: (text, limit) => getMessengerRuntime().channel.text.chunkMarkdownText(text, limit),
   sendPayload: async ({ to, payload, accountId, cfg }) => {
+    const text = payload.text?.trim();
+    if (!text) {
+      throw new Error("Messenger outbound text payload is required.");
+    }
     const sendText =
       getMessengerRuntime().channel.messenger?.sendMessengerText ??
       (await loadMessengerRuntime()).sendMessengerText;
-    const result = await sendText(to, payload.text ?? "", {
+    const result = await sendText(to, text, {
       cfg,
       accountId: accountId ?? undefined,
     });

@@ -21,7 +21,7 @@
       "label": "Messenger",
       "selectionLabel": "Messenger (Facebook Page)",
       "detailLabel": "Messenger Page",
-      "docsPath": "/channels/messenger",
+      "docsPath": "/channels/facebook",
       "docsLabel": "messenger",
       "blurb": "Facebook Page Messenger DMs via Meta webhooks.",
       "systemImage": "message.fill",

@@ -66,7 +66,7 @@ export function isMessengerConfigured(cfg: OpenClawConfig, accountId: string): b
 
 export function parseMessengerAllowFromId(value: string): string | null {
   const normalized = value.trim().replace(/^messenger:(?:user:)?/i, "");
-  return normalized || null;
+  return normalized && normalized !== "*" ? normalized : null;
 }
 
 export const messengerSetupAdapter: ChannelSetupAdapter = {

@@ -1,5 +1,6 @@
 import type { BaseProbeResult } from "openclaw/plugin-sdk/channel-contract";
 import type { MessageReceipt } from "openclaw/plugin-sdk/channel-message";
+import { z } from "zod";
 
 export type MessengerTokenSource = "config" | "env" | "file" | "none";
 
@@ -13,7 +14,7 @@ interface MessengerAccountBaseConfig {
   verifyToken?: string;
   verifyTokenFile?: string;
   name?: string;
-  allowFrom?: Array<string | number>;
+  allowFrom?: string[];
   dmPolicy?: "open" | "allowlist" | "pairing" | "disabled";
   responsePrefix?: string;
   webhookPath?: string;
@@ -53,22 +54,31 @@ export type MessengerProbeResult = BaseProbeResult<string> & {
   };
 };
 
-export type MessengerWebhookMessaging = {
-  sender?: { id?: string };
-  recipient?: { id?: string };
-  timestamp?: number;
-  message?: {
-    mid?: string;
-    text?: string;
-    is_echo?: boolean;
-  };
-};
+export const MessengerWebhookMessagingSchema = z.object({
+  sender: z.object({ id: z.string().optional() }).optional(),
+  recipient: z.object({ id: z.string().optional() }).optional(),
+  timestamp: z.number().optional(),
+  message: z
+    .object({
+      mid: z.string().optional(),
+      text: z.string().optional(),
+      is_echo: z.boolean().optional(),
+    })
+    .optional(),
+});
 
-export type MessengerWebhookBody = {
-  object?: string;
-  entry?: Array<{
-    id?: string;
-    time?: number;
-    messaging?: MessengerWebhookMessaging[];
-  }>;
-};
+export const MessengerWebhookBodySchema = z.object({
+  object: z.string().optional(),
+  entry: z
+    .array(
+      z.object({
+        id: z.string().optional(),
+        time: z.number().optional(),
+        messaging: z.array(MessengerWebhookMessagingSchema).optional(),
+      }),
+    )
+    .optional(),
+});
+
+export type MessengerWebhookMessaging = z.infer<typeof MessengerWebhookMessagingSchema>;
+export type MessengerWebhookBody = z.infer<typeof MessengerWebhookBodySchema>;

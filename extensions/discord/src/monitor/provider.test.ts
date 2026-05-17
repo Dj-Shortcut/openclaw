@@ -111,7 +111,11 @@ function stringifyMockMessage(value: unknown): string {
   if (value === null || value === undefined) {
     return "";
   }
-  return JSON.stringify(value) ?? "";
+  try {
+    return JSON.stringify(value) ?? "";
+  } catch {
+    return String(value);
+  }
 }
 
 function mockMessages(mock: unknown): string[] {

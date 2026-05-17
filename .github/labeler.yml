@@ -75,8 +75,8 @@
 "channel: messenger":
   - changed-files:
       - any-glob-to-any-file:
-          - "extensions/messenger/**"
-          - "docs/channels/messenger.md"
+          - "extensions/facebook/**"
+          - "docs/channels/facebook.md"
 "channel: msteams":
   - changed-files:
       - any-glob-to-any-file:

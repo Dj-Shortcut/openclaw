@@ -17,7 +17,7 @@ const MessengerCommonConfigSchemaBase = z.object({
   verifyToken: z.string().optional(),
   verifyTokenFile: z.string().optional(),
   name: z.string().optional(),
-  allowFrom: z.array(z.union([z.string(), z.number()])).optional(),
+  allowFrom: z.array(z.string()).optional(),
   dmPolicy: DmPolicySchema.optional().default("pairing"),
   responsePrefix: z.string().optional(),
   webhookPath: z.string().optional(),

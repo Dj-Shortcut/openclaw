@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractMessengerTextMessages } from "./webhook.js";
+import { extractMessengerTextMessages, parseMessengerWebhookBody } from "./webhook.js";
 
 describe("extractMessengerTextMessages", () => {
   it("keeps text Page messages and skips echoes or unsupported events", () => {
@@ -31,5 +31,12 @@ describe("extractMessengerTextMessages", () => {
     expect(messages).toHaveLength(1);
     expect(messages[0]?.sender?.id).toBe("psid-1");
     expect(messages[0]?.message?.text).toBe("hello");
+  });
+});
+
+describe("parseMessengerWebhookBody", () => {
+  it("rejects malformed Page payloads before event extraction", () => {
+    expect(parseMessengerWebhookBody("null").ok).toBe(false);
+    expect(parseMessengerWebhookBody(JSON.stringify({ object: "page", entry: {} })).ok).toBe(false);
   });
 });
