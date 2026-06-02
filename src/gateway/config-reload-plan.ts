@@ -30,6 +30,10 @@ type ReloadRule = {
   actions?: ReloadAction[];
 };
 
+export type ConfigReloadMetadata = {
+  kind: ReloadRule["kind"];
+};
+
 type ReloadAction =
   | "reload-hooks"
   | "restart-gmail-watcher"
@@ -93,6 +97,10 @@ const BASE_RELOAD_RULES: ReloadRule[] = [
     kind: "hot",
     actions: ["restart-heartbeat"],
   },
+  // Auth cooldown readers resolve values from the active runtime config for each
+  // auth failure decision, so cooldown tuning needs a snapshot refresh but not
+  // a gateway restart.
+  { prefix: "auth.cooldowns", kind: "hot" },
   {
     prefix: "agents.list",
     kind: "hot",
@@ -220,6 +228,13 @@ function matchRule(path: string): ReloadRule | null {
     }
   }
   return null;
+}
+
+export function resolveConfigReloadMetadata(path: string): ConfigReloadMetadata {
+  if (isPluginInstallTimestampPath(path)) {
+    return { kind: "none" };
+  }
+  return { kind: matchRule(path)?.kind ?? "restart" };
 }
 
 function isPluginInstallTimestampPath(path: string): boolean {

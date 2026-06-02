@@ -1,9 +1,10 @@
+import type { QaProviderModeInput } from "../../run-config.js";
 import {
   collectLiveTransportStandardScenarioCoverage,
   selectLiveTransportScenarios,
   type LiveTransportScenarioDefinition,
 } from "../../shared/live-transport-scenarios.js";
-import { type MatrixQaConfigOverrides } from "../../substrate/config.js";
+import type { MatrixQaConfigOverrides } from "../../substrate/config.js";
 import {
   buildDefaultMatrixQaTopologySpec,
   findMatrixQaProvisionedRoom,
@@ -113,6 +114,7 @@ export type MatrixQaE2eeScenarioId = Extract<MatrixQaScenarioId, `matrix-e2ee-${
 
 export type MatrixQaScenarioDefinition = LiveTransportScenarioDefinition<MatrixQaScenarioId> & {
   configOverrides?: MatrixQaConfigOverrides;
+  providerMode?: QaProviderModeInput;
   topology?: MatrixQaTopologySpec;
 };
 
@@ -454,6 +456,7 @@ export const MATRIX_QA_SCENARIOS: MatrixQaScenarioDefinition[] = [
     timeoutMs: 75_000,
     title: "Matrix block streaming preserves completed quiet preview blocks",
     topology: MATRIX_QA_BLOCK_ROOM_TOPOLOGY,
+    providerMode: "mock-openai",
     configOverrides: {
       agentDefaults: {
         blockStreamingChunk: {
@@ -1226,6 +1229,11 @@ const MATRIX_QA_MEDIA_PROFILE_SCENARIO_IDS = [
   "matrix-e2ee-media-image",
 ] satisfies MatrixQaScenarioId[];
 
+const MATRIX_QA_EXPLICIT_ONLY_SCENARIO_IDS = new Set<MatrixQaScenarioId>([
+  "matrix-room-block-streaming",
+  "matrix-subagent-thread-spawn",
+]);
+
 const MATRIX_QA_E2EE_SMOKE_PROFILE_SCENARIO_IDS = [
   "matrix-e2ee-basic-reply",
   "matrix-e2ee-thread-follow-up",
@@ -1260,7 +1268,9 @@ function normalizeMatrixQaProfile(profile?: string): MatrixQaProfile {
 }
 
 function getMatrixQaProfileScenarioIds(profile: MatrixQaProfile): MatrixQaScenarioId[] {
-  const allIds = MATRIX_QA_SCENARIOS.map((scenario) => scenario.id);
+  const allIds = MATRIX_QA_SCENARIOS.map((scenario) => scenario.id).filter(
+    (id) => !MATRIX_QA_EXPLICIT_ONLY_SCENARIO_IDS.has(id),
+  );
   const mediaIds = buildMatrixQaScenarioIdSet(MATRIX_QA_MEDIA_PROFILE_SCENARIO_IDS);
   const smokeIds = buildMatrixQaScenarioIdSet(MATRIX_QA_E2EE_SMOKE_PROFILE_SCENARIO_IDS);
   switch (profile) {
@@ -1302,7 +1312,7 @@ export function findMatrixQaScenarios(ids?: string[], profile?: string) {
   });
 }
 
-export const __matrixQaProfileTesting = {
+export const matrixQaProfileTesting = {
   getMatrixQaProfileScenarioIds,
   normalizeMatrixQaProfile,
 };

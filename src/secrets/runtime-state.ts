@@ -1,5 +1,6 @@
 import {
   clearRuntimeAuthProfileStoreSnapshots,
+  getRuntimeAuthProfileStoreSnapshot,
   replaceRuntimeAuthProfileStoreSnapshots,
 } from "../agents/auth-profiles/runtime-snapshots.js";
 import { clearLoadedAuthStoreCache } from "../agents/auth-profiles/store-cache.js";
@@ -11,6 +12,7 @@ import {
   type RuntimeConfigSnapshotRefreshHandler,
 } from "../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
 import type { PluginOrigin } from "../plugins/plugin-origin.types.js";
 import type { SecretResolverWarning } from "./runtime-shared.js";
 import {
@@ -30,8 +32,10 @@ export type PreparedSecretsRuntimeSnapshot = {
 export type SecretsRuntimeRefreshContext = {
   env: Record<string, string | undefined>;
   explicitAgentDirs: string[] | null;
+  includeAuthStoreRefs: boolean;
   loadAuthStore?: (agentDir?: string) => AuthProfileStore;
   loadablePluginOrigins: ReadonlyMap<string, PluginOrigin>;
+  manifestRegistry?: Pick<PluginManifestRegistry, "plugins">;
 };
 
 let activeSnapshot: PreparedSecretsRuntimeSnapshot | null = null;
@@ -48,7 +52,11 @@ export function cloneSecretsRuntimeRefreshContext(
   const cloned: SecretsRuntimeRefreshContext = {
     env: { ...context.env },
     explicitAgentDirs: context.explicitAgentDirs ? [...context.explicitAgentDirs] : null,
+    includeAuthStoreRefs: context.includeAuthStoreRefs,
     loadablePluginOrigins: new Map(context.loadablePluginOrigins),
+    ...(context.manifestRegistry
+      ? { manifestRegistry: structuredClone(context.manifestRegistry) }
+      : {}),
   };
   if (context.loadAuthStore) {
     cloned.loadAuthStore = context.loadAuthStore;
@@ -129,6 +137,32 @@ export function getActiveSecretsRuntimeSnapshot(): PreparedSecretsRuntimeSnapsho
     );
   }
   return snapshot;
+}
+
+// Hot-path readers only need the config pair for availability decisions.
+// Return the active references and keep full snapshot clone isolation on
+// getActiveSecretsRuntimeSnapshot() for callers that need mutable data.
+export function getActiveSecretsRuntimeConfigSnapshot(): Pick<
+  PreparedSecretsRuntimeSnapshot,
+  "config" | "sourceConfig"
+> | null {
+  if (!activeSnapshot) {
+    return null;
+  }
+  return {
+    config: activeSnapshot.config,
+    sourceConfig: activeSnapshot.sourceConfig,
+  };
+}
+
+export function getLiveSecretsRuntimeAuthStores(): PreparedSecretsRuntimeSnapshot["authStores"] {
+  if (!activeSnapshot) {
+    return [];
+  }
+  return activeSnapshot.authStores.map((entry) => ({
+    agentDir: entry.agentDir,
+    store: getRuntimeAuthProfileStoreSnapshot(entry.agentDir) ?? structuredClone(entry.store),
+  }));
 }
 
 export function clearSecretsRuntimeSnapshot(): void {

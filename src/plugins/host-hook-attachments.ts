@@ -1,14 +1,18 @@
 import * as fsPromises from "node:fs/promises";
 import { lstat } from "node:fs/promises";
+import {
+  detectMime,
+  FILE_TYPE_SNIFF_MAX_BYTES,
+  normalizeMimeType,
+} from "@openclaw/media-core/mime";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { resolveAgentWorkspaceDir } from "../agents/agent-scope.js";
 import { resolvePathFromInput } from "../agents/path-policy.js";
 import { resolveWorkspaceRoot } from "../agents/workspace-dir.js";
 import { extractDeliveryInfo } from "../config/sessions/delivery-info.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { formatErrorMessage } from "../infra/errors.js";
-import { detectMime, FILE_TYPE_SNIFF_MAX_BYTES, normalizeMimeType } from "../media/mime.js";
 import { resolveAgentIdFromSessionKey } from "../routing/session-key.js";
-import { normalizeOptionalString } from "../shared/string-coerce.js";
 import { isDeliverableMessageChannel, normalizeMessageChannel } from "../utils/message-channel.js";
 import type {
   PluginAttachmentChannelHints,
@@ -214,6 +218,20 @@ function normalizeOptionalThreadId(value: unknown): string | number | undefined 
   return normalizeOptionalString(value);
 }
 
+export function resolveSessionAttachmentThreadId(params: {
+  deliveryThreadId?: unknown;
+  explicitThreadId?: unknown;
+  fallbackThreadId?: unknown;
+  hintThreadTs?: string;
+}): string | number | undefined {
+  return (
+    params.hintThreadTs ??
+    normalizeOptionalThreadId(params.explicitThreadId) ??
+    normalizeOptionalThreadId(params.fallbackThreadId) ??
+    normalizeOptionalThreadId(params.deliveryThreadId)
+  );
+}
+
 export async function sendPluginSessionAttachment(
   params: PluginSessionAttachmentParams & { config?: OpenClawConfig; origin?: PluginOrigin },
 ): Promise<PluginSessionAttachmentResult> {
@@ -258,9 +276,6 @@ export async function sendPluginSessionAttachment(
     };
   }
   const rawText = normalizeOptionalString(params.text) ?? "";
-  const explicitThreadId = normalizeOptionalThreadId(params.threadId);
-  const deliveryThreadId = normalizeOptionalThreadId(deliveryContext.threadId);
-  const fallbackThreadId = normalizeOptionalThreadId(threadId);
   const resolvedDelivery = resolveAttachmentDelivery({
     channel: deliveryContext.channel,
     captionFormat: params.captionFormat,
@@ -274,8 +289,12 @@ export async function sendPluginSessionAttachment(
   if (!Array.isArray(validated)) {
     return { ok: false, error: validated.error };
   }
-  const resolvedThreadId =
-    resolvedDelivery.threadTs ?? explicitThreadId ?? fallbackThreadId ?? deliveryThreadId;
+  const resolvedThreadId = resolveSessionAttachmentThreadId({
+    deliveryThreadId: deliveryContext.threadId,
+    explicitThreadId: params.threadId,
+    fallbackThreadId: threadId,
+    hintThreadTs: resolvedDelivery.threadTs,
+  });
   let result: Awaited<ReturnType<SendMessage>>;
   try {
     const sendMessage = await loadSendMessage();
