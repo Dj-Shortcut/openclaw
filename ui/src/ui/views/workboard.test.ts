@@ -1,3 +1,4 @@
+// Control UI tests cover workboard behavior.
 import { nothing, render } from "lit";
 import { describe, expect, it, vi } from "vitest";
 import { getWorkboardState } from "../controllers/workboard.ts";
@@ -78,6 +79,55 @@ describe("renderWorkboard", () => {
     expect(container.textContent).toContain("Dashboard session");
     expect(container.querySelectorAll(".workboard-column")).toHaveLength(9);
     expect(container.querySelector(".workboard-card__priority")?.textContent).toContain("high");
+  });
+
+  it("can hide empty columns while keeping populated columns visible", () => {
+    const host = {};
+    const state = getWorkboardState(host);
+    state.loaded = true;
+    state.cards = [
+      {
+        id: "card-1",
+        title: "Keep visible",
+        status: "todo",
+        priority: "normal",
+        labels: [],
+        position: 1000,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ];
+    const container = document.createElement("div");
+    const props = {
+      host,
+      client: null,
+      connected: true,
+      pluginEnabled: true,
+      agentsList: null,
+      sessions: [],
+      onOpenSession: () => undefined,
+      onRequestUpdate: () => undefined,
+    } satisfies WorkboardRenderProps;
+
+    render(renderWorkboard(props), container);
+    expect(container.querySelectorAll(".workboard-column")).toHaveLength(9);
+
+    const toggle = container.querySelector<HTMLInputElement>(
+      'input[name="workboard-hide-empty-columns"]',
+    );
+    expect(toggle).toBeInstanceOf(HTMLInputElement);
+    toggle!.checked = true;
+    toggle!.dispatchEvent(new Event("change", { bubbles: true }));
+    render(renderWorkboard(props), container);
+
+    const columnHeadings = Array.from(
+      container.querySelectorAll<HTMLElement>(".workboard-column__header h2"),
+    ).map((heading) => heading.textContent?.trim());
+    expect(state.hideEmptyColumns).toBe(true);
+    expect(container.querySelectorAll(".workboard-column")).toHaveLength(1);
+    expect(columnHeadings).toEqual(["Todo"]);
+    expect(container.textContent).toContain("Todo");
+    expect(container.textContent).toContain("Keep visible");
   });
 
   it("does not render Invalid Date for Date-invalid card timestamps", () => {
@@ -1675,6 +1725,22 @@ describe("renderWorkboard", () => {
         priority: "high",
       }),
     });
+    expect(state.cards[0]).toMatchObject({ title: "Renamed", priority: "high", updatedAt: 2 });
+
+    render(renderWorkboard(props), container);
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+    container
+      .querySelector<HTMLButtonElement>('button[title="Edit card"]')
+      ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    render(renderWorkboard(props), container);
+
+    expect(container.querySelector<HTMLInputElement>(".workboard-draft__title")?.value).toBe(
+      "Renamed",
+    );
+    expect(
+      [...container.querySelectorAll<HTMLSelectElement>(".workboard-draft__meta select")].at(1)
+        ?.value,
+    ).toBe("high");
   });
 
   it("locks edit-modal actions while a comment request is in flight", () => {

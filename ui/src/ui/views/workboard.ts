@@ -1,3 +1,4 @@
+// Control UI view renders workboard screen content.
 import { html, nothing, type TemplateResult } from "lit";
 import { ref } from "lit/directives/ref.js";
 import { t } from "../../i18n/index.ts";
@@ -857,7 +858,10 @@ function renderCardModal(props: WorkboardProps) {
               }}
             >
               ${state.statuses.map(
-                (status) => html`<option value=${status}>${formatStatusLabel(status)}</option>`,
+                (status) =>
+                  html`<option value=${status} ?selected=${state.draftStatus === status}>
+                    ${formatStatusLabel(status)}
+                  </option>`,
               )}
             </select>
           </label>
@@ -873,7 +877,10 @@ function renderCardModal(props: WorkboardProps) {
               }}
             >
               ${WORKBOARD_PRIORITIES.map(
-                (priority) => html`<option value=${priority}>${priority}</option>`,
+                (priority) =>
+                  html`<option value=${priority} ?selected=${state.draftPriority === priority}>
+                    ${priority}
+                  </option>`,
               )}
             </select>
           </label>
@@ -887,10 +894,12 @@ function renderCardModal(props: WorkboardProps) {
                 props.onRequestUpdate?.();
               }}
             >
-              <option value="">${t("workboard.defaultAgent")}</option>
+              <option value="" ?selected=${!state.draftAgentId}>
+                ${t("workboard.defaultAgent")}
+              </option>
               ${agents.map(
                 (agent) =>
-                  html`<option value=${agent.id}>
+                  html`<option value=${agent.id} ?selected=${state.draftAgentId === agent.id}>
                     ${agent.name ?? agent.identity?.name ?? agent.id}
                   </option>`,
               )}
@@ -906,10 +915,15 @@ function renderCardModal(props: WorkboardProps) {
                 props.onRequestUpdate?.();
               }}
             >
-              <option value="">${t("workboard.noLinkedSession")}</option>
+              <option value="" ?selected=${!state.draftSessionKey}>
+                ${t("workboard.noLinkedSession")}
+              </option>
               ${sessions.map(
                 (session) =>
-                  html`<option value=${session.key}>
+                  html`<option
+                    value=${session.key}
+                    ?selected=${state.draftSessionKey === session.key}
+                  >
                     ${session.displayName ?? session.label ?? session.key}
                   </option>`,
               )}
@@ -1870,6 +1884,9 @@ export function renderWorkboard(props: WorkboardProps) {
   for (const card of filtered) {
     byStatus.get(card.status)?.push(card);
   }
+  const visibleStatuses = state.hideEmptyColumns
+    ? state.statuses.filter((status) => (byStatus.get(status)?.length ?? 0) > 0)
+    : state.statuses;
   const dialogOpen = state.draftOpen || Boolean(getVisibleDetailCard(state));
 
   return html`
@@ -1961,6 +1978,18 @@ export function renderWorkboard(props: WorkboardProps) {
                 ${icons.layoutComfortable}
               </button>
             </div>
+            <label class="workboard-toggle">
+              <input
+                type="checkbox"
+                name="workboard-hide-empty-columns"
+                .checked=${state.hideEmptyColumns}
+                @change=${(event: Event) => {
+                  state.hideEmptyColumns = (event.currentTarget as HTMLInputElement).checked;
+                  props.onRequestUpdate?.();
+                }}
+              />
+              <span>${t("workboard.hideEmptyColumns")}</span>
+            </label>
           </div>
           <div class="workboard-toolbar__actions">
             <button
@@ -2020,7 +2049,7 @@ export function renderWorkboard(props: WorkboardProps) {
         ${state.error ? html`<div class="callout danger">${state.error}</div>` : nothing}
         ${renderDispatchSummary(state)}
         <div class="workboard-board workboard-board--${state.layout}">
-          ${state.statuses.map((status) => renderColumn(props, status, byStatus.get(status) ?? []))}
+          ${visibleStatuses.map((status) => renderColumn(props, status, byStatus.get(status) ?? []))}
         </div>
       </div>
       ${renderCardModal(props)} ${renderCardDetailsPanel(props)}

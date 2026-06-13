@@ -1,3 +1,4 @@
+// Control UI English locale strings are the i18n source bundle.
 import type { TranslationMap } from "../lib/types.ts";
 
 export const en: TranslationMap = {
@@ -447,6 +448,14 @@ export const en: TranslationMap = {
     logs: "Live gateway logs.",
     dreams: "Memory dreaming, consolidation, and reflection.",
   },
+  skillWorkshop: {
+    header: {
+      useCurrentChat: "Use current chat",
+      useCurrentChatAria: "Use current chat for revision requests",
+      useCurrentChatTooltip:
+        "Send revision requests to the current chat session instead of the proposal's workshop session.",
+    },
+  },
   activity: {
     title: "Activity",
     subtitle: "Ephemeral tool activity derived from live session events.",
@@ -601,6 +610,7 @@ export const en: TranslationMap = {
     labelsPlaceholder: "ui, docs",
     searchPlaceholder: "Search cards",
     allPriorities: "All priorities",
+    hideEmptyColumns: "Hide empty columns",
     emptyColumn: "Drop work here",
     lifecycleUnlinked: "No session",
     lifecycleUnlinkedDetail: "Start or link a session",
@@ -1585,6 +1595,8 @@ export const en: TranslationMap = {
     },
     jobDetail: {
       system: "System",
+      command: "Command",
+      cwd: "CWD",
       prompt: "Prompt",
       delivery: "Delivery",
       agent: "Agent",
