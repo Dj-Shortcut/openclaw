@@ -1,8 +1,3 @@
-/**
- * Tests credential eligibility and expiry classification.
- * Protects missing, expired, near-expiry, and SecretRef credential handling for
- * auth profile selection.
- */
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_OAUTH_REFRESH_MARGIN_MS,
@@ -82,6 +77,21 @@ describe("evaluateStoredCredentialEligibility", () => {
       now,
     });
     expect(result).toEqual({ eligible: true, reasonCode: "ok" });
+  });
+
+  it.each([
+    "openclaw onboard --auth-choice zai-coding-global",
+    "openclaw onboard --non-interactive --auth-choice=zai-coding-global --zai-api-key $ZAI_API_KEY",
+  ])("marks pasted OpenClaw onboarding command %p as a malformed api key", (key) => {
+    const result = evaluateStoredCredentialEligibility({
+      credential: {
+        type: "api_key",
+        provider: "zai",
+        key,
+      },
+      now,
+    });
+    expect(result).toEqual({ eligible: false, reasonCode: "malformed_api_key" });
   });
 
   it("marks tokenRef with missing expires as eligible", () => {

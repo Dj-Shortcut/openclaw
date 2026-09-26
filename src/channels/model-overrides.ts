@@ -27,7 +27,7 @@ import {
 } from "./plugins/session-conversation.js";
 
 /** Resolved model override for a channel conversation plus the config key that matched. */
-export type ChannelModelOverride = {
+type ChannelModelOverride = {
   channel: string;
   model: string;
   matchKey?: string;
@@ -44,6 +44,7 @@ type ChannelModelOverrideParams = {
   groupChannel?: string | null;
   groupSubject?: string | null;
   parentSessionKey?: string | null;
+  directUserIds?: (string | null | undefined)[];
 };
 
 function resolveProviderEntry(
@@ -130,35 +131,22 @@ function buildGenericParentOverrideCandidates(sessionKey: string | null | undefi
   return buildChannelKeyCandidates(threadId ? baseSessionKey : raw.rawId);
 }
 
-function resolveDirectChannelModelMatch(params: {
-  channel: string;
-  providerEntries: Record<string, string>;
-  groupId?: string | null;
-  parentSessionKey?: string | null;
-}): { model: string; matchKey?: string; matchSource?: ChannelMatchSource } | null {
-  const directKeys = buildChannelKeyCandidates(
-    params.groupId,
-    ...buildGenericParentOverrideCandidates(params.parentSessionKey),
-  );
-  if (directKeys.length === 0) {
-    return null;
+/** Expand prefixed peer IDs by also trying the raw form after the channel prefix. */
+function expandPeerIds(
+  ids: (string | null | undefined)[],
+  channel: string,
+): (string | null | undefined)[] {
+  const channelPrefix = channel.toLowerCase() + ":";
+  const expanded: (string | null | undefined)[] = [];
+  for (const id of ids) {
+    if (id != null) {
+      expanded.push(id);
+      if (id.toLowerCase().startsWith(channelPrefix)) {
+        expanded.push(id.slice(channelPrefix.length));
+      }
+    }
   }
-  const match = resolveChannelEntryMatchWithFallback({
-    entries: params.providerEntries,
-    keys: directKeys,
-    parentKeys: [],
-    wildcardKey: "*",
-    normalizeKey: (value) => normalizeOptionalLowercaseString(value) ?? "",
-  });
-  const raw = match.entry ?? match.wildcardEntry;
-  if (typeof raw !== "string") {
-    return null;
-  }
-  const model = normalizeOptionalString(raw);
-  if (!model) {
-    return null;
-  }
-  return { model, matchKey: match.matchKey, matchSource: match.matchSource };
+  return expanded;
 }
 
 /** Resolves a channel-scoped model override from direct, parent, and wildcard config entries. */
@@ -179,55 +167,38 @@ export function resolveChannelModelOverride(
   if (!providerEntries) {
     return null;
   }
-  const directMatch = resolveDirectChannelModelMatch({
-    channel,
-    providerEntries,
-    groupId: params.groupId,
-    parentSessionKey: params.parentSessionKey,
-  });
-  if (directMatch) {
-    return {
-      channel: normalizeMessageChannel(channel) ?? normalizeOptionalLowercaseString(channel) ?? "",
-      model: directMatch.model,
-      matchKey: directMatch.matchKey,
-      matchSource: directMatch.matchSource,
-    };
+  const resolveMatch = (keys: string[], parentKeys: string[] = []): ChannelModelOverride | null => {
+    const match = resolveChannelEntryMatchWithFallback({
+      entries: providerEntries,
+      keys,
+      parentKeys,
+      wildcardKey: "*",
+      normalizeKey: (value) => normalizeOptionalLowercaseString(value) ?? "",
+    });
+    const model = normalizeOptionalString(match.entry ?? match.wildcardEntry);
+    return model
+      ? {
+          channel:
+            normalizeMessageChannel(channel) ?? normalizeOptionalLowercaseString(channel) ?? "",
+          model,
+          matchKey: match.matchKey,
+          matchSource: match.matchSource,
+        }
+      : null;
+  };
+
+  if (normalizeChatType(params.groupChatType ?? undefined) === "direct") {
+    const directKeys = buildChannelKeyCandidates(
+      params.groupId,
+      ...expandPeerIds(params.directUserIds ?? [], channel),
+      ...buildGenericParentOverrideCandidates(params.parentSessionKey),
+    );
+    const directMatch = directKeys.length > 0 ? resolveMatch(directKeys) : null;
+    if (directMatch) {
+      return directMatch;
+    }
   }
 
   const { keys, parentKeys } = buildChannelCandidates(params);
-  if (keys.length === 0 && parentKeys.length === 0) {
-    const wildcardModel = normalizeOptionalString(providerEntries["*"]);
-    if (wildcardModel) {
-      return {
-        channel:
-          normalizeMessageChannel(channel) ?? normalizeOptionalLowercaseString(channel) ?? "",
-        model: wildcardModel,
-        matchKey: "*",
-        matchSource: "wildcard",
-      };
-    }
-    return null;
-  }
-  const match = resolveChannelEntryMatchWithFallback({
-    entries: providerEntries,
-    keys,
-    parentKeys,
-    wildcardKey: "*",
-    normalizeKey: (value) => normalizeOptionalLowercaseString(value) ?? "",
-  });
-  const raw = match.entry ?? match.wildcardEntry;
-  if (typeof raw !== "string") {
-    return null;
-  }
-  const model = normalizeOptionalString(raw);
-  if (!model) {
-    return null;
-  }
-
-  return {
-    channel: normalizeMessageChannel(channel) ?? normalizeOptionalLowercaseString(channel) ?? "",
-    model,
-    matchKey: match.matchKey,
-    matchSource: match.matchSource,
-  };
+  return resolveMatch(keys, parentKeys);
 }

@@ -1,8 +1,7 @@
-// Matrix plugin module implements sqlite state behavior.
 import os from "node:os";
 import { getMatrixRuntime } from "../runtime.js";
 
-export type MatrixSqliteStateOptions = {
+type MatrixSqliteStateOptions = {
   env?: NodeJS.ProcessEnv;
   stateDir?: string;
   stateRootDir?: string;
@@ -14,13 +13,11 @@ function resolveStateDirOverride(
   if (!options) {
     return undefined;
   }
-  if (options.stateDir) {
-    return options.stateDir;
-  }
-  if (options.stateRootDir) {
-    return options.stateRootDir;
-  }
-  return getMatrixRuntime().state.resolveStateDir(options.env ?? process.env, os.homedir);
+  return (
+    options.stateDir ||
+    options.stateRootDir ||
+    getMatrixRuntime().state.resolveStateDir(options.env ?? process.env, os.homedir)
+  );
 }
 
 export function resolveMatrixSqliteStateKey(options: MatrixSqliteStateOptions | undefined): string {

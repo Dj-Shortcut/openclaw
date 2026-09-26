@@ -1,23 +1,61 @@
-/** Formats compact tool metadata labels for auto-reply progress/status messages. */
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
-import { formatToolSummary, resolveToolDisplay } from "../agents/tool-display.js";
-import { shortenHomeInString, shortenHomePath } from "../utils.js";
+import { isShellToolDisplayName, resolveToolDisplay } from "../agents/tool-display.js";
+/** Formats compact tool metadata labels for auto-reply progress/status messages. */
+import { formatInlineCodeSpan } from "../shared/markdown-code.js";
+import { shortenHomeInString } from "../utils.js";
 
 type ToolAggregateOptions = {
   markdown?: boolean;
 };
 
-/** Shortens a filesystem path for display. */
-export function shortenPath(p: string): string {
-  return shortenHomePath(p);
-}
-
-/** Shortens user-home paths inside arbitrary tool metadata. */
-export function shortenMeta(meta: string): string {
-  if (!meta) {
-    return meta;
+/**
+ * Formats one grouped tool-progress label and returns the detail segment it was
+ * composed from. Callers that need both must not re-parse the label: recovering
+ * the detail by stripping the rendered prefix silently yields nothing whenever
+ * the prefix shape changes.
+ */
+export function formatToolAggregateParts(
+  toolName?: string,
+  metas?: string[],
+  options?: ToolAggregateOptions,
+): { text: string; detail?: string } {
+  const filtered = (metas ?? []).filter(Boolean).map(shortenHomeInString);
+  const display = resolveToolDisplay({ name: toolName });
+  const compactCommandSummary = filtered.length > 0 && isShellToolDisplayName(toolName);
+  const prefix = compactCommandSummary ? display.emoji : `${display.emoji} ${display.label}`;
+  if (!filtered.length) {
+    return { text: `${display.emoji} ${display.label}` };
   }
-  return shortenHomeInString(meta);
+
+  const rawSegments: string[] = [];
+  // Group by directory and brace-collapse filenames to keep progress text short.
+  const grouped: Record<string, string[]> = {};
+  for (const m of filtered) {
+    if (!isPathLike(m) || m.includes("→")) {
+      rawSegments.push(m);
+      continue;
+    }
+    const slash = m.lastIndexOf("/");
+    const dir = m.slice(0, slash);
+    const base = m.slice(slash + 1);
+    if (!grouped[dir]) {
+      grouped[dir] = [];
+    }
+    grouped[dir].push(base);
+  }
+
+  const segments = Object.entries(grouped).map(([dir, files]) => {
+    const brace = files.length > 1 ? `{${files.join(", ")}}` : files[0];
+    return `${dir}/${brace}`;
+  });
+
+  const allSegments = [...rawSegments, ...segments];
+  const meta = allSegments.join("; ");
+  const detail = formatMetaForDisplay(toolName, meta, options?.markdown);
+  return {
+    text: compactCommandSummary ? `${prefix} ${detail}` : `${prefix}: ${detail}`,
+    detail,
+  };
 }
 
 /** Formats one grouped tool-progress label from a tool name and metadata entries. */
@@ -26,63 +64,7 @@ export function formatToolAggregate(
   metas?: string[],
   options?: ToolAggregateOptions,
 ): string {
-  const filtered = (metas ?? []).filter(Boolean).map(shortenMeta);
-  const display = resolveToolDisplay({ name: toolName });
-  const normalizedToolName = normalizeLowercaseStringOrEmpty(toolName);
-  const compactCommandSummary =
-    filtered.length > 0 && (normalizedToolName === "exec" || normalizedToolName === "bash");
-  const prefix = compactCommandSummary ? display.emoji : `${display.emoji} ${display.label}`;
-  if (!filtered.length) {
-    return `${display.emoji} ${display.label}`;
-  }
-
-  const rawSegments: string[] = [];
-  // Group by directory and brace-collapse filenames to keep progress text short.
-  const grouped: Record<string, string[]> = {};
-  for (const m of filtered) {
-    if (!isPathLike(m)) {
-      rawSegments.push(m);
-      continue;
-    }
-    if (m.includes("→")) {
-      rawSegments.push(m);
-      continue;
-    }
-    const parts = m.split("/");
-    if (parts.length > 1) {
-      const dir = parts.slice(0, -1).join("/");
-      const base = parts.at(-1) ?? m;
-      if (!grouped[dir]) {
-        grouped[dir] = [];
-      }
-      grouped[dir].push(base);
-    } else {
-      if (!grouped["."]) {
-        grouped["."] = [];
-      }
-      grouped["."].push(m);
-    }
-  }
-
-  const segments = Object.entries(grouped).map(([dir, files]) => {
-    const brace = files.length > 1 ? `{${files.join(", ")}}` : files[0];
-    if (dir === ".") {
-      return brace;
-    }
-    return `${dir}/${brace}`;
-  });
-
-  const allSegments = [...rawSegments, ...segments];
-  const meta = allSegments.join("; ");
-  const formattedMeta = formatMetaForDisplay(toolName, meta, options?.markdown);
-  return compactCommandSummary ? `${prefix} ${formattedMeta}` : `${prefix}: ${formattedMeta}`;
-}
-
-/** Formats the prefix for a single tool event. */
-export function formatToolPrefix(toolName?: string, meta?: string) {
-  const extra = meta?.trim() ? shortenMeta(meta) : undefined;
-  const display = resolveToolDisplay({ name: toolName, meta: extra });
-  return formatToolSummary(display);
+  return formatToolAggregateParts(toolName, metas, options).text;
 }
 
 function formatMetaForDisplay(
@@ -108,9 +90,6 @@ function splitExecFlags(meta: string): { flags: string[]; body: string } {
     .split(" · ")
     .map((part) => part.trim())
     .filter(Boolean);
-  if (parts.length === 0) {
-    return { flags: [], body: "" };
-  }
   const flags: string[] = [];
   const bodyParts: string[] = [];
   for (const part of parts) {
@@ -124,43 +103,15 @@ function splitExecFlags(meta: string): { flags: string[]; body: string } {
 }
 
 function isPathLike(value: string): boolean {
-  if (!value) {
-    return false;
-  }
-  if (value.includes(" ")) {
-    return false;
-  }
-  if (value.includes("://")) {
-    return false;
-  }
-  if (value.includes("·")) {
-    return false;
-  }
-  if (value.includes("&&") || value.includes("||")) {
-    return false;
-  }
-  return /^~?(\/[^\s]+)+$/.test(value);
+  return (
+    !value.includes("://") &&
+    !value.includes("·") &&
+    !value.includes("&&") &&
+    !value.includes("||") &&
+    /^~?(\/[^\s]+)+$/.test(value)
+  );
 }
 
 function maybeWrapMarkdown(value: string, markdown?: boolean): string {
-  if (!markdown) {
-    return value;
-  }
-  const delimiter = "`".repeat(longestBacktickRun(value) + 1);
-  const padding = value.startsWith("`") || value.endsWith("`") || value.includes("\n") ? " " : "";
-  return `${delimiter}${padding}${value}${padding}${delimiter}`;
-}
-
-function longestBacktickRun(value: string): number {
-  let longest = 0;
-  let current = 0;
-  for (const char of value) {
-    if (char === "`") {
-      current += 1;
-      longest = Math.max(longest, current);
-      continue;
-    }
-    current = 0;
-  }
-  return longest;
+  return markdown ? formatInlineCodeSpan(value) : value;
 }

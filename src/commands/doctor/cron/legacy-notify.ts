@@ -1,11 +1,12 @@
 // Legacy cron `notify: true` migration to explicit webhook/completion delivery.
+import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
 import { normalizeHttpWebhookUrl } from "../../../cron/webhook-url.js";
 
-export type LegacyNotifyMigrationOutcome = {
+type LegacyNotifyMigrationOutcome = {
   changed: boolean;
   warnings: string[];
 };
@@ -22,14 +23,6 @@ export function migrateLegacyNotifyFallback(params: {
     ? normalizeHttpWebhookUrl(configuredLegacyWebhook)
     : undefined;
 
-  const warnMissingLegacyWebhook = (jobName: string) => {
-    warnings.push(
-      configuredLegacyWebhook
-        ? `Cron job "${jobName}" still uses legacy notify fallback, but cron.webhook is not a valid HTTP(S) URL so doctor cannot migrate it automatically.`
-        : `Cron job "${jobName}" still uses legacy notify fallback, but cron.webhook is unset so doctor cannot migrate it automatically.`,
-    );
-  };
-
   for (const raw of params.jobs) {
     if (!("notify" in raw)) {
       continue;
@@ -44,10 +37,7 @@ export function migrateLegacyNotifyFallback(params: {
       continue;
     }
 
-    const delivery =
-      raw.delivery && typeof raw.delivery === "object" && !Array.isArray(raw.delivery)
-        ? (raw.delivery as Record<string, unknown>)
-        : null;
+    const delivery = asNullableRecord(raw.delivery);
     const mode = normalizeOptionalLowercaseString(delivery?.mode);
     const to = normalizeOptionalString(delivery?.to);
     const hasLegacyChatDelivery =
@@ -57,12 +47,7 @@ export function migrateLegacyNotifyFallback(params: {
         normalizeOptionalString(delivery.accountId) !== undefined ||
         "threadId" in delivery ||
         (to !== undefined && !normalizeHttpWebhookUrl(to)));
-    const completionDestination =
-      delivery?.completionDestination &&
-      typeof delivery.completionDestination === "object" &&
-      !Array.isArray(delivery.completionDestination)
-        ? (delivery.completionDestination as Record<string, unknown>)
-        : null;
+    const completionDestination = asNullableRecord(delivery?.completionDestination);
     const completionMode = normalizeOptionalLowercaseString(completionDestination?.mode);
     const completionTo = normalizeOptionalString(completionDestination?.to);
     const validWebhookTo = to ? normalizeHttpWebhookUrl(to) : undefined;
@@ -77,11 +62,21 @@ export function migrateLegacyNotifyFallback(params: {
       continue;
     }
 
+    if (configuredLegacyWebhook && !legacyWebhook) {
+      // Keep the marker so doctor can retry after the operator fixes the target.
+      warnings.push(
+        `Automation "${jobName}" still uses legacy notify fallback, but cron.webhook is not a valid HTTP(S) URL so doctor cannot migrate it automatically.`,
+      );
+      continue;
+    }
+    if (!legacyWebhook) {
+      // Without a configured target, the top-level marker cannot affect delivery.
+      delete raw.notify;
+      changed = true;
+      continue;
+    }
+
     if ((mode === undefined && !hasLegacyChatDelivery) || mode === "none" || mode === "webhook") {
-      if (!legacyWebhook) {
-        warnMissingLegacyWebhook(jobName);
-        continue;
-      }
       raw.delivery = {
         ...delivery,
         mode: "webhook",
@@ -92,22 +87,17 @@ export function migrateLegacyNotifyFallback(params: {
       continue;
     }
 
-    if (legacyWebhook) {
-      raw.delivery = {
-        ...delivery,
-        ...(hasLegacyChatDelivery ? { mode: "announce" } : {}),
-        completionDestination: {
-          ...completionDestination,
-          mode: "webhook",
-          to: legacyWebhook,
-        },
-      };
-      delete raw.notify;
-      changed = true;
-      continue;
-    }
-
-    warnMissingLegacyWebhook(jobName);
+    raw.delivery = {
+      ...delivery,
+      ...(hasLegacyChatDelivery ? { mode: "announce" } : {}),
+      completionDestination: {
+        ...completionDestination,
+        mode: "webhook",
+        to: legacyWebhook,
+      },
+    };
+    delete raw.notify;
+    changed = true;
   }
 
   return { changed, warnings };

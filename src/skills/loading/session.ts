@@ -1,106 +1,31 @@
-// Session skill helpers resolve skills attached to a session and its transcript state.
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import ignore from "ignore";
-import { CONFIG_DIR_NAME, getAgentDir } from "../../agents/config.js";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { getAgentDir } from "../../agents/config.js";
+import { CONFIG_DIR_NAME } from "../../agents/package-metadata.js";
 import type { ResourceDiagnostic } from "../../agents/sessions/diagnostics.js";
-import { createSyntheticSourceInfo, type SourceInfo } from "../../agents/sessions/source-info.js";
-import { parseFrontmatter } from "../../agents/utils/frontmatter.js";
 import { canonicalizePath } from "../../agents/utils/paths.js";
-import { formatSkillsForPrompt as formatSkillContractForPrompt } from "./skill-contract.js";
-import { computeSkillPromptVersion } from "./skill-version.js";
+import { isPathInside } from "../../infra/path-guards.js";
+import {
+  addIgnoreRules,
+  normalizeNativePathSeparators,
+  type IgnoreMatcher,
+} from "../../shared/ignore-rules.js";
+import { expandTildePath } from "../../shared/tilde-path.js";
+import { parseSkillFrontmatter } from "./frontmatter.js";
+import type { Skill } from "./skill-contract.js";
+import { materializeSkill } from "./skill-materializer.js";
+import { formatSkillsForPromptBounded } from "./skill-prompt-limits.js";
 
-/** Max name length per spec */
 const MAX_NAME_LENGTH = 64;
-
-/** Max description length per spec */
 const MAX_DESCRIPTION_LENGTH = 1024;
 
-const IGNORE_FILE_NAMES = [".gitignore", ".ignore", ".fdignore"];
+export type { Skill } from "./skill-contract.js";
 
-type IgnoreMatcher = ReturnType<typeof ignore>;
-
-function toPosixPath(p: string): string {
-  return p.split(sep).join("/");
-}
-
-function prefixIgnorePattern(line: string, prefix: string): string | null {
-  const trimmed = line.trim();
-  if (!trimmed) {
-    return null;
-  }
-  if (trimmed.startsWith("#") && !trimmed.startsWith("\\#")) {
-    return null;
-  }
-
-  let pattern = line;
-  let negated = false;
-
-  if (pattern.startsWith("!")) {
-    negated = true;
-    pattern = pattern.slice(1);
-  } else if (pattern.startsWith("\\!")) {
-    pattern = pattern.slice(1);
-  }
-
-  if (pattern.startsWith("/")) {
-    pattern = pattern.slice(1);
-  }
-
-  const prefixed = prefix ? `${prefix}${pattern}` : pattern;
-  return negated ? `!${prefixed}` : prefixed;
-}
-
-function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string): void {
-  const relativeDir = relative(rootDir, dir);
-  const prefix = relativeDir ? `${toPosixPath(relativeDir)}/` : "";
-
-  for (const filename of IGNORE_FILE_NAMES) {
-    const ignorePath = join(dir, filename);
-    if (!existsSync(ignorePath)) {
-      continue;
-    }
-    try {
-      const content = readFileSync(ignorePath, "utf-8");
-      const patterns = content
-        .split(/\r?\n/)
-        .map((line) => prefixIgnorePattern(line, prefix))
-        .filter((line): line is string => Boolean(line));
-      if (patterns.length > 0) {
-        ig.add(patterns);
-      }
-    } catch {}
-  }
-}
-
-export interface SkillFrontmatter {
-  name?: string;
-  description?: string;
-  "disable-model-invocation"?: boolean;
-  [key: string]: unknown;
-}
-
-export interface Skill {
-  name: string;
-  description: string;
-  filePath: string;
-  baseDir: string;
-  promptVersion?: string;
-  source: string;
-  sourceInfo: SourceInfo;
-  disableModelInvocation: boolean;
-}
-
-export interface LoadSkillsResult {
+interface LoadSkillsResult {
   skills: Skill[];
   diagnostics: ResourceDiagnostic[];
 }
 
-/**
- * Validate skill name per Agent Skills spec.
- * Returns array of validation error messages (empty if valid).
- */
 function validateName(name: string): string[] {
   const errors: string[] = [];
 
@@ -123,9 +48,6 @@ function validateName(name: string): string[] {
   return errors;
 }
 
-/**
- * Validate description per Agent Skills spec.
- */
 function validateDescription(description: string | undefined): string[] {
   const errors: string[] = [];
 
@@ -138,48 +60,13 @@ function validateDescription(description: string | undefined): string[] {
   return errors;
 }
 
-export interface LoadSkillsFromDirOptions {
-  /** Directory to scan for skills */
-  dir: string;
-  /** Source identifier for these skills */
-  source: string;
-}
-
-function createSkillSourceInfo(filePath: string, baseDir: string, source: string): SourceInfo {
-  switch (source) {
-    case "user":
-      return createSyntheticSourceInfo(filePath, {
-        source: "local",
-        scope: "user",
-        baseDir,
-      });
-    case "project":
-      return createSyntheticSourceInfo(filePath, {
-        source: "local",
-        scope: "project",
-        baseDir,
-      });
-    case "path":
-      return createSyntheticSourceInfo(filePath, {
-        source: "local",
-        baseDir,
-      });
-    default:
-      return createSyntheticSourceInfo(filePath, { source, baseDir });
+function resolveSkillSourceOptions(
+  source: string,
+): Parameters<typeof materializeSkill>[0]["sourceOptions"] {
+  if (source === "user" || source === "project") {
+    return { source: "local", scope: source };
   }
-}
-
-/**
- * Load skills from a directory.
- *
- * Discovery rules:
- * - if a directory contains SKILL.md, treat it as a skill root and do not recurse further
- * - otherwise, load direct .md children in the root
- * - recurse into subdirectories to find SKILL.md
- */
-export function loadSkillsFromDir(options: LoadSkillsFromDirOptions): LoadSkillsResult {
-  const { dir, source } = options;
-  return loadSkillsFromDirInternal(dir, source, true);
+  return { source: source === "path" ? "local" : source };
 }
 
 function loadSkillsFromDirInternal(
@@ -197,8 +84,7 @@ function loadSkillsFromDirInternal(
   }
 
   const root = rootDir ?? dir;
-  const ig = ignoreMatcher ?? ignore();
-  addIgnoreRules(ig, dir, root);
+  const ig = addIgnoreRules(dir, root, ignoreMatcher);
 
   try {
     const entries = readdirSync(dir, { withFileTypes: true });
@@ -219,17 +105,12 @@ function loadSkillsFromDirInternal(
         }
       }
 
-      const relPath = toPosixPath(relative(root, fullPath));
+      const relPath = normalizeNativePathSeparators(relative(root, fullPath));
       if (!isFile || ig.ignores(relPath)) {
         continue;
       }
 
-      const result = loadSkillFromFile(fullPath, source);
-      if (result.skill) {
-        skills.push(result.skill);
-      }
-      diagnostics.push(...result.diagnostics);
-      return { skills, diagnostics };
+      return loadSkillFromFile(fullPath, source);
     }
 
     for (const entry of entries) {
@@ -237,14 +118,12 @@ function loadSkillsFromDirInternal(
         continue;
       }
 
-      // Skip node_modules to avoid scanning dependencies
       if (entry.name === "node_modules") {
         continue;
       }
 
       const fullPath = join(dir, entry.name);
 
-      // For symlinks, check if they point to a directory and follow them
       let isDirectory = entry.isDirectory();
       let isFile = entry.isFile();
       if (entry.isSymbolicLink()) {
@@ -253,88 +132,69 @@ function loadSkillsFromDirInternal(
           isDirectory = stats.isDirectory();
           isFile = stats.isFile();
         } catch {
-          // Broken symlink, skip it
           continue;
         }
       }
 
-      const relPath = toPosixPath(relative(root, fullPath));
+      const relPath = normalizeNativePathSeparators(relative(root, fullPath));
       const ignorePath = isDirectory ? `${relPath}/` : relPath;
       if (ig.ignores(ignorePath)) {
         continue;
       }
 
-      if (isDirectory) {
-        const subResult = loadSkillsFromDirInternal(fullPath, source, false, ig, root);
-        skills.push(...subResult.skills);
-        diagnostics.push(...subResult.diagnostics);
+      if (!isDirectory && (!isFile || !includeRootFiles || !entry.name.endsWith(".md"))) {
         continue;
       }
-
-      if (!isFile || !includeRootFiles || !entry.name.endsWith(".md")) {
-        continue;
-      }
-
-      const result = loadSkillFromFile(fullPath, source);
-      if (result.skill) {
-        skills.push(result.skill);
-      }
+      const result = isDirectory
+        ? loadSkillsFromDirInternal(fullPath, source, false, ig, root)
+        : loadSkillFromFile(fullPath, source);
+      skills.push(...result.skills);
       diagnostics.push(...result.diagnostics);
     }
-  } catch {}
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "failed to scan skill directory";
+    diagnostics.push({ type: "warning", message, path: dir });
+  }
 
   return { skills, diagnostics };
 }
 
-function loadSkillFromFile(
-  filePath: string,
-  source: string,
-): { skill: Skill | null; diagnostics: ResourceDiagnostic[] } {
+function loadSkillFromFile(filePath: string, source: string): LoadSkillsResult {
   const diagnostics: ResourceDiagnostic[] = [];
 
   try {
     const rawContent = readFileSync(filePath, "utf-8");
-    const { frontmatter } = parseFrontmatter<SkillFrontmatter>(rawContent);
+    const frontmatter = parseSkillFrontmatter(rawContent);
     const skillDir = dirname(filePath);
-    const parentDirName = basename(skillDir);
-
-    // Validate description
-    const descErrors = validateDescription(frontmatter.description);
-    for (const error of descErrors) {
-      diagnostics.push({ type: "warning", message: error, path: filePath });
-    }
-
-    // Use name from frontmatter, or fall back to parent directory name
-    const name = frontmatter.name || parentDirName;
-
-    // Validate name
-    const nameErrors = validateName(name);
-    for (const error of nameErrors) {
+    const name = frontmatter.name || basename(skillDir);
+    for (const error of [...validateDescription(frontmatter.description), ...validateName(name)]) {
       diagnostics.push({ type: "warning", message: error, path: filePath });
     }
 
     // Still load the skill even with warnings (unless description is completely missing)
     if (!frontmatter.description || frontmatter.description.trim() === "") {
-      return { skill: null, diagnostics };
+      return { skills: [], diagnostics };
     }
 
     return {
-      skill: {
-        name,
-        description: frontmatter.description,
-        filePath,
-        baseDir: skillDir,
-        promptVersion: computeSkillPromptVersion(rawContent),
-        source,
-        sourceInfo: createSkillSourceInfo(filePath, skillDir, source),
-        disableModelInvocation: frontmatter["disable-model-invocation"] === true,
-      },
+      skills: [
+        materializeSkill({
+          content: rawContent,
+          frontmatter,
+          name,
+          description: frontmatter.description,
+          filePath,
+          baseDir: skillDir,
+          source,
+          sourceOptions: resolveSkillSourceOptions(source),
+        }),
+      ],
       diagnostics,
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : "failed to parse skill file";
     diagnostics.push({ type: "warning", message, path: filePath });
-    return { skill: null, diagnostics };
+    return { skills: [], diagnostics };
   }
 }
 
@@ -348,10 +208,10 @@ function loadSkillFromFile(
  */
 export function formatSkillsForPrompt(skills: Skill[]): string {
   const visibleSkills = skills.filter((s) => !s.disableModelInvocation);
-  return formatSkillContractForPrompt(visibleSkills);
+  return formatSkillsForPromptBounded({ skills: visibleSkills });
 }
 
-export interface LoadSkillsOptions {
+interface LoadSkillsOptions {
   /** Working directory for project-local skills. */
   cwd: string;
   /** Agent config directory for global skills. */
@@ -362,33 +222,14 @@ export interface LoadSkillsOptions {
   includeDefaults: boolean;
 }
 
-function normalizePath(input: string): string {
-  const trimmed = input.trim();
-  if (trimmed === "~") {
-    return homedir();
-  }
-  if (trimmed.startsWith("~/")) {
-    return join(homedir(), trimmed.slice(2));
-  }
-  if (trimmed.startsWith("~")) {
-    return join(homedir(), trimmed.slice(1));
-  }
-  return trimmed;
-}
-
 function resolveSkillPath(p: string, cwd: string): string {
-  const normalized = normalizePath(p);
+  const normalized = expandTildePath(p);
   return isAbsolute(normalized) ? normalized : resolve(cwd, normalized);
 }
 
-/**
- * Load skills from all configured locations.
- * Returns skills and any validation diagnostics.
- */
 export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
   const { cwd, agentDir, skillPaths, includeDefaults } = options;
 
-  // Resolve agentDir - if not provided, use default from config
   const resolvedAgentDir = agentDir ?? getAgentDir();
 
   const skillMap = new Map<string, Skill>();
@@ -399,10 +240,8 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
   function addSkills(result: LoadSkillsResult) {
     allDiagnostics.push(...result.diagnostics);
     for (const skill of result.skills) {
-      // Resolve symlinks to detect duplicate files
       const realPath = canonicalizePath(skill.filePath);
 
-      // Skip silently if we've already loaded this exact file (via symlink)
       if (realPathSet.has(realPath)) {
         continue;
       }
@@ -435,21 +274,12 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
   const userSkillsDir = join(resolvedAgentDir, "skills");
   const projectSkillsDir = resolve(cwd, CONFIG_DIR_NAME, "skills");
 
-  const isUnderPath = (target: string, root: string): boolean => {
-    const normalizedRoot = resolve(root);
-    if (target === normalizedRoot) {
-      return true;
-    }
-    const prefix = normalizedRoot.endsWith(sep) ? normalizedRoot : `${normalizedRoot}${sep}`;
-    return target.startsWith(prefix);
-  };
-
   const getSource = (resolvedPath: string): "user" | "project" | "path" => {
     if (!includeDefaults) {
-      if (isUnderPath(resolvedPath, userSkillsDir)) {
+      if (isPathInside(userSkillsDir, resolvedPath)) {
         return "user";
       }
-      if (isUnderPath(resolvedPath, projectSkillsDir)) {
+      if (isPathInside(projectSkillsDir, resolvedPath)) {
         return "project";
       }
     }
@@ -473,12 +303,7 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
       if (stats.isDirectory()) {
         addSkills(loadSkillsFromDirInternal(resolvedPath, source, true));
       } else if (stats.isFile() && resolvedPath.endsWith(".md")) {
-        const result = loadSkillFromFile(resolvedPath, source);
-        if (result.skill) {
-          addSkills({ skills: [result.skill], diagnostics: result.diagnostics });
-        } else {
-          allDiagnostics.push(...result.diagnostics);
-        }
+        addSkills(loadSkillFromFile(resolvedPath, source));
       } else {
         allDiagnostics.push({
           type: "warning",

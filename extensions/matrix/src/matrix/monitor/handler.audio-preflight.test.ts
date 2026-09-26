@@ -6,12 +6,13 @@ import {
   createMatrixRoomMessageEvent,
 } from "./handler.test-helpers.js";
 
-const { downloadMatrixMediaMock, sendDurableMessageBatchMock, transcribeFirstAudioMock } =
-  vi.hoisted(() => ({
+const { downloadMatrixMediaMock, sendTranscriptEchoMock, transcribeFirstAudioMock } = vi.hoisted(
+  () => ({
     downloadMatrixMediaMock: vi.fn(),
-    sendDurableMessageBatchMock: vi.fn(),
+    sendTranscriptEchoMock: vi.fn(),
     transcribeFirstAudioMock: vi.fn(),
-  }));
+  }),
+);
 
 vi.mock("./media.js", async () => {
   const actual = await vi.importActual<typeof import("./media.js")>("./media.js");
@@ -21,10 +22,21 @@ vi.mock("./media.js", async () => {
   };
 });
 
-vi.mock("./preflight-audio.runtime.js", () => ({
-  sendDurableMessageBatch: sendDurableMessageBatchMock,
-  transcribeFirstAudio: transcribeFirstAudioMock,
-}));
+vi.mock("openclaw/plugin-sdk/media-understanding-runtime", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("openclaw/plugin-sdk/media-understanding-runtime")>();
+  return {
+    ...actual,
+    createChannelPreflightAudio: (
+      params: Parameters<typeof actual.createChannelPreflightAudio>[0],
+    ) =>
+      actual.createChannelPreflightAudio({
+        ...params,
+        sendTranscriptEcho: sendTranscriptEchoMock,
+        transcribeFirstAudio: transcribeFirstAudioMock,
+      }),
+  };
+});
 
 function createAudioPreflightHarness(
   overrides: Parameters<typeof createMatrixHandlerTestHarness>[0] = {},
@@ -42,7 +54,6 @@ function createAudioPreflightHarness(
       matchedBy: "binding.account",
     }),
     resolveStorePath: () => "/tmp/openclaw-test-session.json",
-    readSessionUpdatedAt: () => 123,
     getRoomInfo: async () => ({
       name: "Audio Room",
       canonicalAlias: "#audio:example.org",
@@ -51,10 +62,18 @@ function createAudioPreflightHarness(
     getMemberDisplayName: async () => "Frank",
     startupMs: Date.now() - 120_000,
     startupGraceMs: 60_000,
-    textLimit: 4000,
     mediaMaxBytes: 5 * 1024 * 1024,
     replyToMode: "first",
     ...overrides,
+  });
+}
+
+function createVoiceEvent() {
+  return createAudioEvent({
+    msgtype: "m.audio",
+    body: "voice.ogg",
+    url: "mxc://example/voice",
+    info: { mimetype: "audio/ogg", size: 12345 },
   });
 }
 
@@ -80,36 +99,27 @@ function expectLatestInboundContext(
 
 describe("createMatrixRoomMessageHandler audio preflight", () => {
   beforeEach(() => {
-    downloadMatrixMediaMock.mockReset();
-    sendDurableMessageBatchMock.mockReset();
+    downloadMatrixMediaMock.mockReset().mockResolvedValue({
+      path: "/tmp/inbound/voice.ogg",
+      contentType: "audio/ogg",
+      placeholder: "[matrix audio attachment]",
+    });
+    sendTranscriptEchoMock.mockReset();
     transcribeFirstAudioMock.mockReset();
     installMatrixMonitorTestRuntime();
   });
 
   it("transcribes inbound voice notes in DMs and surfaces the transcript as the agent body", async () => {
-    downloadMatrixMediaMock.mockResolvedValue({
-      path: "/tmp/inbound/voice.ogg",
-      contentType: "audio/ogg",
-      placeholder: "[matrix audio attachment]",
-    });
     transcribeFirstAudioMock.mockResolvedValue("hello bot");
     const { handler, recordInboundSession } = createAudioPreflightHarness();
 
-    await handler(
-      "!room:example.org",
-      createAudioEvent({
-        msgtype: "m.audio",
-        body: "voice.ogg",
-        url: "mxc://example/voice",
-        info: { mimetype: "audio/ogg", size: 12345 },
-      }),
-    );
+    await handler("!room:example.org", createVoiceEvent());
 
+    expect(downloadMatrixMediaMock).toHaveBeenCalledTimes(1);
     expect(transcribeFirstAudioMock).toHaveBeenCalledWith(
       expect.objectContaining({
         ctx: expect.objectContaining({
-          MediaPaths: ["/tmp/inbound/voice.ogg"],
-          MediaTypes: ["audio/ogg"],
+          media: [{ path: "/tmp/inbound/voice.ogg", contentType: "audio/ogg" }],
           Provider: "matrix",
           Surface: "matrix",
           OriginatingChannel: "matrix",
@@ -129,11 +139,6 @@ describe("createMatrixRoomMessageHandler audio preflight", () => {
   });
 
   it("lets transcript-mentioned voice notes pass the requireMention room gate", async () => {
-    downloadMatrixMediaMock.mockResolvedValue({
-      path: "/tmp/inbound/voice.ogg",
-      contentType: "audio/ogg",
-      placeholder: "[matrix audio attachment]",
-    });
     transcribeFirstAudioMock.mockResolvedValue("bot can you check this");
     const { handler, recordInboundSession } = createAudioPreflightHarness({
       isDirectMessage: false,
@@ -143,15 +148,7 @@ describe("createMatrixRoomMessageHandler audio preflight", () => {
       },
     });
 
-    await handler(
-      "!room:example.org",
-      createAudioEvent({
-        msgtype: "m.audio",
-        body: "voice.ogg",
-        url: "mxc://example/voice",
-        info: { mimetype: "audio/ogg", size: 12345 },
-      }),
-    );
+    await handler("!room:example.org", createVoiceEvent());
 
     expect(transcribeFirstAudioMock).toHaveBeenCalledTimes(1);
     expect(expectLatestInboundContext(recordInboundSession)).toMatchObject({
@@ -160,12 +157,52 @@ describe("createMatrixRoomMessageHandler audio preflight", () => {
     });
   });
 
-  it("keeps non-filename audio fallback text while still surfacing the transcript", async () => {
+  it("transcribes encrypted room audio when a blank top-level URL masks its file URL", async () => {
     downloadMatrixMediaMock.mockResolvedValue({
-      path: "/tmp/inbound/voice.ogg",
+      path: "/tmp/inbound/encrypted-voice.ogg",
       contentType: "audio/ogg",
       placeholder: "[matrix audio attachment]",
     });
+    transcribeFirstAudioMock.mockResolvedValue("bot can you hear this encrypted voice note");
+    const { handler, recordInboundSession } = createAudioPreflightHarness({
+      isDirectMessage: false,
+      historyLimit: 5,
+      mentionRegexes: [/\bbot\b/i],
+      roomsConfig: {
+        "!room:example.org": { requireMention: true } as never,
+      },
+    });
+    const file = {
+      url: "mxc://example/encrypted-voice",
+      key: { kty: "oct", key_ops: ["encrypt"], alg: "A256CTR", k: "secret", ext: true },
+      iv: "iv",
+      hashes: { sha256: "hash" },
+      v: "v2",
+    };
+
+    await handler(
+      "!room:example.org",
+      createAudioEvent({
+        msgtype: "m.audio",
+        body: " \t ",
+        url: " ",
+        file,
+        info: { mimetype: "audio/ogg", size: 12345 },
+      }),
+    );
+
+    expect(downloadMatrixMediaMock).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ mxcUrl: "mxc://example/encrypted-voice", file }),
+    );
+    expect(transcribeFirstAudioMock).toHaveBeenCalledOnce();
+    expect(expectLatestInboundContext(recordInboundSession)).toMatchObject({
+      BodyForAgent: expect.stringContaining("bot can you hear this encrypted voice note"),
+      MediaPath: "/tmp/inbound/encrypted-voice.ogg",
+      WasMentioned: true,
+    });
+  });
+
+  it("keeps non-filename audio fallback text while still surfacing the transcript", async () => {
     transcribeFirstAudioMock.mockResolvedValue("hello bot from fallback audio");
     const { handler, recordInboundSession } = createAudioPreflightHarness();
 
@@ -187,12 +224,7 @@ describe("createMatrixRoomMessageHandler audio preflight", () => {
   });
 
   it("echoes accepted preflight transcripts after the mention gate", async () => {
-    downloadMatrixMediaMock.mockResolvedValue({
-      path: "/tmp/inbound/voice.ogg",
-      contentType: "audio/ogg",
-      placeholder: "[matrix audio attachment]",
-    });
-    sendDurableMessageBatchMock.mockResolvedValue({ status: "sent", results: [] });
+    sendTranscriptEchoMock.mockResolvedValue(undefined);
     transcribeFirstAudioMock.mockResolvedValue("hello bot");
     const { handler } = createAudioPreflightHarness({
       cfg: {
@@ -201,34 +233,22 @@ describe("createMatrixRoomMessageHandler audio preflight", () => {
       },
     });
 
-    await handler(
-      "!room:example.org",
-      createAudioEvent({
-        msgtype: "m.audio",
-        body: "voice.ogg",
-        url: "mxc://example/voice",
-        info: { mimetype: "audio/ogg", size: 12345 },
-      }),
-    );
+    await handler("!room:example.org", createVoiceEvent());
 
-    expect(sendDurableMessageBatchMock).toHaveBeenCalledWith(
+    expect(sendTranscriptEchoMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        channel: "matrix",
-        to: "room:!room:example.org",
-        accountId: "ops",
-        payloads: [{ text: '📝 "hello bot"' }],
-        bestEffort: true,
-        durability: "best_effort",
+        ctx: expect.objectContaining({
+          Provider: "matrix",
+          OriginatingTo: "room:!room:example.org",
+          AccountId: "ops",
+        }),
+        transcript: "hello bot",
+        format: '📝 "{transcript}"',
       }),
     );
   });
 
   it("drops transcript-unmentioned voice notes in requireMention rooms", async () => {
-    downloadMatrixMediaMock.mockResolvedValue({
-      path: "/tmp/inbound/voice.ogg",
-      contentType: "audio/ogg",
-      placeholder: "[matrix audio attachment]",
-    });
     transcribeFirstAudioMock.mockResolvedValue("hello world");
     const { handler, recordInboundSession } = createAudioPreflightHarness({
       isDirectMessage: false,
@@ -239,15 +259,7 @@ describe("createMatrixRoomMessageHandler audio preflight", () => {
       },
     });
 
-    await handler(
-      "!room:example.org",
-      createAudioEvent({
-        msgtype: "m.audio",
-        body: "voice.ogg",
-        url: "mxc://example/voice",
-        info: { mimetype: "audio/ogg", size: 12345 },
-      }),
-    );
+    await handler("!room:example.org", createVoiceEvent());
 
     expect(transcribeFirstAudioMock).toHaveBeenCalledTimes(1);
     expect(recordInboundSession).not.toHaveBeenCalled();
@@ -281,15 +293,7 @@ describe("createMatrixRoomMessageHandler audio preflight", () => {
       },
     });
 
-    await handler(
-      "!room:example.org",
-      createAudioEvent({
-        msgtype: "m.audio",
-        body: "voice.ogg",
-        url: "mxc://example/voice",
-        info: { mimetype: "audio/ogg", size: 12345 },
-      }),
-    );
+    await handler("!room:example.org", createVoiceEvent());
 
     expect(downloadMatrixMediaMock).not.toHaveBeenCalled();
     expect(transcribeFirstAudioMock).not.toHaveBeenCalled();
@@ -315,15 +319,7 @@ describe("createMatrixRoomMessageHandler audio preflight", () => {
       },
     });
 
-    const slowAudio = handler(
-      "!room:example.org",
-      createAudioEvent({
-        msgtype: "m.audio",
-        body: "voice.ogg",
-        url: "mxc://example/voice",
-        info: { mimetype: "audio/ogg", size: 12345 },
-      }),
-    );
+    const slowAudio = handler("!room:example.org", createVoiceEvent());
     await new Promise((resolve) => {
       setTimeout(resolve, 0);
     });
@@ -362,23 +358,10 @@ describe("createMatrixRoomMessageHandler audio preflight", () => {
   });
 
   it("keeps placeholder body when transcription fails", async () => {
-    downloadMatrixMediaMock.mockResolvedValue({
-      path: "/tmp/inbound/voice.ogg",
-      contentType: "audio/ogg",
-      placeholder: "[matrix audio attachment]",
-    });
     transcribeFirstAudioMock.mockRejectedValue(new Error("STT down"));
     const { handler, recordInboundSession } = createAudioPreflightHarness();
 
-    await handler(
-      "!room:example.org",
-      createAudioEvent({
-        msgtype: "m.audio",
-        body: "voice.ogg",
-        url: "mxc://example/voice",
-        info: { mimetype: "audio/ogg", size: 12345 },
-      }),
-    );
+    await handler("!room:example.org", createVoiceEvent());
 
     expect(expectLatestInboundContext(recordInboundSession)).toMatchObject({
       BodyForAgent: "[matrix audio attachment]",
@@ -471,27 +454,5 @@ describe("createMatrixRoomMessageHandler audio preflight", () => {
       BodyForAgent: "[matrix audio attachment too large]",
     });
     expect(expectLatestInboundContext(recordInboundSession).MediaPath).toBeUndefined();
-  });
-
-  it("downloads audio only once across preflight and normal media handling", async () => {
-    downloadMatrixMediaMock.mockResolvedValue({
-      path: "/tmp/inbound/voice.ogg",
-      contentType: "audio/ogg",
-      placeholder: "[matrix audio attachment]",
-    });
-    transcribeFirstAudioMock.mockResolvedValue("hello bot");
-    const { handler } = createAudioPreflightHarness();
-
-    await handler(
-      "!room:example.org",
-      createAudioEvent({
-        msgtype: "m.audio",
-        body: "voice.ogg",
-        url: "mxc://example/voice",
-        info: { mimetype: "audio/ogg", size: 12345 },
-      }),
-    );
-
-    expect(downloadMatrixMediaMock).toHaveBeenCalledTimes(1);
   });
 });

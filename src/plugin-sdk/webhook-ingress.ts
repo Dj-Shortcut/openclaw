@@ -1,6 +1,13 @@
 /**
  * Public SDK subpath for webhook ingress guards, targets, and request helpers.
  */
+import type { IncomingMessage } from "node:http";
+import { resolveRequestClientIpFromHeaders } from "../gateway/net.js";
+import { getWebhookLegacyListener } from "../plugins/http-legacy-listener.js";
+import { getPluginRuntimeGatewayRequestScope } from "../plugins/runtime/gateway-request-scope.js";
+
+export { getWebhookLegacyListener };
+
 export {
   createBoundedCounter,
   createFixedWindowRateLimiter,
@@ -28,11 +35,14 @@ export {
   type WebhookInFlightLimiter,
 } from "./webhook-request-guards.js";
 export {
+  canonicalizeWebhookRouteKey,
   registerPluginHttpRoute,
   registerWebhookTarget,
   registerWebhookTargetWithPluginRoute,
   resolveSingleWebhookTarget,
   resolveSingleWebhookTargetAsync,
+  normalizeWebhookPath,
+  resolveWebhookPath,
   resolveWebhookTargetWithAuthOrReject,
   resolveWebhookTargetWithAuthOrRejectSync,
   resolveWebhookTargets,
@@ -42,9 +52,19 @@ export {
   type RegisteredWebhookTarget,
   type WebhookTargetMatchResult,
 } from "./webhook-targets.js";
-export { normalizeWebhookPath, resolveWebhookPath } from "./webhook-path.js";
-export { resolveRequestClientIp } from "../gateway/net.js";
-export { createAuthRateLimiter } from "../gateway/auth-rate-limit.js";
+export function resolveRequestClientIp(
+  req?: IncomingMessage,
+  trustedProxies?: string[],
+  allowRealIpFallback = false,
+): string | undefined {
+  // Legacy ports keep the channel's proxy policy; the Gateway port uses validated attribution.
+  return (
+    (!req || !getWebhookLegacyListener(req)
+      ? getPluginRuntimeGatewayRequestScope()?.client?.clientIp
+      : undefined) ?? resolveRequestClientIpFromHeaders(req, trustedProxies, allowRealIpFallback)
+  );
+}
+export { createGatewayAuthRateLimiter as createAuthRateLimiter } from "../gateway/auth-rate-limit.js";
 export type { AuthRateLimiter, RateLimitConfig } from "../gateway/auth-rate-limit.js";
 export { rawDataToString } from "../infra/ws.js";
 export { normalizePluginHttpPath } from "../plugins/http-path.js";

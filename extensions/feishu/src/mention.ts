@@ -1,4 +1,3 @@
-// Feishu plugin module implements mention behavior.
 import type { FeishuMessageEvent } from "./event-types.js";
 import type { MentionTarget } from "./mention-target.types.js";
 import { isFeishuGroupChatType } from "./types.js";
@@ -28,22 +27,14 @@ export function isFeishuBroadcastMention(mention: FeishuMentionLike): boolean {
  */
 export function extractMentionTargets(
   event: FeishuMessageEvent,
-  botOpenId?: string,
+  botOpenId: string,
 ): MentionTarget[] {
   const mentions = event.message.mentions ?? [];
 
   return mentions
-    .filter((m) => {
-      if (isFeishuBroadcastMention(m)) {
-        return false;
-      }
-      // Exclude the bot itself
-      if (botOpenId && m.id.open_id === botOpenId) {
-        return false;
-      }
-      // Must have open_id
-      return Boolean(m.id.open_id);
-    })
+    .filter(
+      (m) => !isFeishuBroadcastMention(m) && m.id.open_id !== botOpenId && Boolean(m.id.open_id),
+    )
     .map((m) => ({
       openId: m.id.open_id!,
       name: m.name,
@@ -62,54 +53,29 @@ export function isMentionForwardRequest(event: FeishuMessageEvent, botOpenId?: s
   if (mentions.length === 0) {
     return false;
   }
+  const normalizedBotOpenId = botOpenId?.trim();
+  if (!normalizedBotOpenId) {
+    return false;
+  }
 
   const isDirectMessage = !isFeishuGroupChatType(event.message.chat_type);
   const userMentions = mentions.filter((m) => !isFeishuBroadcastMention(m));
-  const hasOtherMention = userMentions.some((m) => m.id.open_id !== botOpenId);
+  const hasOtherMention = userMentions.some((m) => m.id.open_id !== normalizedBotOpenId);
 
   if (isDirectMessage) {
     // DM: trigger if any non-bot user is mentioned
     return hasOtherMention;
   }
   // Group: need to mention both bot and other users
-  const hasBotMention = userMentions.some((m) => m.id.open_id === botOpenId);
+  const hasBotMention = userMentions.some((m) => m.id.open_id === normalizedBotOpenId);
   return hasBotMention && hasOtherMention;
 }
 
-/**
- * Format @mention for text message
- */
-function formatMentionForText(target: MentionTarget): string {
-  return `<at user_id="${target.openId}">${target.name}</at>`;
-}
-
-/**
- * Format @mention for card message (lark_md)
- */
-function formatMentionForCard(target: MentionTarget): string {
-  return `<at id=${target.openId}></at>`;
-}
-
-/**
- * Build complete message with @mentions (text format)
- */
-export function buildMentionedMessage(targets: MentionTarget[], message: string): string {
-  if (targets.length === 0) {
-    return message;
-  }
-
-  const mentionParts = targets.map((t) => formatMentionForText(t));
-  return `${mentionParts.join(" ")} ${message}`;
-}
-
-/**
- * Build card content with @mentions (Markdown format)
- */
 export function buildMentionedCardContent(targets: MentionTarget[], message: string): string {
   if (targets.length === 0) {
     return message;
   }
 
-  const mentionParts = targets.map((t) => formatMentionForCard(t));
+  const mentionParts = targets.map((target) => `<at id=${target.openId}></at>`);
   return `${mentionParts.join(" ")} ${message}`;
 }

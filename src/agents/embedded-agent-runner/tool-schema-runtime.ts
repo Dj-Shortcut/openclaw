@@ -11,7 +11,6 @@ import {
 } from "../../plugins/provider-runtime.js";
 import type { ProviderToolSchemaDiagnostic } from "../../plugins/types.js";
 import type { AgentTool } from "../runtime/index.js";
-import type { AnyAgentTool } from "../tools/common.js";
 import { log } from "./logger.js";
 
 type ProviderToolSchemaParams<TSchemaType extends TSchema = TSchema, TResult = unknown> = {
@@ -27,19 +26,27 @@ type ProviderToolSchemaParams<TSchemaType extends TSchema = TSchema, TResult = u
   allowRuntimePluginLoad?: boolean;
 };
 
-function buildProviderToolSchemaContext<TSchemaType extends TSchema = TSchema, TResult = unknown>(
+function buildProviderToolSchemaParams<TSchemaType extends TSchema = TSchema, TResult = unknown>(
   params: ProviderToolSchemaParams<TSchemaType, TResult>,
-  provider: string,
 ) {
+  const provider = params.provider.trim();
   return {
     config: params.config,
     workspaceDir: params.workspaceDir,
     env: params.env,
     provider,
-    modelId: params.modelId,
-    modelApi: params.modelApi,
-    model: params.model,
-    tools: params.tools as unknown as AnyAgentTool[],
+    runtimeHandle: params.runtimeHandle,
+    allowRuntimePluginLoad: params.allowRuntimePluginLoad,
+    context: {
+      config: params.config,
+      workspaceDir: params.workspaceDir,
+      env: params.env,
+      provider,
+      modelId: params.modelId,
+      modelApi: params.modelApi,
+      model: params.model,
+      tools: params.tools,
+    },
   };
 }
 
@@ -51,16 +58,9 @@ export function normalizeProviderToolSchemas<
   TSchemaType extends TSchema = TSchema,
   TResult = unknown,
 >(params: ProviderToolSchemaParams<TSchemaType, TResult>): AgentTool<TSchemaType, TResult>[] {
-  const provider = params.provider.trim();
-  const pluginNormalized = normalizeProviderToolSchemasWithPlugin({
-    provider,
-    config: params.config,
-    workspaceDir: params.workspaceDir,
-    env: params.env,
-    runtimeHandle: params.runtimeHandle,
-    allowRuntimePluginLoad: params.allowRuntimePluginLoad,
-    context: buildProviderToolSchemaContext(params, provider),
-  });
+  const pluginNormalized = normalizeProviderToolSchemasWithPlugin(
+    buildProviderToolSchemaParams(params),
+  );
   return Array.isArray(pluginNormalized)
     ? (pluginNormalized as AgentTool<TSchemaType, TResult>[])
     : params.tools;
@@ -70,16 +70,7 @@ export function normalizeProviderToolSchemas<
  * Logs provider-owned tool-schema diagnostics after normalization.
  */
 export function logProviderToolSchemaDiagnostics(params: ProviderToolSchemaParams): void {
-  const provider = params.provider.trim();
-  const diagnostics = inspectProviderToolSchemasWithPlugin({
-    provider,
-    config: params.config,
-    workspaceDir: params.workspaceDir,
-    env: params.env,
-    runtimeHandle: params.runtimeHandle,
-    allowRuntimePluginLoad: params.allowRuntimePluginLoad,
-    context: buildProviderToolSchemaContext(params, provider),
-  });
+  const diagnostics = inspectProviderToolSchemasWithPlugin(buildProviderToolSchemaParams(params));
   if (!Array.isArray(diagnostics)) {
     return;
   }

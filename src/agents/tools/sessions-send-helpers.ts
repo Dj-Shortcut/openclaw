@@ -1,24 +1,12 @@
-/**
- * sessions_send helper logic.
- *
- * Resolves announcement targets, channel/session routing metadata, and ping-pong guard prompt text.
- */
 import {
   getChannelPlugin,
   normalizeChannelId as normalizeAnyChannelId,
 } from "../../channels/plugins/index.js";
 import { resolveSessionConversationRef } from "../../channels/plugins/session-conversation.js";
-import { normalizeChannelId as normalizeChatChannelId } from "../../channels/registry.js";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { normalizeChatChannelId } from "../../channels/registry.js";
+import { parseSessionDeliveryRoute } from "../../sessions/session-key-utils.js";
 import { ANNOUNCE_SKIP_TOKEN, REPLY_SKIP_TOKEN } from "./sessions-send-tokens.js";
-export {
-  isAnnounceSkip,
-  isNonDeliverableSessionsReply,
-  isReplySkip,
-} from "./sessions-send-tokens.js";
-
-const DEFAULT_AGENTNG_PONG_TURNS = 5;
-const MAX_PING_PONG_TURNS = 20;
+export { isNonDeliverableSessionsReply } from "./sessions-send-tokens.js";
 
 export type AnnounceTarget = {
   channel: string;
@@ -27,11 +15,34 @@ export type AnnounceTarget = {
   threadId?: string; // Forum topic/thread ID
 };
 
-/** Resolves a session key into the channel target used for source-reply announcements. */
 export function resolveAnnounceTargetFromKey(sessionKey: string): AnnounceTarget | null {
   const parsed = resolveSessionConversationRef(sessionKey);
   if (!parsed) {
-    return null;
+    const directRoute = parseSessionDeliveryRoute(sessionKey);
+    if (!directRoute || (directRoute.peerKind !== "direct" && directRoute.peerKind !== "dm")) {
+      return null;
+    }
+
+    const normalizedChannel =
+      normalizeAnyChannelId(directRoute.channel) ?? normalizeChatChannelId(directRoute.channel);
+    const channel = normalizedChannel ?? directRoute.channel;
+    const messaging = normalizedChannel
+      ? getChannelPlugin(normalizedChannel)?.messaging
+      : undefined;
+    // Session peers are canonical; adapters restore API casing at their boundary.
+    // Channel-style resolvers must not turn an explicit direct user into a room.
+    const resolvedTarget =
+      messaging?.directTargetStyle === "user-prefixed"
+        ? undefined
+        : messaging?.resolveDeliveryTarget?.({ conversationId: directRoute.peerId });
+    const directTarget = `user:${directRoute.peerId}`;
+
+    return {
+      channel,
+      to: resolvedTarget?.to?.trim() || messaging?.normalizeTarget?.(directTarget) || directTarget,
+      ...(directRoute.accountId ? { accountId: directRoute.accountId } : {}),
+      threadId: resolvedTarget?.threadId ?? directRoute.threadId,
+    };
   }
   const normalizedChannel =
     normalizeAnyChannelId(parsed.channel) ?? normalizeChatChannelId(parsed.channel);
@@ -71,19 +82,14 @@ function buildAgentSessionLines(params: {
   ].filter((line): line is string => Boolean(line));
 }
 
-/** Builds the initial prompt context for a sessions_send agent-to-agent request. */
 export function buildAgentToAgentMessageContext(params: {
   requesterSessionKey?: string;
   requesterChannel?: string;
   targetSessionKey: string;
 }) {
-  const lines = ["Agent-to-agent message context:", ...buildAgentSessionLines(params)].filter(
-    Boolean,
-  );
-  return lines.join("\n");
+  return ["Agent-to-agent message context:", ...buildAgentSessionLines(params)].join("\n");
 }
 
-/** Builds the bounded ping-pong reply prompt for the current A2A participant. */
 export function buildAgentToAgentReplyContext(params: {
   requesterSessionKey?: string;
   requesterChannel?: string;
@@ -95,17 +101,15 @@ export function buildAgentToAgentReplyContext(params: {
 }) {
   const currentLabel =
     params.currentRole === "requester" ? "Agent 1 (requester)" : "Agent 2 (target)";
-  const lines = [
+  return [
     "Agent-to-agent reply step:",
     `Current agent: ${currentLabel}.`,
     `Turn ${params.turn} of ${params.maxTurns}.`,
     ...buildAgentSessionLines(params),
     `If you want to stop the ping-pong, reply exactly "${REPLY_SKIP_TOKEN}".`,
-  ].filter(Boolean);
-  return lines.join("\n");
+  ].join("\n");
 }
 
-/** Builds the final announce prompt that decides whether to post back to the target channel. */
 export function buildAgentToAgentAnnounceContext(params: {
   requesterSessionKey?: string;
   requesterChannel?: string;
@@ -115,7 +119,7 @@ export function buildAgentToAgentAnnounceContext(params: {
   roundOneReply?: string;
   latestReply?: string;
 }) {
-  const lines = [
+  return [
     "Agent-to-agent announce step:",
     ...buildAgentSessionLines(params),
     `Original request: ${params.originalMessage}`,
@@ -124,19 +128,7 @@ export function buildAgentToAgentAnnounceContext(params: {
       : "Round 1 reply: (not available).",
     params.latestReply ? `Latest reply: ${params.latestReply}` : "Latest reply: (not available).",
     `If you want to remain silent, reply exactly "${ANNOUNCE_SKIP_TOKEN}".`,
-    "Any other reply will be posted to the target channel.",
+    "Any other reply is recorded in the target session. External delivery is attempted only if the target has a delivery route.",
     "After this reply, the agent-to-agent conversation is over.",
-  ].filter(Boolean);
-  return lines.join("\n");
-}
-
-/** Resolves the configured A2A ping-pong turn limit with a hard runtime cap. */
-export function resolvePingPongTurns(cfg?: OpenClawConfig) {
-  const raw = cfg?.session?.agentToAgent?.maxPingPongTurns;
-  const fallback = DEFAULT_AGENTNG_PONG_TURNS;
-  if (typeof raw !== "number" || !Number.isFinite(raw)) {
-    return fallback;
-  }
-  const rounded = Math.floor(raw);
-  return Math.max(0, Math.min(MAX_PING_PONG_TURNS, rounded));
+  ].join("\n");
 }

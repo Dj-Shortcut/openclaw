@@ -6,17 +6,15 @@
 import fs from "node:fs";
 import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { fetchWithSsrFGuard } from "../infra/net/fetch-guard.js";
+import { wrapGuardedBodyStream } from "../infra/net/guarded-body-stream.js";
 import {
   ssrfPolicyFromHttpBaseUrlAllowedOrigin,
   type PinnedDispatcherPolicy,
 } from "../infra/net/ssrf.js";
 import { loadUndiciRuntimeDeps } from "../infra/net/undici-runtime.js";
 
-/** MCP SDK-compatible fetch function type. */
-export type { FetchLike };
-
 /** Default MCP HTTP fetch backed by lazy-loaded undici runtime deps. */
-export const fetchWithUndici: FetchLike = async (url, init) =>
+const fetchWithUndici: FetchLike = async (url, init) =>
   (await loadUndiciRuntimeDeps().fetch(
     url,
     init as Parameters<ReturnType<typeof loadUndiciRuntimeDeps>["fetch"]>[1],
@@ -28,11 +26,6 @@ const fetchWithUndiciGuard = async (
 ): Promise<Response> => await fetchWithUndici(input instanceof Request ? input.url : input, init);
 
 const MCP_HTTP_MAX_REDIRECTS = 20;
-const managedMcpResponseCleanupRegistry = new FinalizationRegistry<{
-  finalize: () => Promise<void>;
-}>((held) => {
-  void held.finalize();
-});
 
 function resolveFetchRequest(input: RequestInfo | URL, init?: RequestInit) {
   if (input instanceof Request) {
@@ -40,39 +33,22 @@ function resolveFetchRequest(input: RequestInfo | URL, init?: RequestInit) {
     const body = request.body ?? undefined;
     return {
       url: request.url,
+      signal: request.signal,
       init: {
         method: request.method,
         headers: request.headers,
         body,
         redirect: request.redirect,
-        signal: request.signal,
         ...(body ? ({ duplex: "half" } as const) : {}),
       } satisfies RequestInit & { duplex?: "half" },
     };
   }
+  const { signal, ...requestInit } = init ?? {};
   return {
     url: input instanceof URL ? input.toString() : input,
-    init,
+    signal: signal ?? undefined,
+    init: init ? requestInit : undefined,
   };
-}
-
-async function ensureGlobalFetchResponse(response: Response): Promise<Response> {
-  const init = {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  };
-  if (response.body != null) {
-    return new Response(response.body, init);
-  }
-  if (response.status === 204 || response.status === 205 || response.status === 304) {
-    return new Response(null, init);
-  }
-  if (typeof response.text === "function") {
-    const text = await response.text();
-    return new Response(text, init);
-  }
-  return new Response(null, init);
 }
 
 async function buildManagedMcpResponse(
@@ -82,56 +58,18 @@ async function buildManagedMcpResponse(
 ): Promise<Response> {
   if (!response.body) {
     void release();
-    return await ensureGlobalFetchResponse(response);
   }
-
-  const source = response.body;
-  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-  let released = false;
-  const cleanupRegistrationToken = {};
-  const finalize = async () => {
-    if (released) {
-      return;
-    }
-    released = true;
-    managedMcpResponseCleanupRegistry.unregister(cleanupRegistrationToken);
-    await reader?.cancel().catch(() => undefined);
-    await release().catch(() => undefined);
-  };
-  const wrappedBody = new ReadableStream<Uint8Array>({
-    start() {
-      reader = source.getReader();
-    },
-    async pull(controller) {
-      try {
-        const chunk = await reader?.read();
-        if (!chunk || chunk.done) {
-          controller.close();
-          await finalize();
-          return;
-        }
-        refreshTimeout?.();
-        controller.enqueue(chunk.value);
-      } catch (error) {
-        controller.error(error);
-        await finalize();
-      }
-    },
-    async cancel(reason) {
-      try {
-        await reader?.cancel(reason);
-      } finally {
-        await finalize();
-      }
-    },
-  });
-  managedMcpResponseCleanupRegistry.register(wrappedBody, { finalize }, cleanupRegistrationToken);
-  return await ensureGlobalFetchResponse(
-    new Response(wrappedBody, {
+  // A body-less foreign Response exposes no bounded reader. Never materialize it
+  // with text() or arrayBuffer() before the transport's response cap can apply.
+  return new Response(
+    response.body
+      ? wrapGuardedBodyStream({ body: response.body, cleanup: release, refreshTimeout })
+      : null,
+    {
       status: response.status,
       statusText: response.statusText,
       headers: response.headers,
-    }),
+    },
   );
 }
 
@@ -141,6 +79,8 @@ export function buildMcpHttpFetch(params: {
   clientCert?: string;
   clientKey?: string;
   resourceUrl?: string;
+  timeoutMs?: number;
+  beforeRequest?: () => void;
 }): FetchLike {
   const needsCustomDispatcher =
     params.sslVerify === false || Boolean(params.clientCert || params.clientKey);
@@ -172,6 +112,9 @@ export function buildMcpHttpFetch(params: {
       allowCrossOriginUnsafeRedirectReplay: true,
       auditContext: "mcp-http",
       useEnvProxyForEligibleUrls: true,
+      beforeRequest: params.beforeRequest,
+      ...(request.signal ? { signal: request.signal } : {}),
+      ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
       ...(policy ? { policy } : {}),
       ...(needsCustomDispatcher ? { resolveDispatcherPolicy: resolveCustomDispatcherPolicy } : {}),
     };

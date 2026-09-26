@@ -2,6 +2,13 @@
 import { describe, expect, it } from "vitest";
 import { validateConfigObjectWithPlugins } from "./validation.js";
 
+function mappingConfig(mapping: Record<string, unknown>) {
+  return {
+    agents: { entries: { openclaw: {} } },
+    hooks: { mappings: [{ match: { path: "custom" }, action: "agent", ...mapping }] },
+  };
+}
+
 describe("config hooks module paths", () => {
   const expectRejectedIssuePath = (config: Record<string, unknown>, expectedPath: string) => {
     const res = validateConfigObjectWithPlugins(config);
@@ -12,104 +19,39 @@ describe("config hooks module paths", () => {
     expect(res.issues.map((issue) => issue.path)).toContain(expectedPath);
   };
 
-  it("rejects absolute hooks.mappings[].transform.module", () => {
-    expectRejectedIssuePath(
-      {
-        agents: { list: [{ id: "openclaw" }] },
-        hooks: {
-          mappings: [
-            {
-              match: { path: "custom" },
-              action: "agent",
-              transform: { module: "/tmp/transform.mjs" },
-            },
-          ],
-        },
-      },
-      "hooks.mappings.0.transform.module",
-    );
-  });
+  it.each(["/tmp/transform.mjs", "../escape.mjs"])(
+    "rejects unsafe transform module %s",
+    (module) => {
+      expectRejectedIssuePath(
+        mappingConfig({ transform: { module } }),
+        "hooks.mappings.0.transform.module",
+      );
+    },
+  );
 
-  it("rejects escaping hooks.mappings[].transform.module", () => {
+  it("rejects retired hooks.internal.handlers registrations", () => {
     expectRejectedIssuePath(
       {
-        agents: { list: [{ id: "openclaw" }] },
-        hooks: {
-          mappings: [
-            {
-              match: { path: "custom" },
-              action: "agent",
-              transform: { module: "../escape.mjs" },
-            },
-          ],
-        },
-      },
-      "hooks.mappings.0.transform.module",
-    );
-  });
-
-  it("rejects absolute hooks.internal.handlers[].module", () => {
-    expectRejectedIssuePath(
-      {
-        agents: { list: [{ id: "openclaw" }] },
+        agents: { entries: { openclaw: {} } },
         hooks: {
           internal: {
             enabled: true,
-            handlers: [{ event: "command:new", module: "/tmp/handler.mjs" }],
+            handlers: [{ event: "command:new", module: "hooks/handler.mjs" }],
           },
         },
       },
-      "hooks.internal.handlers.0.module",
-    );
-  });
-
-  it("rejects escaping hooks.internal.handlers[].module", () => {
-    expectRejectedIssuePath(
-      {
-        agents: { list: [{ id: "openclaw" }] },
-        hooks: {
-          internal: {
-            enabled: true,
-            handlers: [{ event: "command:new", module: "../handler.mjs" }],
-          },
-        },
-      },
-      "hooks.internal.handlers.0.module",
+      "hooks.internal",
     );
   });
 
   it("accepts hooks.mappings[].channel runtime plugin ids", () => {
-    const res = validateConfigObjectWithPlugins({
-      agents: { list: [{ id: "openclaw" }] },
-      hooks: {
-        mappings: [
-          {
-            match: { path: "custom" },
-            action: "agent",
-            channel: "collabchat",
-            messageTemplate: "hello",
-          },
-        ],
-      },
-    });
+    const res = validateConfigObjectWithPlugins(
+      mappingConfig({ channel: "collabchat", messageTemplate: "hello" }),
+    );
     expect(res.ok).toBe(true);
   });
 
   it("rejects blank hooks.mappings[].channel values", () => {
-    expectRejectedIssuePath(
-      {
-        agents: { list: [{ id: "openclaw" }] },
-        hooks: {
-          mappings: [
-            {
-              match: { path: "custom" },
-              action: "agent",
-              channel: "   ",
-            },
-          ],
-        },
-      },
-      "hooks.mappings.0.channel",
-    );
+    expectRejectedIssuePath(mappingConfig({ channel: "   " }), "hooks.mappings.0.channel");
   });
 });

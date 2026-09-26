@@ -1,9 +1,9 @@
 // Token-provider normalization hooks for provider-backed auth choices.
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import { resolveProviderMatch } from "../plugins/provider-auth-choice-helpers.js";
 import { resolvePluginProviders } from "../plugins/provider-auth-choice.runtime.js";
 import type { ProviderAuthKind } from "../plugins/types.js";
-import { normalizeTokenProviderInput } from "./auth-choice.apply-helpers.js";
-import type { ApplyAuthChoiceParams, ApplyAuthChoiceResult } from "./auth-choice.apply.types.js";
+import type { ApplyAuthChoiceParams } from "./auth-choice.apply.types.js";
 import type { AuthChoice } from "./onboard-types.js";
 
 function resolveProviderAuthChoiceByKind(params: {
@@ -37,38 +37,26 @@ export function normalizeApiKeyTokenProviderAuthChoice(params: {
   if (!params.tokenProvider) {
     return params.authChoice;
   }
-  const normalizedTokenProvider = normalizeTokenProviderInput(params.tokenProvider);
+  const normalizedTokenProvider = normalizeOptionalLowercaseString(params.tokenProvider);
   if (!normalizedTokenProvider) {
     return params.authChoice;
   }
-  if (params.authChoice === "token" || params.authChoice === "setup-token") {
-    return (
-      resolveProviderAuthChoiceByKind({
-        providerId: normalizedTokenProvider,
-        kind: "token",
-        config: params.config,
-        workspaceDir: params.workspaceDir,
-        env: params.env,
-      }) ?? params.authChoice
-    );
-  }
-  if (params.authChoice !== "apiKey") {
+  const kind =
+    params.authChoice === "apiKey"
+      ? "api_key"
+      : params.authChoice === "token" || params.authChoice === "setup-token"
+        ? "token"
+        : undefined;
+  if (!kind) {
     return params.authChoice;
   }
   return (
     resolveProviderAuthChoiceByKind({
       providerId: normalizedTokenProvider,
-      kind: "api_key",
+      kind,
       config: params.config,
       workspaceDir: params.workspaceDir,
       env: params.env,
     }) ?? params.authChoice
   );
-}
-
-/** Reserved extension point for historical api-provider auth application flows. */
-export async function applyAuthChoiceApiProviders(
-  _params: ApplyAuthChoiceParams,
-): Promise<ApplyAuthChoiceResult | null> {
-  return null;
 }

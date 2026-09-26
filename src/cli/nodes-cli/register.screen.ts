@@ -11,12 +11,11 @@ import { parseDurationMs } from "../parse-duration.js";
 import { runNodesCommand } from "./cli-utils.js";
 import {
   buildNodeInvokeParams,
-  callGatewayCli,
+  callNodesGatewayCli,
   nodesCallOpts,
   parseOptionalNodeFiniteNumber,
-  parseOptionalNodeNonNegativeInteger,
-  parseOptionalNodePositiveInteger,
-  resolveNodeId,
+  parseOptionalNodeInteger,
+  resolveCliNodeId,
 } from "./rpc.js";
 import type { NodesRpcOpts } from "./types.js";
 
@@ -39,31 +38,32 @@ export function registerNodesScreenCommands(nodes: Command) {
       .option("--invoke-timeout <ms>", "Node invoke timeout in ms (default 120000)", "120000")
       .action(async (opts: NodesRpcOpts & { out?: string }) => {
         await runNodesCommand("screen record", async () => {
-          const nodeId = await resolveNodeId(opts, opts.node ?? "");
           const durationMs = parseDurationMs(opts.duration ?? "");
-          const screenIndex = parseOptionalNodeNonNegativeInteger(opts.screen ?? "0", "--screen");
+          const screenIndex = parseOptionalNodeInteger(
+            opts.screen ?? "0",
+            "--screen",
+            "non-negative",
+          );
           const fps = parseOptionalNodeFiniteNumber(opts.fps ?? "10", "--fps", {
             minExclusive: 0,
           });
-          const timeoutMs = parseOptionalNodePositiveInteger(
-            opts.invokeTimeout,
-            "--invoke-timeout",
-          );
+          const timeoutMs = parseOptionalNodeInteger(opts.invokeTimeout, "--invoke-timeout");
+          const nodeId = await resolveCliNodeId(opts, opts.node ?? "");
 
           const invokeParams = buildNodeInvokeParams({
             nodeId,
             command: "screen.record",
             params: {
-              durationMs: Number.isFinite(durationMs) ? durationMs : undefined,
-              screenIndex: Number.isFinite(screenIndex) ? screenIndex : undefined,
-              fps: Number.isFinite(fps) ? fps : undefined,
+              durationMs,
+              screenIndex,
+              fps,
               format: "mp4",
               includeAudio: opts.audio !== false,
             },
             timeoutMs,
           });
 
-          const raw = await callGatewayCli("node.invoke", opts, invokeParams);
+          const raw = await callNodesGatewayCli("node.invoke", opts, invokeParams);
           const res = typeof raw === "object" && raw !== null ? (raw as { payload?: unknown }) : {};
           const parsed = parseScreenRecordPayload(res.payload);
           const filePath = opts.out ?? screenRecordTempPath({ ext: parsed.format || "mp4" });

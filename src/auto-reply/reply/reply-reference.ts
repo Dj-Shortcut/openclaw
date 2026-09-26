@@ -3,7 +3,7 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import type { ReplyToMode } from "../../config/types.js";
 
 /** Stateful planner for reply-to ids across one delivery flow. */
-export type ReplyReferencePlanner = {
+type ReplyReferencePlanner = {
   /** Returns the effective reply/thread id for the next send without updating state. */
   peek(): string | undefined;
   /** Returns the effective reply/thread id for the next send and updates state. */
@@ -37,23 +37,14 @@ export function createReplyReferencePlanner(options: {
   const startId = normalizeOptionalString(options.startId);
 
   const resolve = (): string | undefined => {
-    if (!allowReference) {
+    if (
+      !allowReference ||
+      options.replyToMode === "off" ||
+      (isSingleUseReplyToMode(options.replyToMode) && hasReplied)
+    ) {
       return undefined;
     }
-    if (options.replyToMode === "off") {
-      return undefined;
-    }
-    const id = existingId ?? startId;
-    if (!id) {
-      return undefined;
-    }
-    if (options.replyToMode === "all") {
-      return id;
-    }
-    if (isSingleUseReplyToMode(options.replyToMode) && hasReplied) {
-      return undefined;
-    }
-    return id;
+    return existingId ?? startId;
   };
 
   const use = (): string | undefined => {

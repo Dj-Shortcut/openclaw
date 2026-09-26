@@ -11,27 +11,12 @@ import type { CodexAppServerRuntimeOptions, resolveCodexPluginsPolicy } from "./
 
 type TrustedDiagnosticEventInput = Parameters<typeof emitTrustedDiagnosticEventWithPrivateData>[0];
 
-/** Reads a tool schema field in either app-server or OpenClaw naming. */
-export function readCodexDiagnosticToolParameters(tool: {
-  inputSchema?: unknown;
-  parameters?: unknown;
-}): unknown {
-  return tool.inputSchema ?? tool.parameters;
-}
-
 /** Builds compact diagnostic tool definitions for trusted private telemetry. */
-export function buildCodexDiagnosticToolDefinitions(
-  tools: readonly {
-    name: string;
-    description: string;
-    inputSchema?: unknown;
-    parameters?: unknown;
-  }[],
-) {
+function buildCodexDiagnosticToolDefinitions(tools: readonly CodexModelCallDiagnosticTool[]) {
   return tools.map((tool) => ({
     name: tool.name,
     description: tool.description,
-    parameters: readCodexDiagnosticToolParameters(tool),
+    parameters: tool.inputSchema ?? tool.parameters,
   }));
 }
 
@@ -45,7 +30,7 @@ export function utf8JsonByteLength(value: unknown): number | undefined {
 }
 
 /** Builds a short namespaced fingerprint for sensitive log values. */
-export function fingerprintCodexLogValue(namespace: string, value: string): string {
+function fingerprintCodexLogValue(namespace: string, value: string): string {
   const hash = createHash("sha256");
   hash.update(namespace);
   hash.update("\0");
@@ -73,6 +58,7 @@ export function buildCodexPluginThreadConfigEligibilityLogData(params: {
     enabled: params.pluginThreadConfigRequired,
     policyConfigured: params.resolvedPluginPolicy?.configured === true,
     policyEnabled: params.resolvedPluginPolicy?.enabled === true,
+    allowAllPlugins: params.resolvedPluginPolicy?.allowAllPlugins === true,
     pluginConfigKeys: params.resolvedPluginPolicy?.pluginPolicies
       .map((plugin) => plugin.configKey)
       .toSorted(),
@@ -205,13 +191,12 @@ export function createCodexModelCallDiagnosticEmitter(params: {
 export function classifyCodexModelCallFailureKind(params: {
   error: unknown;
   timedOut: boolean;
-  turnCompletionIdleTimedOut: boolean;
   runAborted: boolean;
   abortReason: unknown;
   clientClosedAbort: boolean;
   formatError: (error: unknown) => string;
 }): CodexModelCallFailureKind | undefined {
-  if (params.timedOut || params.turnCompletionIdleTimedOut) {
+  if (params.timedOut) {
     return "timeout";
   }
   const errorMessage = params.error ? params.formatError(params.error).toLowerCase() : "";

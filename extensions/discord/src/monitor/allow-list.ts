@@ -1,11 +1,14 @@
-// Discord plugin module implements allow list behavior.
-import type { AllowlistMatch } from "openclaw/plugin-sdk/allow-from";
+import {
+  type AllowlistMatch,
+  resolveAllowlistMatchByCandidates,
+} from "openclaw/plugin-sdk/allow-from";
 import {
   buildChannelKeyCandidates,
   resolveChannelEntryMatchWithFallback,
   resolveChannelMatchConfig,
   type ChannelMatchSource,
 } from "openclaw/plugin-sdk/channel-targets";
+import type { DiscordGuildEntry } from "openclaw/plugin-sdk/config-contracts";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
@@ -23,28 +26,16 @@ type DiscordAllowListMatch = AllowlistMatch<"wildcard" | "id" | "name" | "tag">;
 
 const DISCORD_OWNER_ALLOWLIST_PREFIXES = ["discord:", "user:", "pk:"];
 
-type DiscordChannelOverrideConfig = {
-  requireMention?: boolean;
-  ignoreOtherMentions?: boolean;
-  skills?: string[];
-  enabled?: boolean;
-  users?: string[];
-  roles?: string[];
-  systemPrompt?: string;
-  includeThreadStarter?: boolean;
-  autoThread?: boolean;
-  autoThreadName?: "message" | "generated";
-  autoArchiveDuration?: "60" | "1440" | "4320" | "10080" | 60 | 1440 | 4320 | 10080;
-};
+type DiscordChannelOverrideConfig = Omit<
+  NonNullable<DiscordGuildEntry["channels"]>[string],
+  "tools" | "toolsBySender"
+>;
 
-export type DiscordGuildEntryResolved = {
+export type DiscordGuildEntryResolved = Omit<
+  DiscordGuildEntry,
+  "tools" | "toolsBySender" | "channels"
+> & {
   id?: string;
-  slug?: string;
-  requireMention?: boolean;
-  ignoreOtherMentions?: boolean;
-  reactionNotifications?: "off" | "own" | "all" | "allowlist";
-  users?: string[];
-  roles?: string[];
   channels?: Record<string, DiscordChannelOverrideConfig>;
 };
 
@@ -124,18 +115,11 @@ export function allowListMatches(
   candidate: { id?: string; name?: string; tag?: string },
   params?: { allowNameMatching?: boolean },
 ) {
-  if (list.allowAll) {
-    return true;
-  }
-  if (candidate.id && list.ids.has(candidate.id)) {
-    return true;
-  }
-  if (params?.allowNameMatching === true) {
-    if (resolveDiscordAllowListNameMatch(list, candidate)) {
-      return true;
-    }
-  }
-  return false;
+  return resolveDiscordAllowListMatch({
+    allowList: list,
+    candidate,
+    allowNameMatching: params?.allowNameMatching,
+  }).allowed;
 }
 
 export function resolveDiscordAllowListMatch(params: {
@@ -181,10 +165,7 @@ function resolveDiscordUserAllowed(params: {
   );
 }
 
-export function resolveDiscordRoleAllowed(params: {
-  allowList?: string[];
-  memberRoleIds: string[];
-}) {
+function resolveDiscordRoleAllowed(params: { allowList?: string[]; memberRoleIds: string[] }) {
   // Role allowlists accept role IDs only. Names are ignored.
   const allowList = normalizeDiscordAllowList(params.allowList, ["role:"]);
   if (!allowList) {
@@ -289,25 +270,18 @@ export function resolveDiscordOwnerAccess(params: {
   ownerAllowList: DiscordAllowList | null;
   ownerAllowed: boolean;
 } {
-  const ownerAllowFrom = params.allowFrom?.filter(
-    (entry) => (normalizeOptionalString(entry) ?? "") !== "*",
-  );
   const ownerAllowList = normalizeDiscordAllowList(
-    ownerAllowFrom && ownerAllowFrom.length > 0 ? ownerAllowFrom : undefined,
+    params.allowFrom?.filter((entry) => (normalizeOptionalString(entry) ?? "") !== "*"),
     DISCORD_OWNER_ALLOWLIST_PREFIXES,
   );
-  const ownerAllowed = ownerAllowList
-    ? allowListMatches(
-        ownerAllowList,
-        {
-          id: params.sender.id,
-          name: params.sender.name,
-          tag: params.sender.tag,
-        },
-        { allowNameMatching: params.allowNameMatching },
-      )
-    : false;
-  return { ownerAllowList, ownerAllowed };
+  return {
+    ownerAllowList,
+    ownerAllowed:
+      ownerAllowList !== null &&
+      allowListMatches(ownerAllowList, params.sender, {
+        allowNameMatching: params.allowNameMatching,
+      }),
+  };
 }
 
 export function resolveDiscordCommandAuthorized(params: {
@@ -408,7 +382,7 @@ function hasConfiguredDiscordChannels(
 function resolveDiscordChannelConfigEntry(
   entry: DiscordChannelEntry,
 ): DiscordChannelConfigResolved {
-  const resolved: DiscordChannelConfigResolved = {
+  return {
     allowed: entry.enabled !== false,
     requireMention: entry.requireMention,
     ignoreOtherMentions: entry.ignoreOtherMentions,
@@ -422,7 +396,6 @@ function resolveDiscordChannelConfigEntry(
     autoThreadName: entry.autoThreadName,
     autoArchiveDuration: entry.autoArchiveDuration,
   };
-  return resolved;
 }
 
 export function resolveDiscordChannelConfig(params: {
@@ -431,18 +404,12 @@ export function resolveDiscordChannelConfig(params: {
   channelName?: string;
   channelSlug: string;
 }): DiscordChannelConfigResolved | null {
-  const { guildInfo, channelId, channelName, channelSlug } = params;
-  const channels = guildInfo?.channels;
-  if (!hasConfiguredDiscordChannels(channels)) {
-    return null;
-  }
-  const match = resolveDiscordChannelEntryMatch(channels, {
-    id: channelId,
-    name: channelName,
-    slug: channelSlug,
+  return resolveDiscordChannelConfigWithFallback({
+    guildInfo: params.guildInfo,
+    channelId: params.channelId,
+    channelName: params.channelName,
+    channelSlug: params.channelSlug,
   });
-  const resolved = resolveChannelMatchConfig(match, resolveDiscordChannelConfigEntry);
-  return resolved ?? { allowed: false };
 }
 
 export function resolveDiscordChannelConfigWithFallback(params: {
@@ -576,13 +543,14 @@ export function resolveGroupDmAllow(params: {
   if (!channels || channels.length === 0) {
     return true;
   }
-  const allowList = new Set(channels.map((entry) => normalizeDiscordSlug(entry)));
-  const candidates = [
-    normalizeDiscordSlug(channelId),
-    channelSlug,
-    channelName ? normalizeDiscordSlug(channelName) : "",
-  ].filter(Boolean);
-  return allowList.has("*") || candidates.some((candidate) => allowList.has(candidate));
+  return resolveAllowlistMatchByCandidates({
+    allowList: channels.map((entry) => normalizeDiscordSlug(entry)),
+    candidates: [
+      { value: normalizeDiscordSlug(channelId), source: "id" },
+      { value: channelSlug, source: "slug" },
+      { value: channelName ? normalizeDiscordSlug(channelName) : undefined, source: "name" },
+    ],
+  }).allowed;
 }
 
 export function shouldEmitDiscordReactionNotification(params: {

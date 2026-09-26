@@ -15,4 +15,12 @@ describe("bounded child output", () => {
     expect(second).toEqual({ text: "fghij", truncated: true });
     expect(formatBoundedChildOutput(second)).toBe("[output truncated]\nfghij");
   });
+
+  it("does not split a surrogate pair at the tail cap boundary", () => {
+    // The five-code-unit tail starts on the emoji's low surrogate.
+    const chunk = `${"p".repeat(10)}🤖kept`;
+    const result = appendBoundedChildOutput(emptyBoundedChildOutput(), chunk, 5);
+    expect(result).toEqual({ text: "kept", truncated: true });
+    expect(formatBoundedChildOutput(result)).toBe("[output truncated]\nkept");
+  });
 });

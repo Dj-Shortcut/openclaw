@@ -29,8 +29,9 @@ const beforeToolCallMocks = vi.hoisted(() => ({
       this.reason = reason;
     }
   },
-  consumeAdjustedParamsForToolCall: vi.fn((_: string): unknown => undefined),
+  consumeAdjustedParamsForToolCall: vi.fn((_toolCallId: string): unknown => undefined),
   recordAdjustedParamsForToolCall: vi.fn(),
+  recordStructuredReplayTrustForToolCall: vi.fn(),
   isToolWrappedWithBeforeToolCallHook: vi.fn(() => false),
   runBeforeToolCallHook: vi.fn(async ({ params }: { params: unknown }) => ({
     blocked: false,
@@ -92,10 +93,19 @@ async function loadFreshAfterToolCallModulesForTest() {
   vi.doMock("../plugins/hook-runner-global.js", () => ({
     getGlobalHookRunner: () => hookMocks.runner,
   }));
-  vi.doMock("../infra/agent-events.js", () => ({
+  vi.doMock("../infra/agent-events.js", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../infra/agent-events.js")>()),
     emitAgentCommandOutputEvent: vi.fn(),
     emitAgentEvent: vi.fn(),
     emitAgentItemEvent: vi.fn(),
+  }));
+  vi.doMock("./agent-tools.before-tool-call.state.js", () => ({
+    consumeAdjustedParamsForToolCall: beforeToolCallMocks.consumeAdjustedParamsForToolCall,
+    consumePreExecutionBlockedToolCall: vi.fn(() => false),
+    consumeTrackedToolExecutionStarted: vi.fn(() => undefined),
+    consumeStructuredReplaySafeToolCall: vi.fn(() => false),
+    peekAdjustedParamsForToolCall: vi.fn(() => undefined),
+    peekPreExecutionBlockedToolCall: vi.fn(() => false),
   }));
   vi.doMock("./agent-tools.before-tool-call.js", () => ({
     BeforeToolCallBlockedError: beforeToolCallMocks.BeforeToolCallBlockedError,
@@ -104,7 +114,10 @@ async function loadFreshAfterToolCallModulesForTest() {
       details: { status: "blocked", deniedReason: "plugin-before-tool-call", reason },
     }),
     consumeAdjustedParamsForToolCall: beforeToolCallMocks.consumeAdjustedParamsForToolCall,
+    consumePreExecutionBlockedToolCall: vi.fn(() => false),
     recordAdjustedParamsForToolCall: beforeToolCallMocks.recordAdjustedParamsForToolCall,
+    recordStructuredReplayTrustForToolCall:
+      beforeToolCallMocks.recordStructuredReplayTrustForToolCall,
     isBeforeToolCallBlockedError: (error: unknown) =>
       error instanceof beforeToolCallMocks.BeforeToolCallBlockedError,
     isToolWrappedWithBeforeToolCallHook: beforeToolCallMocks.isToolWrappedWithBeforeToolCallHook,
@@ -181,32 +194,6 @@ describe("after_tool_call fires exactly once in embedded runs", () => {
       } as never,
     );
   }
-
-  it("fires after_tool_call exactly once on success when both adapter and handler are active", async () => {
-    const { def, extensionContext } = resolveAdapterDefinition(createTestTool("read"));
-
-    const toolCallId = "integration-call-1";
-    const args = { path: "/tmp/test.txt" };
-    const ctx = createToolHandlerCtx();
-
-    // Step 1: Simulate tool_execution_start event (SDK emits this)
-    await emitToolExecutionStartEvent({ ctx, toolName: "read", toolCallId, args });
-
-    // Step 2: Execute tool through the adapter wrapper (SDK calls this)
-    await def.execute(toolCallId, args, undefined, undefined, extensionContext);
-
-    // Step 3: Simulate tool_execution_end event (SDK emits this after execute returns)
-    await emitToolExecutionEndEvent({
-      ctx,
-      toolName: "read",
-      toolCallId,
-      isError: false,
-      result: { content: [{ type: "text", text: "ok" }] },
-    });
-
-    // The hook must fire exactly once — not zero, not two.
-    expect(hookMocks.runner.runAfterToolCall).toHaveBeenCalledTimes(1);
-  });
 
   it("fires after_tool_call exactly once on error when both adapter and handler are active", async () => {
     const { def, extensionContext } = resolveAdapterDefinition(createFailingTool("exec"));

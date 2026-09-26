@@ -50,14 +50,15 @@ describe("resolveSnapshotPlan", () => {
     expect(plan.wantsRoleSnapshot).toBe(true);
   });
 
-  it("parses timeoutMs from the snapshot query string", () => {
+  it("does not treat refs=role alone as a role snapshot feature", () => {
     const plan = resolveSnapshotPlan({
       profile: profile("openclaw"),
-      query: { timeoutMs: "12345" },
+      query: { refs: "role" },
       hasPlaywright: true,
     });
 
-    expect(plan.timeoutMs).toBe(12345);
+    expect(plan.refsMode).toBe("role");
+    expect(plan.wantsRoleSnapshot).toBe(false);
   });
 
   it("caps timeoutMs from the snapshot query string to Node's safe timer range", () => {
@@ -122,16 +123,6 @@ describe("resolveSnapshotPlan", () => {
     expect(plan.resolvedMaxChars).toBe(DEFAULT_AI_SNAPSHOT_MAX_CHARS);
     expect(plan.depth).toBeUndefined();
     expect(plan.timeoutMs).toBeUndefined();
-  });
-
-  it("keeps maxChars zero as an explicit uncapped snapshot request", () => {
-    const plan = resolveSnapshotPlan({
-      profile: profile("openclaw"),
-      query: { maxChars: "0" },
-      hasPlaywright: true,
-    });
-
-    expect(plan.resolvedMaxChars).toBeUndefined();
   });
 
   it("ignores non-positive timeoutMs values", () => {

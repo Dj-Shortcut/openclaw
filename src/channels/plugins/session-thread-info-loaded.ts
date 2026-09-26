@@ -9,12 +9,7 @@ import {
   parseThreadSessionSuffix,
   type ParsedThreadSessionSuffix,
 } from "../../sessions/session-key-utils.js";
-import { getLoadedChannelPluginForRead } from "./registry-loaded-read.js";
-
-type SessionConversationHookResult = {
-  id: string;
-  threadId?: string | null;
-};
+import { getLoadedChannelPluginForRead } from "./registry-loaded.js";
 
 function resolveLoadedSessionConversationThreadInfo(
   sessionKey: string | undefined | null,
@@ -31,7 +26,7 @@ function resolveLoadedSessionConversationThreadInfo(
   const resolved = messaging?.resolveSessionConversation?.({
     kind: raw.kind,
     rawId,
-  }) as SessionConversationHookResult | null | undefined;
+  });
   if (!resolved?.id?.trim()) {
     return null;
   }

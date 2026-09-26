@@ -1,6 +1,6 @@
-// Tlon plugin module implements approval runtime behavior.
+import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
-import type { PendingApproval, TlonSettingsStore } from "../settings.js";
+import { putTlonSetting, type PendingApproval, type TlonSettingsStore } from "../settings.js";
 import { normalizeShip } from "../targets.js";
 import { sendDm } from "../urbit/send.js";
 import type { UrbitSSEClient } from "../urbit/sse-client.js";
@@ -48,22 +48,14 @@ export function createTlonApprovalRuntime(params: {
     refreshWatchedChannels,
   } = params;
 
-  const savePendingApprovals = async (): Promise<void> => {
+  const savePendingApprovals = async (required = false): Promise<void> => {
     try {
-      await api.poke({
-        app: "settings",
-        mark: "settings-event",
-        json: {
-          "put-entry": {
-            desk: "moltbot",
-            "bucket-key": "tlon",
-            "entry-key": "pendingApprovals",
-            value: JSON.stringify(getPendingApprovals()),
-          },
-        },
-      });
+      await putTlonSetting(api, "pendingApprovals", JSON.stringify(getPendingApprovals()));
     } catch (err) {
       runtime.error?.(`[tlon] Failed to save pending approvals: ${String(err)}`);
+      if (required) {
+        throw err;
+      }
     }
   };
 
@@ -74,18 +66,7 @@ export function createTlonApprovalRuntime(params: {
       : [...getEffectiveDmAllowlist(), normalizedShip];
     setEffectiveDmAllowlist(nextAllowlist);
     try {
-      await api.poke({
-        app: "settings",
-        mark: "settings-event",
-        json: {
-          "put-entry": {
-            desk: "moltbot",
-            "bucket-key": "tlon",
-            "entry-key": "dmAllowlist",
-            value: nextAllowlist,
-          },
-        },
-      });
+      await putTlonSetting(api, "dmAllowlist", nextAllowlist);
       runtime.log?.(`[tlon] Added ${normalizedShip} to dmAllowlist`);
     } catch (err) {
       runtime.error?.(`[tlon] Failed to update dmAllowlist: ${String(err)}`);
@@ -110,18 +91,7 @@ export function createTlonApprovalRuntime(params: {
     setCurrentSettings({ ...currentSettings, channelRules: updatedRules });
 
     try {
-      await api.poke({
-        app: "settings",
-        mark: "settings-event",
-        json: {
-          "put-entry": {
-            desk: "moltbot",
-            "bucket-key": "tlon",
-            "entry-key": "channelRules",
-            value: JSON.stringify(updatedRules),
-          },
-        },
-      });
+      await putTlonSetting(api, "channelRules", JSON.stringify(updatedRules));
       runtime.log?.(`[tlon] Added ${normalizedShip} to ${channelNest} allowlist`);
     } catch (err) {
       runtime.error?.(`[tlon] Failed to update channelRules: ${String(err)}`);
@@ -216,7 +186,7 @@ export function createTlonApprovalRuntime(params: {
     );
 
     if (existingIndex !== -1) {
-      const existing = approvals[existingIndex];
+      const existing = expectDefined(approvals[existingIndex], "located pending approval index");
       if (approval.originalMessage) {
         existing.originalMessage = approval.originalMessage;
         existing.messagePreview = approval.messagePreview;
@@ -224,13 +194,13 @@ export function createTlonApprovalRuntime(params: {
       runtime.log?.(
         `[tlon] Updated existing approval for ${approval.requestingShip} (${approval.type}) - re-sending notification`,
       );
-      await savePendingApprovals();
+      await savePendingApprovals(true);
       await sendOwnerNotification(formatApprovalRequest(existing));
       return;
     }
 
     setPendingApprovals([...approvals, approval]);
-    await savePendingApprovals();
+    await savePendingApprovals(true);
     await sendOwnerNotification(formatApprovalRequest(approval));
     runtime.log?.(
       `[tlon] Queued approval request: ${approval.id} (${approval.type} from ${approval.requestingShip})`,

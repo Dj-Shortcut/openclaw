@@ -1,7 +1,6 @@
-// Gmail hook helpers manage Gmail OAuth setup and watcher launch state.
 import { randomBytes } from "node:crypto";
-import path from "node:path";
-import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { asPositiveFiniteNumber } from "@openclaw/normalization-core/number-coercion";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { normalizeUniqueStringEntries } from "@openclaw/normalization-core/string-normalization";
 import {
   type OpenClawConfig,
@@ -10,7 +9,11 @@ import {
   resolveGatewayPort,
 } from "../config/config.js";
 import { resolveExecutable } from "../infra/executable-path.js";
-import { getWindowsInstallRoots } from "../infra/windows-install-roots.js";
+import {
+  buildWindowsCmdExeCommandLine,
+  isWindowsBatchCommand,
+  resolveTrustedWindowsCmdExe,
+} from "../process/windows-command.js";
 
 export const DEFAULT_GMAIL_LABEL = "INBOX";
 export const DEFAULT_GMAIL_TOPIC = "gog-gmail-watch";
@@ -21,8 +24,9 @@ export const DEFAULT_GMAIL_SERVE_PATH = "/gmail-pubsub";
 export const DEFAULT_GMAIL_MAX_BYTES = 20_000;
 export const DEFAULT_GMAIL_RENEW_MINUTES = 12 * 60;
 const DEFAULT_HOOKS_PATH = "/hooks";
+// OpenClaw handles inbound mail; override gog's narrower SPAM,TRASH default.
+const GMAIL_WATCH_EXCLUDED_LABELS = "SPAM,TRASH,DRAFT,SENT";
 const GMAIL_WATCH_SENSITIVE_FLAGS = new Set(["--token", "--hook-url", "--hook-token"]);
-const WINDOWS_UNSAFE_CMD_CHARS_RE = /[&|<>^%\r\n]/;
 let gogBin: string | undefined;
 
 export type GmailHookOverrides = {
@@ -69,6 +73,11 @@ export type GmailHookRuntimeConfig = {
 
 export function generateHookToken(bytes = 24): string {
   return randomBytes(bytes).toString("hex");
+}
+
+/** Resolve the per-message body byte bound gog is provisioned with (`--max-bytes`). */
+export function resolveGmailHookMaxBytes(raw: number | undefined): number {
+  return Math.floor(asPositiveFiniteNumber(raw) ?? DEFAULT_GMAIL_MAX_BYTES);
 }
 
 export function mergeHookPresets(existing: string[] | undefined, preset: string): string[] {
@@ -141,40 +150,25 @@ export function resolveGmailHookRuntimeConfig(
 
   const includeBody = overrides.includeBody ?? gmail?.includeBody ?? true;
 
-  const maxBytesRaw = overrides.maxBytes ?? gmail?.maxBytes;
-  const maxBytes =
-    typeof maxBytesRaw === "number" && Number.isFinite(maxBytesRaw) && maxBytesRaw > 0
-      ? Math.floor(maxBytesRaw)
-      : DEFAULT_GMAIL_MAX_BYTES;
+  const maxBytes = resolveGmailHookMaxBytes(overrides.maxBytes ?? gmail?.maxBytes);
 
-  const renewEveryMinutesRaw = overrides.renewEveryMinutes ?? gmail?.renewEveryMinutes;
-  const renewEveryMinutes =
-    typeof renewEveryMinutesRaw === "number" &&
-    Number.isFinite(renewEveryMinutesRaw) &&
-    renewEveryMinutesRaw > 0
-      ? Math.floor(renewEveryMinutesRaw)
-      : DEFAULT_GMAIL_RENEW_MINUTES;
+  const renewEveryMinutes = Math.floor(
+    asPositiveFiniteNumber(overrides.renewEveryMinutes ?? gmail?.renewEveryMinutes) ??
+      DEFAULT_GMAIL_RENEW_MINUTES,
+  );
 
   const serveBind = overrides.serveBind ?? gmail?.serve?.bind ?? DEFAULT_GMAIL_SERVE_BIND;
-  const servePortRaw = overrides.servePort ?? gmail?.serve?.port;
-  const servePort =
-    typeof servePortRaw === "number" && Number.isFinite(servePortRaw) && servePortRaw > 0
-      ? Math.floor(servePortRaw)
-      : DEFAULT_GMAIL_SERVE_PORT;
-  const servePathRaw = overrides.servePath ?? gmail?.serve?.path;
-  const normalizedServePathRaw =
-    typeof servePathRaw === "string" && servePathRaw.trim().length > 0
-      ? normalizeServePath(servePathRaw)
-      : DEFAULT_GMAIL_SERVE_PATH;
+  const servePort = Math.floor(
+    asPositiveFiniteNumber(overrides.servePort ?? gmail?.serve?.port) ?? DEFAULT_GMAIL_SERVE_PORT,
+  );
+  const normalizedServePathRaw = normalizeServePath(
+    normalizeOptionalString(overrides.servePath ?? gmail?.serve?.path),
+  );
   const tailscaleTargetRaw = overrides.tailscaleTarget ?? gmail?.tailscale?.target;
 
   const tailscaleMode = overrides.tailscaleMode ?? gmail?.tailscale?.mode ?? "off";
   const tailscaleTarget =
-    tailscaleMode !== "off" &&
-    typeof tailscaleTargetRaw === "string" &&
-    tailscaleTargetRaw.trim().length > 0
-      ? tailscaleTargetRaw.trim()
-      : undefined;
+    tailscaleMode !== "off" ? normalizeOptionalString(tailscaleTargetRaw) : undefined;
   // Tailscale strips the public path before proxying, so listen on "/" when on.
   const servePath = normalizeServePath(
     tailscaleMode !== "off" && !tailscaleTarget ? "/" : normalizedServePathRaw,
@@ -253,6 +247,7 @@ export function buildGogWatchServeArgs(cfg: GmailHookRuntimeConfig): string[] {
   if (cfg.includeBody) {
     args.push("--include-body");
   }
+  args.push("--exclude-labels", GMAIL_WATCH_EXCLUDED_LABELS);
   if (cfg.maxBytes > 0) {
     args.push("--max-bytes", String(cfg.maxBytes));
   }
@@ -271,16 +266,6 @@ export function resolveGogExecutable(): string {
   return (gogBin ??= resolveExecutable("gog"));
 }
 
-function escapeForCmdExe(arg: string): string {
-  if (WINDOWS_UNSAFE_CMD_CHARS_RE.test(arg)) {
-    throw new Error(`Unsafe Windows cmd.exe argument detected: ${JSON.stringify(arg)}`);
-  }
-  if (!arg.includes(" ") && !arg.includes('"')) {
-    return arg;
-  }
-  return `"${arg.replace(/"/g, '""')}"`;
-}
-
 export function resolveGogServeInvocation(args: string[]): {
   args: string[];
   command: string;
@@ -288,14 +273,12 @@ export function resolveGogServeInvocation(args: string[]): {
   windowsVerbatimArguments?: true;
 } {
   const command = resolveGogExecutable();
-  const ext = normalizeLowercaseStringOrEmpty(path.extname(command));
-  if (process.platform !== "win32" || (ext !== ".cmd" && ext !== ".bat")) {
+  if (!isWindowsBatchCommand(command)) {
     return { command, args, windowsHide: process.platform === "win32" ? true : undefined };
   }
-  const cmdExe = path.win32.join(getWindowsInstallRoots().systemRoot, "System32", "cmd.exe");
   return {
-    command: cmdExe,
-    args: ["/d", "/s", "/c", [command, ...args].map(escapeForCmdExe).join(" ")],
+    command: resolveTrustedWindowsCmdExe(),
+    args: ["/d", "/s", "/c", buildWindowsCmdExeCommandLine(command, args)],
     windowsHide: true,
     windowsVerbatimArguments: true,
   };

@@ -1,154 +1,127 @@
-/**
- * Detects message-tool sends that delivered a visible reply to the current source.
- */
+import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
+import { hasNonEmptyString, readStringValue } from "@openclaw/normalization-core/string-coerce";
 import type { SourceReplyDeliveryMode } from "../auto-reply/get-reply-options.types.js";
-import { isMessageToolSendActionName } from "./embedded-agent-messaging.js";
-import { isToolResultError } from "./embedded-agent-subscribe.tools.js";
-import { normalizeToolName } from "./tool-policy.js";
+import {
+  pluginBroadcastHasDelivery,
+  pluginEnvelopeHas,
+  readEmbeddedMessageDeliveryFact,
+} from "./embedded-agent-message-delivery.js";
+import {
+  isMessageToolConversationCreateActionName,
+  isMessageToolSendActionName,
+  isMessagingToolDeliveryAction,
+  isPluginNativeMessagingTool,
+} from "./embedded-agent-messaging.js";
+import { normalizeToolPolicyName } from "./tool-policy.js";
+import { isToolResultError, readToolResultDetails } from "./tool-result-error.js";
 
-const MESSAGE_TOOL_NAME = "message";
 const EXPLICIT_MESSAGE_ROUTE_KEYS = ["channel", "target", "to", "channelId", "provider"];
-const DRY_RUN_DELIVERY_STATUS = "dry_run";
-const SENT_DELIVERY_STATUS = "sent";
-const RESULT_ENVELOPE_KEYS = [
-  "details",
-  "payload",
-  "result",
-  "results",
-  "sendResult",
-  "toolResult",
-];
-
-function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : {};
+export function resolveMessageToolSourceReplyFinal(args: unknown): boolean {
+  return (asOptionalRecord(args) ?? {}).final !== false;
 }
 
-function hasStringValue(value: unknown): boolean {
-  return typeof value === "string" && value.trim().length > 0;
+function resultConfirmsCurrentSourceRoute(value: unknown): boolean {
+  return asOptionalRecord(asOptionalRecord(value)?.details)?.sourceReplyRoute === "current-source";
 }
 
 function hasExplicitMessageRoute(args: Record<string, unknown>): boolean {
-  if (EXPLICIT_MESSAGE_ROUTE_KEYS.some((key) => hasStringValue(args[key]))) {
-    return true;
+  return (
+    EXPLICIT_MESSAGE_ROUTE_KEYS.some((key) => hasNonEmptyString(args[key])) ||
+    (Array.isArray(args.targets) && args.targets.some((value) => hasNonEmptyString(value)))
+  );
+}
+
+function isMessageToolSourceReplyActionName(action: unknown): boolean {
+  return (
+    isMessageToolSendActionName(action) ||
+    ["reply", "thread-reply", "poll"].includes(normalizeStatus(action) ?? "")
+  );
+}
+
+export function readMessageToolSourceReplyText(args: unknown): string | undefined {
+  const record = asOptionalRecord(args) ?? {};
+  if (!isMessageToolSourceReplyActionName(record.action)) {
+    return undefined;
   }
-  return Array.isArray(args.targets) && args.targets.some((value) => hasStringValue(value));
+  if (normalizeStatus(record.action) === "poll") {
+    return readStringValue(record.pollQuestion) ?? readStringValue(record.poll_question);
+  }
+  return ["content", "message", "text", "body"]
+    .map((key) => readStringValue(record[key]))
+    .find((value) => value !== undefined);
 }
 
 function normalizeStatus(value: unknown): string | undefined {
   return typeof value === "string" ? value.trim().toLowerCase() : undefined;
 }
 
-function parseJsonRecord(value: string): Record<string, unknown> | undefined {
-  try {
-    const parsed = JSON.parse(value);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : undefined;
-  } catch {
-    return undefined;
+export function isDeliveredMessagingToolResult(params: {
+  toolName?: string;
+  args?: unknown;
+  result?: unknown;
+  hookResult?: unknown;
+  isError?: boolean;
+  requirePluginDeliveryId?: boolean;
+}): boolean {
+  const args = asOptionalRecord(params.args) ?? {};
+  if (args.dryRun === true) {
+    return false;
   }
-}
-
-function recordHasDeliveredMessageId(record: Record<string, unknown>): boolean {
-  if (hasStringValue(record.messageId)) {
+  const normalizedToolName = normalizeToolPolicyName(params.toolName ?? "message");
+  if (normalizedToolName === "conversations_send" || normalizedToolName === "conversations_turn") {
+    const status = readToolResultDetails(params.result)?.status;
+    // Waiting for a peer reply can fail after the channel send has succeeded.
+    return (
+      status === "sent" ||
+      (normalizedToolName === "conversations_turn" &&
+        (status === "replied" || status === "timeout"))
+    );
+  }
+  if (!isPluginNativeMessagingTool(normalizedToolName)) {
+    return false;
+  }
+  const action = normalizeStatus(args.action);
+  const results = [params.result, params.hookResult];
+  if (
+    results.some((result) => pluginEnvelopeHas(result, "dryRun")) ||
+    (params.requirePluginDeliveryId &&
+      !results.some((result) => pluginEnvelopeHas(result, "deliveryId")))
+  ) {
+    return false;
+  }
+  if (results.some((result) => pluginEnvelopeHas(result, "partial"))) {
     return true;
   }
-  const receipt = record.receipt;
-  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) {
-    return false;
-  }
-  const receiptRecord = receipt as Record<string, unknown>;
-  return (
-    hasStringValue(receiptRecord.primaryPlatformMessageId) ||
-    (Array.isArray(receiptRecord.platformMessageIds) &&
-      receiptRecord.platformMessageIds.some((value) => hasStringValue(value)))
-  );
-}
-
-function deliveryEnvelopeIndicatesDryRun(value: unknown, depth = 0): boolean {
-  if (!value || typeof value !== "object" || depth > 4) {
-    return false;
-  }
-  if (Array.isArray(value)) {
-    return value.some((item) => deliveryEnvelopeIndicatesDryRun(item, depth + 1));
-  }
-
-  const record = value as Record<string, unknown>;
   if (
-    record.dryRun === true ||
-    normalizeStatus(record.deliveryStatus) === DRY_RUN_DELIVERY_STATUS
+    action &&
+    isMessageToolConversationCreateActionName(action) &&
+    results.some((result) => pluginEnvelopeHas(result, "conversation"))
   ) {
     return true;
   }
-
-  const content = record.content;
-  if (Array.isArray(content)) {
-    for (const item of content) {
-      if (deliveryEnvelopeIndicatesDryRun(item, depth + 1)) {
-        return true;
-      }
-      if (item && typeof item === "object" && !Array.isArray(item)) {
-        const text = (item as Record<string, unknown>).text;
-        if (typeof text === "string") {
-          const parsed = parseJsonRecord(text);
-          if (parsed && deliveryEnvelopeIndicatesDryRun(parsed, depth + 1)) {
-            return true;
-          }
-        }
-      }
-    }
+  if (action === "broadcast" && results.some(pluginBroadcastHasDelivery)) {
+    return true;
   }
-
-  return RESULT_ENVELOPE_KEYS.some((key) =>
-    deliveryEnvelopeIndicatesDryRun(record[key], depth + 1),
-  );
-}
-
-function deliveryEnvelopeIndicatesDelivered(value: unknown, depth = 0): boolean {
-  if (!value || typeof value !== "object" || depth > 4) {
+  if (
+    params.isError ||
+    results.some((result) => isToolResultError(result) || pluginEnvelopeHas(result, "failure"))
+  ) {
     return false;
   }
-  if (Array.isArray(value)) {
-    return value.some((item) => deliveryEnvelopeIndicatesDelivered(item, depth + 1));
-  }
-
-  const record = value as Record<string, unknown>;
+  const nonDelivery = results.some((result) => pluginEnvelopeHas(result, "nonDelivery"));
+  const noOp = results.some((result) => pluginEnvelopeHas(result, "noOp"));
   if (
-    normalizeStatus(record.deliveryStatus) === SENT_DELIVERY_STATUS ||
-    recordHasDeliveredMessageId(record)
+    !nonDelivery &&
+    !noOp &&
+    isMessagingToolDeliveryAction(normalizedToolName, args) &&
+    action !== "broadcast" &&
+    results.some((result) => pluginEnvelopeHas(result, "ok"))
   ) {
     return true;
   }
-
-  const content = record.content;
-  if (Array.isArray(content)) {
-    for (const item of content) {
-      if (deliveryEnvelopeIndicatesDelivered(item, depth + 1)) {
-        return true;
-      }
-      if (item && typeof item === "object" && !Array.isArray(item)) {
-        const text = (item as Record<string, unknown>).text;
-        if (typeof text === "string") {
-          const parsed = parseJsonRecord(text);
-          if (parsed && deliveryEnvelopeIndicatesDelivered(parsed, depth + 1)) {
-            return true;
-          }
-        }
-      }
-    }
-  }
-
-  return RESULT_ENVELOPE_KEYS.some((key) =>
-    deliveryEnvelopeIndicatesDelivered(record[key], depth + 1),
-  );
+  return !nonDelivery && !noOp && results.some((result) => pluginEnvelopeHas(result, "delivery"));
 }
 
-/**
- * Only implicit-route, non-dry-run, delivered `message.send` calls qualify.
- * Explicit routes and other messaging tools are outbound side effects, not source replies.
- */
 export function isDeliveredMessageToolOnlySourceReplyResult(params: {
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
   toolName: string;
@@ -156,29 +129,44 @@ export function isDeliveredMessageToolOnlySourceReplyResult(params: {
   result?: unknown;
   hookResult?: unknown;
   isError?: boolean;
+  allowExplicitSourceRoute?: boolean;
+  deliveryConfirmed?: boolean;
 }): boolean {
-  if (params.sourceReplyDeliveryMode !== "message_tool_only") {
+  const deliveryFact =
+    readEmbeddedMessageDeliveryFact(readToolResultDetails(params.hookResult)?.messageDelivery) ??
+    readEmbeddedMessageDeliveryFact(readToolResultDetails(params.result)?.messageDelivery);
+  const confirmedCurrentSourceRoute =
+    deliveryFact?.sourceReplyDelivered === true ||
+    resultConfirmsCurrentSourceRoute(params.result) ||
+    resultConfirmsCurrentSourceRoute(params.hookResult);
+  if (params.sourceReplyDeliveryMode !== "message_tool_only" && !confirmedCurrentSourceRoute) {
     return false;
   }
-  if (normalizeToolName(params.toolName) !== MESSAGE_TOOL_NAME) {
+  if (normalizeToolPolicyName(params.toolName) !== "message") {
     return false;
   }
-  const args = asRecord(params.args);
-  if (!isMessageToolSendActionName(args.action) || hasExplicitMessageRoute(args)) {
-    return false;
-  }
-  if (params.isError || isToolResultError(params.result) || isToolResultError(params.hookResult)) {
+  const args = asOptionalRecord(params.args) ?? {};
+  const sourceRouteReplyAction =
+    (params.allowExplicitSourceRoute === true || confirmedCurrentSourceRoute) &&
+    isMessageToolSourceReplyActionName(args.action);
+  if (
+    deliveryFact?.sourceReplyDelivered !== true &&
+    !isMessageToolSendActionName(args.action) &&
+    !sourceRouteReplyAction
+  ) {
     return false;
   }
   if (
-    args.dryRun === true ||
-    deliveryEnvelopeIndicatesDryRun(params.result) ||
-    deliveryEnvelopeIndicatesDryRun(params.hookResult)
+    hasExplicitMessageRoute(args) &&
+    params.allowExplicitSourceRoute !== true &&
+    !confirmedCurrentSourceRoute
   ) {
     return false;
   }
   return (
-    deliveryEnvelopeIndicatesDelivered(params.result) ||
-    deliveryEnvelopeIndicatesDelivered(params.hookResult)
+    params.deliveryConfirmed ??
+    (deliveryFact
+      ? deliveryFact.status === "settled" && (!params.isError || deliveryFact.partialDelivery)
+      : isDeliveredMessagingToolResult(params))
   );
 }

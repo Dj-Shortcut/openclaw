@@ -2,14 +2,13 @@
 // conversation bindings, failing closed when requester context is ambiguous.
 import { normalizeConversationRef } from "./session-binding-normalization.js";
 import {
-  getSessionBindingService,
+  listSessionBindingsBySessionAsync,
   type ConversationRef,
   type SessionBindingRecord,
-  type SessionBindingService,
 } from "./session-binding-service.js";
 
 /** Session-bound delivery lookup input for routing task completion messages. */
-export type BoundDeliveryRouterInput = {
+type BoundDeliveryRouterInput = {
   eventKind: "task_completion";
   targetSessionKey: string;
   requester?: ConversationRef;
@@ -17,20 +16,16 @@ export type BoundDeliveryRouterInput = {
 };
 
 /** Resolved session binding or the fallback reason used by delivery callers. */
-export type BoundDeliveryRouterResult = {
+type BoundDeliveryRouterResult = {
   binding: SessionBindingRecord | null;
   mode: "bound" | "fallback";
   reason: string;
 };
 
 /** Router facade that maps a target session/requester pair to a bound conversation. */
-export type BoundDeliveryRouter = {
-  resolveDestination: (input: BoundDeliveryRouterInput) => BoundDeliveryRouterResult;
+type BoundDeliveryRouter = {
+  resolveDestination: (input: BoundDeliveryRouterInput) => Promise<BoundDeliveryRouterResult>;
 };
-
-function isActiveBinding(record: SessionBindingRecord): boolean {
-  return record.status === "active";
-}
 
 function resolveBindingForRequester(
   requester: ConversationRef,
@@ -62,11 +57,15 @@ function resolveBindingForRequester(
 
 /** Creates a router that resolves task-completion delivery through active session bindings. */
 export function createBoundDeliveryRouter(
-  service: SessionBindingService = getSessionBindingService(),
+  listBySession: (
+    targetSessionKey: string,
+  ) => Promise<SessionBindingRecord[]> = listSessionBindingsBySessionAsync,
 ): BoundDeliveryRouter {
   return {
-    resolveDestination: (input) => {
+    resolveDestination: async (input) => {
       const targetSessionKey = input.targetSessionKey.trim();
+      const requester = input.requester ? normalizeConversationRef(input.requester) : undefined;
+      const failClosed = input.failClosed;
       if (!targetSessionKey) {
         return {
           binding: null,
@@ -75,7 +74,9 @@ export function createBoundDeliveryRouter(
         };
       }
 
-      const activeBindings = service.listBySession(targetSessionKey).filter(isActiveBinding);
+      const activeBindings = (await listBySession(targetSessionKey)).filter(
+        (record) => record.status === "active",
+      );
       if (activeBindings.length === 0) {
         return {
           binding: null,
@@ -84,8 +85,8 @@ export function createBoundDeliveryRouter(
         };
       }
 
-      if (!input.requester) {
-        if (input.failClosed) {
+      if (!requester) {
+        if (failClosed) {
           return {
             binding: null,
             mode: "fallback",
@@ -108,7 +109,6 @@ export function createBoundDeliveryRouter(
         };
       }
 
-      const requester: ConversationRef = normalizeConversationRef(input.requester);
       if (!requester.channel || !requester.conversationId) {
         return {
           binding: null,
@@ -126,7 +126,7 @@ export function createBoundDeliveryRouter(
         };
       }
 
-      if (activeBindings.length === 1 && !input.failClosed) {
+      if (activeBindings.length === 1 && !failClosed) {
         return {
           binding: activeBindings[0] ?? null,
           mode: "bound",

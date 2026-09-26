@@ -1,5 +1,8 @@
-// Discord plugin module implements native command.options behavior.
 import { ApplicationCommandOptionType } from "discord-api-types/v10";
+import {
+  getPreparedModelCatalogSnapshot,
+  resolveAgentDir,
+} from "openclaw/plugin-sdk/agent-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   resolveCommandArgChoices,
@@ -7,6 +10,7 @@ import {
 } from "openclaw/plugin-sdk/native-command-registry";
 import { createSubsystemLogger } from "openclaw/plugin-sdk/runtime-env";
 import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import type { AutocompleteInteraction, CommandOptions } from "../internal/discord.js";
 
 const log = createSubsystemLogger("discord/native-command");
@@ -23,10 +27,10 @@ export function truncateDiscordCommandDescription(params: {
   if (value.length <= DISCORD_COMMAND_DESCRIPTION_MAX) {
     return value;
   }
-  log.warn(
+  log.debug(
     `discord: truncating native command description (${label}) from ${value.length} to ${DISCORD_COMMAND_DESCRIPTION_MAX}: ${JSON.stringify(value)}`,
   );
-  return value.slice(0, DISCORD_COMMAND_DESCRIPTION_MAX);
+  return truncateUtf16Safe(value, DISCORD_COMMAND_DESCRIPTION_MAX);
 }
 
 export function truncateDiscordCommandDescriptionLocalizations(params: {
@@ -48,50 +52,40 @@ export function truncateDiscordCommandDescriptionLocalizations(params: {
   );
 }
 
-function resolveDiscordCommandLogLabel(command: ChatCommandDefinition): string {
-  if (typeof command.nativeName === "string" && command.nativeName.trim().length > 0) {
-    return command.nativeName;
-  }
-  return command.key;
-}
-
 export function buildDiscordCommandOptions(params: {
   command: ChatCommandDefinition;
   cfg: OpenClawConfig;
+  resolveConfig?: () => OpenClawConfig;
   authorizeChoiceContext?: (interaction: AutocompleteInteraction) => Promise<boolean>;
-  resolveChoiceContext?: (
-    interaction: AutocompleteInteraction,
-  ) => Promise<{ provider?: string; model?: string } | null>;
+  resolveChoiceContext?: (interaction: AutocompleteInteraction) => Promise<{
+    provider?: string;
+    model?: string;
+    agentRuntime?: string;
+    agentId?: string;
+  } | null>;
 }): CommandOptions | undefined {
-  const { command, cfg, authorizeChoiceContext, resolveChoiceContext } = params;
-  const commandLabel = resolveDiscordCommandLogLabel(command);
+  const { command, cfg, resolveConfig, authorizeChoiceContext, resolveChoiceContext } = params;
+  const commandLabel = command.nativeName?.trim() ? command.nativeName : command.key;
   const args = command.args;
   if (!args || args.length === 0) {
     return undefined;
   }
   return args.map((arg) => {
-    const required = arg.required ?? false;
-    if (arg.type === "number") {
-      return {
-        name: arg.name,
-        description: truncateDiscordCommandDescription({
-          value: arg.description,
-          label: `command:${commandLabel} arg:${arg.name}`,
-        }),
-        type: ApplicationCommandOptionType.Number,
-        required,
-      };
-    }
-    if (arg.type === "boolean") {
-      return {
-        name: arg.name,
-        description: truncateDiscordCommandDescription({
-          value: arg.description,
-          label: `command:${commandLabel} arg:${arg.name}`,
-        }),
-        type: ApplicationCommandOptionType.Boolean,
-        required,
-      };
+    const base = {
+      name: arg.name,
+      description: truncateDiscordCommandDescription({
+        value: arg.description,
+        label: `command:${commandLabel} arg:${arg.name}`,
+      }),
+      required: arg.required ?? false,
+    };
+    if (arg.type === "number" || arg.type === "boolean") {
+      return Object.assign(base, {
+        type:
+          arg.type === "number"
+            ? ApplicationCommandOptionType.Number
+            : ApplicationCommandOptionType.Boolean,
+      });
     }
     const resolvedChoices = resolveCommandArgChoices({ command, arg, cfg });
     const shouldAutocomplete =
@@ -115,12 +109,27 @@ export function buildDiscordCommandOptions(params: {
             typeof arg.choices === "function" && resolveChoiceContext
               ? await resolveChoiceContext(interaction)
               : null;
+          const currentCfg = resolveConfig?.() ?? cfg;
+          const choiceCatalog =
+            command.key === "think"
+              ? getPreparedModelCatalogSnapshot({
+                  config: currentCfg,
+                  ...(context?.agentId
+                    ? {
+                        agentId: context.agentId,
+                        agentDir: resolveAgentDir(currentCfg, context.agentId),
+                      }
+                    : {}),
+                })?.entries
+              : undefined;
           const choices = resolveCommandArgChoices({
             command,
             arg,
-            cfg,
+            cfg: currentCfg,
             provider: context?.provider,
             model: context?.model,
+            agentRuntime: context?.agentRuntime,
+            catalog: choiceCatalog,
           });
           const filtered = focusValue
             ? choices.filter((choice) =>
@@ -139,16 +148,10 @@ export function buildDiscordCommandOptions(params: {
             value: choice.value,
           }))
         : undefined;
-    return {
-      name: arg.name,
-      description: truncateDiscordCommandDescription({
-        value: arg.description,
-        label: `command:${commandLabel} arg:${arg.name}`,
-      }),
+    return Object.assign(base, {
       type: ApplicationCommandOptionType.String,
-      required,
       choices,
       autocomplete,
-    };
+    });
   }) satisfies CommandOptions;
 }

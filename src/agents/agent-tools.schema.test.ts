@@ -1,3 +1,5 @@
+import { normalizeToolParameterSchema } from "@openclaw/ai/internal/tool-schema";
+import { expectDefined } from "@openclaw/normalization-core";
 /**
  * Tests provider-compatible tool schema normalization.
  * Protects caching, ref inlining, OpenAPI keyword cleanup, and no-parameter
@@ -7,22 +9,152 @@ import { runAgentLoop, type AgentEvent, type StreamFn } from "openclaw/plugin-sd
 import { createAssistantMessageEventStream, validateToolArguments } from "openclaw/plugin-sdk/llm";
 import { Type, type TSchema } from "typebox";
 import { describe, expect, it, vi } from "vitest";
-import { wrapToolWithBeforeToolCallHook } from "./agent-tools.before-tool-call.js";
 import {
-  cleanToolSchemaForGemini,
-  normalizeToolParameterSchema,
-  normalizeToolParameters,
-} from "./agent-tools.schema.js";
+  isToolWrappedWithBeforeToolCallHook,
+  wrapToolWithBeforeToolCallHook,
+} from "./agent-tools.before-tool-call.js";
+import {
+  assertRequiredParams,
+  REQUIRED_PARAM_GROUPS,
+  normalizeFileToolPathParam,
+  wrapToolParamValidation,
+} from "./agent-tools.params.js";
+import { normalizeToolParameters } from "./agent-tools.schema.js";
 import type { AnyAgentTool } from "./agent-tools.types.js";
+import { createProcessTool } from "./bash-tools.process.js";
+import { execSchema, processSchema } from "./bash-tools.schemas.js";
+import {
+  getBeforeToolCallHookContext,
+  getBeforeToolCallSourceTool,
+} from "./before-tool-call-metadata.js";
+import { createZeroUsageFixture } from "./test-helpers/usage-fixtures.js";
 
-const TEST_USAGE = {
-  input: 0,
-  output: 0,
-  cacheRead: 0,
-  cacheWrite: 0,
-  totalTokens: 0,
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-};
+const TEST_USAGE = createZeroUsageFixture();
+
+async function runToolCall(
+  tool: AnyAgentTool,
+  toolCall: Parameters<typeof validateToolArguments>[1],
+  prompt: string,
+) {
+  const events: AgentEvent[] = [];
+  let streamCalls = 0;
+  const streamFn: StreamFn = () => {
+    const stream = createAssistantMessageEventStream();
+    queueMicrotask(() => {
+      streamCalls += 1;
+      const message =
+        streamCalls === 1
+          ? {
+              role: "assistant" as const,
+              content: [toolCall],
+              api: "faux",
+              provider: "faux",
+              model: "faux-1",
+              usage: TEST_USAGE,
+              stopReason: "toolUse" as const,
+              timestamp: Date.now(),
+            }
+          : {
+              role: "assistant" as const,
+              content: [{ type: "text" as const, text: "done" }],
+              api: "faux",
+              provider: "faux",
+              model: "faux-1",
+              usage: TEST_USAGE,
+              stopReason: "stop" as const,
+              timestamp: Date.now(),
+            };
+      stream.push({ type: "done", reason: message.stopReason, message });
+    });
+    return stream;
+  };
+
+  const messages = await runAgentLoop(
+    [{ role: "user", content: prompt, timestamp: Date.now() }],
+    { systemPrompt: "test", messages: [], tools: [tool] },
+    {
+      model: {
+        id: "faux-1",
+        name: "Faux",
+        provider: "faux",
+        api: "faux",
+        baseUrl: "http://localhost:0",
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 128000,
+        maxTokens: 1024,
+      },
+      convertToLlm: (agentMessages) => agentMessages as never,
+    },
+    (event) => {
+      events.push(event);
+    },
+    undefined,
+    streamFn,
+  );
+  return { messages, events, streamCalls };
+}
+
+describe("direct exec tool schema", () => {
+  it("keeps model-facing descriptions compact without hiding runtime constraints", () => {
+    const fields = execSchema.properties as Record<string, { description?: string }>;
+    const describeField = (name: string) => fields[name]?.description ?? "";
+    const descriptions = Object.values(fields).map((field) => field.description ?? "");
+
+    expect(descriptions.join("").length).toBeLessThan(550);
+    expect(describeField("workdir")).toContain("empty string");
+    expect(describeField("workdir")).toContain("whitespace-only");
+    expect(describeField("yieldMs")).toContain("Milliseconds");
+    expect(describeField("timeoutSeconds")).toContain("seconds");
+    expect(describeField("pty")).toContain("PTY");
+    expect(describeField("elevated")).toContain("if allowed");
+    expect(describeField("ask")).toContain("tools.exec.mode");
+    expect(describeField("ask")).toContain("channel-origin");
+    expect(describeField("ask")).toContain("ask=off");
+  });
+});
+
+describe("direct process tool schema", () => {
+  it("keeps the action enum canonical at the agent-loop boundary", () => {
+    expect(processSchema.properties.action.type).toBe("string");
+    const actionEnum = processSchema.properties.action as Type.TString & { enum?: string[] };
+    expect(actionEnum.enum?.join("|")).toBe(
+      "list|poll|log|write|send-keys|submit|paste|kill|clear|remove",
+    );
+    expect(() =>
+      validateToolArguments(createProcessTool(), {
+        type: "toolCall",
+        id: "call-invalid-process-action",
+        name: "process",
+        arguments: { action: "delete" },
+      }),
+    ).toThrow('Validation failed for tool "process"');
+  });
+
+  it("rejects unknown process actions without starting execution", async () => {
+    const processTool = createProcessTool();
+    const execute = vi.spyOn(processTool, "execute");
+    const { messages, events } = await runToolCall(
+      processTool,
+      {
+        type: "toolCall",
+        id: "call-unknown-process-action",
+        name: "process",
+        arguments: { action: "delete" },
+      },
+      "inspect processes",
+    );
+
+    expect(execute).not.toHaveBeenCalled();
+    const toolResult = messages.find((message) => message.role === "toolResult");
+    expect(JSON.stringify(toolResult)).toContain('Validation failed for tool \\"process\\"');
+    expect(events.find((event) => event.type === "tool_execution_end")).toMatchObject({
+      executionStarted: false,
+      errorKind: "argument-validation",
+    });
+  });
+});
 
 describe("normalizeToolParameterSchema", () => {
   it("reuses normalized schemas for the same schema object and provider options", () => {
@@ -40,6 +172,121 @@ describe("normalizeToolParameterSchema", () => {
     expect(second).toBe(first);
     expect(providerSpecific).not.toBe(first);
     expect(providerSpecific).toEqual(first);
+  });
+
+  it("uses Gemini cleanup for OpenAI-compatible providers when the model id is Gemini", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        sessionKey: {
+          description: "Explicit session key, or null to clear it",
+          anyOf: [{ type: "string" }, { type: "null" }],
+        },
+      },
+    };
+
+    expect(
+      normalizeToolParameterSchema(schema, {
+        modelProvider: "jjcc",
+        modelId: "gemini-3.1-pro-preview",
+      }),
+    ).toEqual({
+      type: "object",
+      properties: {
+        sessionKey: {
+          type: "string",
+          description: "Explicit session key, or null to clear it",
+        },
+      },
+    });
+    expect(
+      normalizeToolParameterSchema(schema, {
+        modelProvider: "stepfun",
+        modelId: "step-router-v1",
+      }),
+    ).toEqual(schema);
+  });
+
+  it("keeps normalized tool-schema profile behavior aligned with the cache key", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        sessionKey: {
+          anyOf: [{ type: "string" }, { type: "null" }],
+        },
+      },
+    };
+
+    const defaultSchema = normalizeToolParameterSchema(schema, {
+      modelProvider: "openai-compatible",
+      modelId: "custom-model",
+    });
+    const mixedCaseGeminiProfileSchema = normalizeToolParameterSchema(schema, {
+      modelProvider: "openai-compatible",
+      modelId: "custom-model",
+      modelCompat: { toolSchemaProfile: "Gemini" },
+    });
+
+    expect(defaultSchema).toEqual(schema);
+    expect(mixedCaseGeminiProfileSchema).toEqual({
+      type: "object",
+      properties: {
+        sessionKey: { type: "string" },
+      },
+    });
+  });
+
+  it("applies llama.cpp cleaning only for the explicit tool-schema profile", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        declarationKey: { type: "string", pattern: "^\\S+$", maxLength: 200 },
+        safe: { type: "string", maxLength: 1999 },
+        boundary: { type: "string", maxLength: 2000 },
+        script: { type: "string", minLength: 1, maxLength: 65_536 },
+      },
+    };
+
+    expect(normalizeToolParameterSchema(schema, { modelProvider: "openai" })).toEqual(schema);
+    expect(
+      normalizeToolParameterSchema(schema, {
+        modelProvider: "openai-compatible",
+        modelCompat: { toolSchemaProfile: "llamacpp" },
+      }),
+    ).toEqual({
+      type: "object",
+      properties: {
+        declarationKey: { type: "string", maxLength: 200 },
+        safe: { type: "string", maxLength: 1999 },
+        boundary: { type: "string" },
+        script: { type: "string", minLength: 1 },
+      },
+    });
+  });
+
+  it("applies explicit unsupported keyword stripping after Gemini cleanup", () => {
+    expect(
+      normalizeToolParameterSchema(
+        {
+          type: "object",
+          properties: {
+            count: {
+              anyOf: [{ type: "integer", vendorOnly: true }, { type: "null" }],
+            },
+          },
+        },
+        {
+          modelProvider: "jjcc",
+          modelId: "gemini-3.1-pro-preview",
+          modelCompat: { unsupportedToolSchemaKeywords: ["vendorOnly"] },
+        },
+      ),
+    ).toEqual({
+      type: "object",
+      properties: {
+        count: { type: "integer" },
+      },
+    });
   });
 
   it("normalizes truly empty schemas to type:object with properties:{}", () => {
@@ -87,12 +334,6 @@ describe("normalizeToolParameterSchema", () => {
     }
   });
 
-  it("leaves non-object typed schemas without properties unchanged", () => {
-    const schema = { type: "array", items: { type: "string" } };
-
-    expect(normalizeToolParameterSchema(schema)).toEqual(schema);
-  });
-
   it("adds permissive items schemas to arrays missing items", () => {
     expect(
       normalizeToolParameterSchema({
@@ -132,15 +373,18 @@ describe("normalizeToolParameterSchema", () => {
   });
 
   it("inlines local $ref before removing unsupported keywords", () => {
-    const cleaned = cleanToolSchemaForGemini({
-      type: "object",
-      properties: {
-        foo: { $ref: "#/$defs/Foo" },
+    const cleaned = normalizeToolParameterSchema(
+      {
+        type: "object",
+        properties: {
+          foo: { $ref: "#/$defs/Foo" },
+        },
+        $defs: {
+          Foo: { type: "string", enum: ["a", "b"] },
+        },
       },
-      $defs: {
-        Foo: { type: "string", enum: ["a", "b"] },
-      },
-    }) as {
+      { modelProvider: "gemini" },
+    ) as {
       $defs?: unknown;
       properties?: Record<string, unknown>;
     };
@@ -157,6 +401,27 @@ describe("normalizeToolParameterSchema", () => {
       enum: ["a", "b"],
     });
   });
+
+  it.each(["own", "inherited"] as const)(
+    "inlines definitions attached to %s array roots",
+    (kind) => {
+      const schemas = [{ $ref: "#/$defs/Value" }, { $ref: "#/definitions/Value" }];
+      const definitions = {
+        $defs: { Value: { type: "string" } },
+        definitions: { Value: { type: "integer" } },
+      };
+      if (kind === "own") {
+        Object.assign(schemas, definitions);
+      } else {
+        Object.setPrototypeOf(schemas, Object.assign(Object.create(Array.prototype), definitions));
+      }
+
+      expect(normalizeToolParameterSchema(schemas)).toEqual([
+        { type: "string" },
+        { type: "integer" },
+      ]);
+    },
+  );
 
   it("inlines nested local $ref schemas for provider-neutral tools", () => {
     expect(
@@ -243,6 +508,62 @@ describe("normalizeToolParameterSchema", () => {
     });
   });
 
+  it("rejects noncanonical array indices in local $ref paths", () => {
+    const normalized = normalizeToolParameterSchema({
+      type: "object",
+      properties: {
+        canonicalZero: { $ref: "#/$defs/Choice/anyOf/0" },
+        canonicalOne: { $ref: "#/$defs/Choice/anyOf/1" },
+        hexadecimal: { $ref: "#/$defs/Choice/anyOf/0x1" },
+        exponent: { $ref: "#/$defs/Choice/anyOf/1e0" },
+        leadingZero: { $ref: "#/$defs/Choice/anyOf/01" },
+        plusZero: { $ref: "#/$defs/Choice/anyOf/+0" },
+        negativeZero: { $ref: "#/$defs/Choice/anyOf/-0" },
+        empty: { $ref: "#/$defs/Choice/anyOf/" },
+        whitespace: { $ref: "#/$defs/Choice/anyOf/ " },
+        escapedObjectKey: { $ref: "#/$defs/Escaped/properties/a~1b" },
+      },
+      $defs: {
+        Choice: {
+          anyOf: [{ type: "string" }, { type: "number" }],
+        },
+        Escaped: {
+          type: "object",
+          properties: {
+            "a/b": { type: "boolean" },
+          },
+        },
+      },
+    }) as {
+      properties?: Record<string, unknown>;
+    };
+
+    expect(normalized.properties?.canonicalZero).toEqual({ type: "string" });
+    expect(normalized.properties?.canonicalOne).toEqual({ type: "number" });
+    expect(normalized.properties?.hexadecimal).toEqual({
+      $ref: "#/$defs/Choice/anyOf/0x1",
+    });
+    expect(normalized.properties?.exponent).toEqual({
+      $ref: "#/$defs/Choice/anyOf/1e0",
+    });
+    expect(normalized.properties?.leadingZero).toEqual({
+      $ref: "#/$defs/Choice/anyOf/01",
+    });
+    expect(normalized.properties?.plusZero).toEqual({
+      $ref: "#/$defs/Choice/anyOf/+0",
+    });
+    expect(normalized.properties?.negativeZero).toEqual({
+      $ref: "#/$defs/Choice/anyOf/-0",
+    });
+    expect(normalized.properties?.empty).toEqual({
+      $ref: "#/$defs/Choice/anyOf/",
+    });
+    expect(normalized.properties?.whitespace).toEqual({
+      $ref: "#/$defs/Choice/anyOf/ ",
+    });
+    expect(normalized.properties?.escapedObjectKey).toEqual({ type: "boolean" });
+  });
+
   it("inlines local refs in tuple array items", () => {
     expect(
       normalizeToolParameterSchema({
@@ -258,35 +579,6 @@ describe("normalizeToolParameterSchema", () => {
     ).toEqual({
       type: "array",
       items: [{ type: "string" }, { type: "integer" }],
-    });
-  });
-
-  it("keeps Swagger 2 definition refs supported", () => {
-    expect(
-      normalizeToolParameterSchema({
-        type: "object",
-        properties: {
-          pet: { $ref: "#/definitions/Pet" },
-        },
-        definitions: {
-          Pet: {
-            type: "object",
-            properties: {
-              id: { type: "integer" },
-            },
-          },
-        },
-      }),
-    ).toEqual({
-      type: "object",
-      properties: {
-        pet: {
-          type: "object",
-          properties: {
-            id: { type: "integer" },
-          },
-        },
-      },
     });
   });
 
@@ -421,30 +713,34 @@ describe("normalizeToolParameterSchema", () => {
     });
   });
 
-  it("normalizes OpenAPI nullable and schema-only annotations", () => {
-    expect(
-      normalizeToolParameterSchema({
+  it.each(["first", "last"] as const)(
+    "normalizes OpenAPI annotations declared %s while preserving unchanged siblings",
+    (position) => {
+      const status = { type: "string", enum: ["available"] };
+      const annotations = { nullable: true, readOnly: true, example: "available" };
+      const unchanged = { allOf: [{ type: "string" }, { minLength: 1 }] };
+      const schema = {
         type: "object",
         properties: {
+          unchanged,
+          status:
+            position === "first" ? { ...annotations, ...status } : { ...status, ...annotations },
+        },
+      };
+      const original = JSON.stringify(schema);
+      expect(normalizeToolParameterSchema(schema)).toEqual({
+        type: "object",
+        properties: {
+          unchanged,
           status: {
-            type: "string",
-            enum: ["available"],
-            nullable: true,
-            readOnly: true,
-            example: "available",
+            type: ["string", "null"],
+            enum: ["available", null],
           },
         },
-      }),
-    ).toEqual({
-      type: "object",
-      properties: {
-        status: {
-          type: ["string", "null"],
-          enum: ["available", null],
-        },
-      },
-    });
-  });
+      });
+      expect(JSON.stringify(schema)).toBe(original);
+    },
+  );
 
   it("preserves schema properties named like OpenAPI annotations", () => {
     expect(
@@ -596,18 +892,21 @@ describe("normalizeToolParameterSchema", () => {
   });
 
   it("cleans tuple items schemas", () => {
-    const cleaned = cleanToolSchemaForGemini({
-      type: "object",
-      properties: {
-        tuples: {
-          type: "array",
-          items: [
-            { type: "string", format: "uuid" },
-            { type: "number", minimum: 1 },
-          ],
+    const cleaned = normalizeToolParameterSchema(
+      {
+        type: "object",
+        properties: {
+          tuples: {
+            type: "array",
+            items: [
+              { type: "string", format: "uuid" },
+              { type: "number", minimum: 1 },
+            ],
+          },
         },
       },
-    }) as {
+      { modelProvider: "gemini" },
+    ) as {
       properties?: Record<string, unknown>;
     };
 
@@ -621,13 +920,16 @@ describe("normalizeToolParameterSchema", () => {
   });
 
   it("drops null-only union variants without flattening other unions", () => {
-    const cleaned = cleanToolSchemaForGemini({
-      type: "object",
-      properties: {
-        parentId: { anyOf: [{ type: "string" }, { type: "null" }] },
-        count: { oneOf: [{ type: "string" }, { type: "number" }] },
+    const cleaned = normalizeToolParameterSchema(
+      {
+        type: "object",
+        properties: {
+          parentId: { anyOf: [{ type: "string" }, { type: "null" }] },
+          count: { oneOf: [{ type: "string" }, { type: "number" }] },
+        },
       },
-    }) as {
+      { modelProvider: "gemini" },
+    ) as {
       properties?: Record<string, unknown>;
     };
 
@@ -642,121 +944,85 @@ describe("normalizeToolParameterSchema", () => {
     expect(parentId?.anyOf).toBeUndefined();
     expect(count?.oneOf).toBeUndefined();
   });
+
+  // Regression for #128743: a root-level union whose branches carry their own
+  // properties must not replace the root properties. Root `required` entries
+  // (e.g. thread_id) must remain declared in `properties`, otherwise the schema
+  // becomes unsatisfiable when `additionalProperties` is false.
+  it.each(["anyOf", "oneOf"] as const)(
+    "preserves root properties and constraints when flattening root-level %s (#128743)",
+    (unionKey) => {
+      const schema = {
+        type: "object",
+        title: "MessagesReplyInput",
+        additionalProperties: false,
+        required: ["thread_id"],
+        properties: {
+          thread_id: { type: "string", minLength: 1, maxLength: 128 },
+          body: { anyOf: [{ type: "string" }, { type: "null" }], default: null },
+          body_file: { anyOf: [{ type: "string" }, { type: "null" }], default: null },
+          task_id: { anyOf: [{ type: "string" }, { type: "null" }], default: null },
+          turn_grant_id: { anyOf: [{ type: "string" }, { type: "null" }], default: null },
+        },
+        [unionKey]: [
+          { required: ["body"], properties: { body: { type: "string" } } },
+          { required: ["body_file"], properties: { body_file: { type: "string" } } },
+        ],
+      } as Record<string, unknown>;
+
+      const normalized = normalizeToolParameterSchema(schema) as Record<string, unknown>;
+      const properties = (normalized.properties as Record<string, unknown>) ?? {};
+      const required = (normalized.required as string[] | undefined) ?? [];
+
+      // The root composition keyword is flattened for portability, but the root
+      // declared properties must survive the merge.
+      expect(Object.keys(properties)).toEqual(
+        expect.arrayContaining(["thread_id", "body", "body_file", "task_id", "turn_grant_id"]),
+      );
+      expect(normalized.additionalProperties).toBe(false);
+      // Every required field must be a declared property, otherwise the schema is
+      // unsatisfiable by construction (required + additionalProperties:false).
+      for (const field of required) {
+        expect(Object.hasOwn(properties, field)).toBe(true);
+      }
+      expect(properties.thread_id).toEqual({ type: "string", minLength: 1, maxLength: 128 });
+      expect(properties.body).toEqual({
+        anyOf: [{ type: "string" }, { type: "null" }],
+        default: null,
+      });
+      expect(properties.body_file).toEqual({
+        anyOf: [{ type: "string" }, { type: "null" }],
+        default: null,
+      });
+    },
+  );
 });
 
-function makeTool(parameters: TSchema): AnyAgentTool {
+function makeTool(parameters: TSchema, overrides: Partial<AnyAgentTool> = {}): AnyAgentTool {
   return {
     name: "test_tool",
     label: "Test Tool",
     description: "test",
     parameters,
     execute: vi.fn(),
+    ...overrides,
   };
 }
 
 describe("normalizeToolParameters", () => {
-  it("normalizes truly empty schemas to type:object with properties:{} (MCP parameter-free tools)", () => {
-    const tool: AnyAgentTool = {
-      name: "get_flux_instance",
-      label: "get_flux_instance",
-      description: "Get current Flux instance status",
-      parameters: {},
-      execute: vi.fn(),
-    };
+  it("preserves before_tool_call wrapper metadata", () => {
+    const source = makeTool(Type.Object({ value: Type.String() }));
+    const hookContext = { agentId: "main", sessionId: "session-before-normalize" };
+    const wrapped = wrapToolWithBeforeToolCallHook(source, hookContext);
 
-    const normalized = normalizeToolParameters(tool);
-
-    const parameters = normalized.parameters as Record<string, unknown>;
-    expect(parameters.type).toBe("object");
-    expect(parameters.properties).toStrictEqual({});
-  });
-
-  it("does not rewrite non-empty schemas that still lack type/properties", () => {
-    const tool: AnyAgentTool = {
-      name: "conditional",
-      label: "conditional",
-      description: "Conditional schema stays untouched",
-      parameters: { allOf: [] },
-      execute: vi.fn(),
-    };
-
-    const normalized = normalizeToolParameters(tool);
-
-    expect(normalized.parameters).toEqual({ allOf: [] });
-  });
-
-  it("injects properties:{} for type:object schemas missing properties (MCP no-param tools)", () => {
-    const tool: AnyAgentTool = {
-      name: "list_regions",
-      label: "list_regions",
-      description: "List all AWS regions",
-      parameters: { type: "object" },
-      execute: vi.fn(),
-    };
-
-    const normalized = normalizeToolParameters(tool);
-
-    const parameters = normalized.parameters as Record<string, unknown>;
-    expect(parameters.type).toBe("object");
-    expect(parameters.properties).toStrictEqual({});
-  });
-
-  it("injects properties:{} when properties key exists but is undefined (MCP SDK edge case #75362)", () => {
-    const tool: AnyAgentTool = {
-      name: "get_flux_instance",
-      label: "get_flux_instance",
-      description: "Get flux instance",
-      parameters: { type: "object", properties: undefined } as unknown as Record<string, unknown>,
-      execute: vi.fn(),
-    };
-
-    const normalized = normalizeToolParameters(tool);
-
-    const parameters = normalized.parameters as Record<string, unknown>;
-    expect(parameters.type).toBe("object");
-    expect(parameters.properties).toStrictEqual({});
-  });
-
-  it("injects properties:{} when properties key is null (MCP SDK edge case #75362)", () => {
-    const tool: AnyAgentTool = {
-      name: "get_flux_instance",
-      label: "get_flux_instance",
-      description: "Get flux instance",
-      parameters: { type: "object", properties: null } as unknown as Record<string, unknown>,
-      execute: vi.fn(),
-    };
-
-    const normalized = normalizeToolParameters(tool);
-
-    const parameters = normalized.parameters as Record<string, unknown>;
-    expect(parameters.type).toBe("object");
-    expect(parameters.properties).toStrictEqual({});
-  });
-
-  it("preserves existing properties on type:object schemas", () => {
-    const tool: AnyAgentTool = {
-      name: "query",
-      label: "query",
-      description: "Run a query",
-      parameters: { type: "object", properties: { q: { type: "string" } } },
-      execute: vi.fn(),
-    };
-
-    const normalized = normalizeToolParameters(tool);
-
-    const parameters = normalized.parameters as Record<string, unknown>;
-    expect(parameters.type).toBe("object");
-    expect(parameters.properties).toEqual({ q: { type: "string" } });
+    const normalized = normalizeToolParameters(wrapped);
+    expect(isToolWrappedWithBeforeToolCallHook(normalized)).toBe(true);
+    expect(getBeforeToolCallSourceTool(normalized)).toBe(source);
+    expect(getBeforeToolCallHookContext(normalized)).toBe(hookContext);
   });
 
   it("injects properties:{} for type:object with only additionalProperties", () => {
-    const tool: AnyAgentTool = {
-      name: "passthrough",
-      label: "passthrough",
-      description: "Accept any input",
-      parameters: { type: "object", additionalProperties: true },
-      execute: vi.fn(),
-    };
+    const tool = makeTool({ type: "object", additionalProperties: true }, { name: "passthrough" });
 
     const normalized = normalizeToolParameters(tool);
 
@@ -766,37 +1032,11 @@ describe("normalizeToolParameters", () => {
     expect(parameters.additionalProperties).toBe(true);
   });
 
-  it("prepares null arguments as empty objects for object schemas without required params", () => {
-    const tool: AnyAgentTool = {
-      name: "wiki_lint",
-      label: "wiki_lint",
-      description: "Lint wiki vault",
-      parameters: { type: "object", properties: {}, required: [] },
-      execute: vi.fn(),
-    };
-
-    const normalized = normalizeToolParameters(tool);
-    const prepared = normalized.prepareArguments?.(null) as Record<string, never>;
-
-    expect(prepared).toStrictEqual({});
-    expect(
-      validateToolArguments(normalized, {
-        type: "toolCall",
-        id: "call-1",
-        name: "wiki_lint",
-        arguments: prepared,
-      }),
-    ).toStrictEqual({});
-  });
-
   it("leaves null arguments invalid when the object schema has required params", () => {
-    const tool: AnyAgentTool = {
-      name: "query",
-      label: "query",
-      description: "Run query",
-      parameters: { type: "object", properties: { q: { type: "string" } }, required: ["q"] },
-      execute: vi.fn(),
-    };
+    const tool = makeTool(
+      { type: "object", properties: { q: { type: "string" } }, required: ["q"] },
+      { name: "query" },
+    );
 
     const normalized = normalizeToolParameters(tool);
 
@@ -812,11 +1052,8 @@ describe("normalizeToolParameters", () => {
   });
 
   it("leaves null arguments invalid when required params are nested in composite schemas", () => {
-    const tool: AnyAgentTool = {
-      name: "query",
-      label: "query",
-      description: "Run query",
-      parameters: {
+    const tool = makeTool(
+      {
         type: "object",
         allOf: [
           {
@@ -826,8 +1063,8 @@ describe("normalizeToolParameters", () => {
           },
         ],
       },
-      execute: vi.fn(),
-    };
+      { name: "query" },
+    );
 
     const normalized = normalizeToolParameters(tool);
 
@@ -859,69 +1096,15 @@ describe("normalizeToolParameters", () => {
       sessionKey: "e2e-null-args",
       loopDetection: { enabled: true },
     });
-    const events: AgentEvent[] = [];
-    let streamCalls = 0;
-    const streamFn: StreamFn = () => {
-      const stream = createAssistantMessageEventStream();
-      queueMicrotask(() => {
-        streamCalls += 1;
-        const message =
-          streamCalls === 1
-            ? {
-                role: "assistant" as const,
-                content: [
-                  {
-                    type: "toolCall" as const,
-                    id: "call-null-args",
-                    name: "wiki_lint",
-                    arguments: null as never,
-                  },
-                ],
-                api: "faux",
-                provider: "faux",
-                model: "faux-1",
-                usage: TEST_USAGE,
-                stopReason: "toolUse" as const,
-                timestamp: Date.now(),
-              }
-            : {
-                role: "assistant" as const,
-                content: [{ type: "text" as const, text: "done" }],
-                api: "faux",
-                provider: "faux",
-                model: "faux-1",
-                usage: TEST_USAGE,
-                stopReason: "stop" as const,
-                timestamp: Date.now(),
-              };
-        stream.push({ type: "done", reason: message.stopReason, message });
-      });
-      return stream;
-    };
-
-    const messages = await runAgentLoop(
-      [{ role: "user", content: "lint the wiki", timestamp: Date.now() }],
-      { systemPrompt: "test", messages: [], tools: [tool] },
+    const { messages, events, streamCalls } = await runToolCall(
+      tool,
       {
-        model: {
-          id: "faux-1",
-          name: "Faux",
-          provider: "faux",
-          api: "faux",
-          baseUrl: "http://localhost:0",
-          reasoning: false,
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 128000,
-          maxTokens: 1024,
-        },
-        convertToLlm: (agentMessages) => agentMessages as never,
+        type: "toolCall",
+        id: "call-null-args",
+        name: "wiki_lint",
+        arguments: null as never,
       },
-      (event) => {
-        events.push(event);
-      },
-      undefined,
-      streamFn,
+      "lint the wiki",
     );
 
     expect(streamCalls).toBe(2);
@@ -954,16 +1137,13 @@ describe("normalizeToolParameters", () => {
   });
 
   it("strips compat-declared unsupported schema keywords without provider-specific branching", () => {
-    const tool: AnyAgentTool = {
-      name: "demo",
-      label: "demo",
-      description: "demo",
-      parameters: Type.Object({
+    const tool = makeTool(
+      Type.Object({
         count: Type.Integer({ minimum: 1, maximum: 5 }),
         query: Type.Optional(Type.String({ minLength: 2 })),
       }),
-      execute: vi.fn(),
-    };
+      { name: "demo" },
+    );
 
     const normalized = normalizeToolParameters(tool, {
       modelCompat: {
@@ -975,25 +1155,28 @@ describe("normalizeToolParameters", () => {
       required?: string[];
       properties?: Record<string, Record<string, unknown>>;
     };
+    const properties = expectDefined(parameters.properties, "normalized schema properties");
+    const count = expectDefined(properties.count, "normalized count property");
+    const query = expectDefined(properties.query, "normalized query property");
 
     expect(parameters.required).toEqual(["count"]);
-    expect(parameters.properties?.count.minimum).toBeUndefined();
-    expect(parameters.properties?.count.maximum).toBeUndefined();
-    expect(parameters.properties?.count.type).toBe("integer");
-    expect(parameters.properties?.query.minLength).toBeUndefined();
-    expect(parameters.properties?.query.type).toBe("string");
+    expect(count.minimum).toBeUndefined();
+    expect(count.maximum).toBeUndefined();
+    expect(count.type).toBe("integer");
+    expect(query.minLength).toBeUndefined();
+    expect(query.type).toBe("string");
   });
 
   it("omits empty array items when model compat requires it", () => {
-    const tool: AnyAgentTool = {
-      name: "demo",
-      label: "demo",
-      description: "demo",
-      parameters: {
+    const tool = makeTool(
+      {
         type: "object",
         properties: Object.fromEntries([
           ["__proto__", { type: "array", items: {} }],
           ["emptyItems", { type: "array" }],
+          ["undefinedItems", { type: "array", items: undefined }],
+          ["unionItems", { type: ["array", "null"], items: {} }],
+          ["unionUndefinedItems", { type: ["array", "null"], items: undefined }],
           ["typedItems", { type: "array", items: { type: "string" } }],
           ["falseItems", { type: "array", items: false }],
           ["nullItems", { type: "array", items: null }],
@@ -1001,8 +1184,8 @@ describe("normalizeToolParameters", () => {
           ["literalEnum", { type: "string", enum: [{ type: "array", items: {} }] }],
         ]),
       },
-      execute: vi.fn(),
-    };
+      { name: "demo" },
+    );
 
     const normalized = normalizeToolParameters(tool, {
       modelCompat: { omitEmptyArrayItems: true } as never,
@@ -1013,6 +1196,9 @@ describe("normalizeToolParameters", () => {
       properties: Object.fromEntries([
         ["__proto__", { type: "array" }],
         ["emptyItems", { type: "array" }],
+        ["undefinedItems", { type: "array" }],
+        ["unionItems", { type: ["array", "null"] }],
+        ["unionUndefinedItems", { type: ["array", "null"], items: undefined }],
         ["typedItems", { type: "array", items: { type: "string" } }],
         ["falseItems", { type: "array", items: false }],
         ["nullItems", { type: "array", items: null }],
@@ -1057,8 +1243,7 @@ describe("normalizeToolParameters", () => {
       properties?: Record<string, unknown>;
     };
 
-    expect(params.required).not.toContain("token");
-    expect(params.required).toContain("action");
+    expect(params.required).toEqual(["action", "amount"]);
     expect(params.properties).toHaveProperty("action");
     expect(params.properties).toHaveProperty("amount");
     expect(params.properties).toHaveProperty("price");
@@ -1082,30 +1267,6 @@ describe("normalizeToolParameters", () => {
     const params = result.parameters as { required?: string[] };
 
     expect(params.required).toEqual(["action", "token"]);
-  });
-
-  it("keeps all required fields when they exist in merged properties", () => {
-    const tool = makeTool({
-      type: "object",
-      required: ["action", "amount"],
-      anyOf: [
-        {
-          type: "object",
-          properties: {
-            action: { type: "string" },
-            amount: { type: "number" },
-          },
-        },
-      ],
-    });
-
-    const result = normalizeToolParameters(tool, {
-      modelProvider: "google",
-    });
-
-    const params = result.parameters as { required?: string[] };
-    expect(params.required).toContain("action");
-    expect(params.required).toContain("amount");
   });
 
   it("removes required entirely when no fields match merged properties", () => {
@@ -1150,5 +1311,175 @@ describe("normalizeToolParameters", () => {
 
     const params = result.parameters as { required?: string[] };
     expect(params.required).toEqual(["name"]);
+  });
+});
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
+
+function makeValidatedFileTool(name: "write" | "edit", execute: AnyAgentTool["execute"]) {
+  return wrapToolParamValidation(makeTool({}, { name, execute }), REQUIRED_PARAM_GROUPS[name]);
+}
+
+describe("assertRequiredParams", () => {
+  it("strips only the malformed terminal XML arg-value suffix", () => {
+    expect(normalizeFileToolPathParam("echo test</arg_value>>")).toBe("echo test");
+    expect(normalizeFileToolPathParam("echo test</arg_value>>>>>")).toBe("echo test");
+    expect(normalizeFileToolPathParam("echo test</arg_value>")).toBe("echo test</arg_value>");
+    expect(normalizeFileToolPathParam("echo </arg_value>> test")).toBe("echo </arg_value>> test");
+  });
+
+  it("normalizes known hallucinated Office/codex path extensions", () => {
+    expect(normalizeFileToolPathParam("reports/final.docodex")).toBe("reports/final.docx");
+    expect(normalizeFileToolPathParam("slides/plan.pptxodex")).toBe("slides/plan.pptx");
+    expect(normalizeFileToolPathParam("sheets/budget.XLSCODEX")).toBe("sheets/budget.xlsx");
+    expect(normalizeFileToolPathParam("notes/codex-report.txt")).toBe("notes/codex-report.txt");
+    expect(normalizeFileToolPathParam("archive.docodex/notes.txt")).toBe(
+      "archive.docodex/notes.txt",
+    );
+  });
+
+  it("strips malformed path suffixes without touching payload text", async () => {
+    const execute = vi.fn(async (_id, args) => args);
+    const tool = makeValidatedFileTool("write", execute);
+
+    await tool.execute("id", {
+      path: "notes.txt</arg_value>>",
+      content: "keep literal payload</arg_value>>",
+    });
+
+    expect(execute).toHaveBeenCalledWith(
+      "id",
+      {
+        path: "notes.txt",
+        content: "keep literal payload</arg_value>>",
+      },
+      undefined,
+      undefined,
+    );
+  });
+
+  it("normalizes Office/codex path extensions without touching payload text", async () => {
+    const execute = vi.fn(async (_id, args) => args);
+    const tool = makeValidatedFileTool("write", execute);
+
+    await tool.execute("id", {
+      path: "reports/final.docodex",
+      content: "keep literal payload.docodex",
+    });
+
+    expect(execute).toHaveBeenCalledWith(
+      "id",
+      {
+        path: "reports/final.docx",
+        content: "keep literal payload.docodex",
+      },
+      undefined,
+      undefined,
+    );
+  });
+
+  it("rejects paths that become empty after malformed XML arg-value suffix stripping", async () => {
+    const execute = vi.fn();
+    const tool = makeValidatedFileTool("write", execute);
+
+    await expect(tool.execute("id", { path: "</arg_value>>", content: "x" })).rejects.toThrow(
+      /Missing required parameter: path/,
+    );
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("preserves edit replacement payloads while cleaning the path", async () => {
+    const execute = vi.fn(async (_id, args) => args);
+    const tool = makeValidatedFileTool("edit", execute);
+
+    const edits = [
+      {
+        oldText: "literal old</arg_value>>",
+        newText: "literal new</arg_value>>",
+      },
+    ];
+    await tool.execute("id", { path: "notes.docxodex</arg_value>>>", edits });
+
+    expect(execute).toHaveBeenCalledWith("id", { path: "notes.docx", edits }, undefined, undefined);
+  });
+
+  it("does not normalize legacy aliases during validation", async () => {
+    const tool = makeValidatedFileTool("write", vi.fn());
+    await expect(
+      tool.execute("id", { file_path: "test.txt" }, new AbortController().signal, vi.fn()),
+    ).rejects.toThrow(/\(received: file_path\)/);
+  });
+
+  it("enforces canonical path/content at runtime", async () => {
+    const execute = vi.fn(async (_id, args) => args);
+    const tool = makeValidatedFileTool("write", execute);
+
+    await tool.execute("tool-1", { path: "foo.txt", content: "x" });
+    expect(execute).toHaveBeenCalledWith(
+      "tool-1",
+      { path: "foo.txt", content: "x" },
+      undefined,
+      undefined,
+    );
+
+    await expect(tool.execute("tool-2", { content: "x" })).rejects.toThrow(
+      "Missing required parameter: path (received: content). Supply correct parameters before retrying.",
+    );
+    await expect(tool.execute("tool-3", { path: "   ", content: "x" })).rejects.toThrow(
+      "Missing required parameter: path (received: path=<empty-string>, content). Supply correct parameters before retrying.",
+    );
+    await expect(tool.execute("tool-4", {})).rejects.toThrow(
+      "Missing required parameters: path, content. Supply correct parameters before retrying.",
+    );
+  });
+
+  it("excludes null and undefined values from received hint", () => {
+    expect(() =>
+      assertRequiredParams(
+        { path: "test.txt", content: null },
+        [
+          { keys: ["path"], label: "path" },
+          { keys: ["content"], label: "content" },
+        ],
+        "write",
+      ),
+    ).toThrow(/\(received: path\)[^,]/);
+  });
+
+  it("shows empty-string values for present params that still fail validation", () => {
+    expect(() =>
+      assertRequiredParams(
+        { path: "/tmp/a.txt", content: "   " },
+        [
+          { keys: ["path"], label: "path" },
+          { keys: ["content"], label: "content" },
+        ],
+        "write",
+      ),
+    ).toThrow(/\(received: path, content=<empty-string>\)/);
+  });
+
+  it("shows wrong-type values for present params that still fail validation", async () => {
+    const tool = makeValidatedFileTool("write", vi.fn());
+    await expect(
+      tool.execute(
+        "id",
+        { path: "test.txt", content: { unexpected: true } },
+        new AbortController().signal,
+        vi.fn(),
+      ),
+    ).rejects.toThrow(/\(received: (?:path, content=<object>|content=<object>, path)\)/);
+  });
+
+  it("includes multiple received keys when several params are present", () => {
+    expect(() =>
+      assertRequiredParams(
+        { path: "/tmp/a.txt", extra: "yes" },
+        [
+          { keys: ["path"], label: "path" },
+          { keys: ["content"], label: "content" },
+        ],
+        "write",
+      ),
+    ).toThrow(/\(received: path, extra\)/);
   });
 });

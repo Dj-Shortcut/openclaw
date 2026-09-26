@@ -4,6 +4,7 @@
  * This module owns the provider-facing control tool, conservative intent
  * classifier, and user-visible status/queue/cancel messages used by Talk.
  */
+import { asNonArrayRecord, asRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
@@ -169,8 +170,7 @@ export function resolveRealtimeVoiceAgentControlIntent(params: {
     };
   }
 
-  const text = params.text;
-  const normalized = text.trim().toLowerCase();
+  const normalized = params.text.trim().toLowerCase();
   // "Stop using X" redirects the active work; it must not be treated as an
   // abort of the whole run just because it starts with "stop".
   if (matchesAnyPattern(normalized, STOP_REDIRECT_CONTROL_PATTERNS)) {
@@ -240,17 +240,17 @@ export function parseRealtimeVoiceAgentControlToolArgs(args: unknown): {
   mode: RealtimeVoiceAgentControlMode;
 } {
   const parsed = parseRealtimeVoiceAgentControlToolArgsRecord(args);
-  const record = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  const record = asNonArrayRecord(parsed);
   const text =
-    normalizeOptionalString((record as Record<string, unknown>).text) ??
-    normalizeOptionalString((record as Record<string, unknown>).message) ??
-    normalizeOptionalString((record as Record<string, unknown>).request) ??
-    normalizeOptionalString((record as Record<string, unknown>).query);
+    normalizeOptionalString(record.text) ??
+    normalizeOptionalString(record.message) ??
+    normalizeOptionalString(record.request) ??
+    normalizeOptionalString(record.query);
   if (!text) {
     throw new Error("text required");
   }
   const mode =
-    normalizeRealtimeVoiceAgentControlMode((record as Record<string, unknown>).mode) ??
+    normalizeRealtimeVoiceAgentControlMode(record.mode) ??
     resolveRealtimeVoiceAgentControlIntent({ text }).mode;
   return { text, mode };
 }
@@ -270,11 +270,15 @@ function parseRealtimeVoiceAgentControlToolArgsRecord(args: unknown): unknown {
   }
 }
 
+/** Fixed user-visible failure; private execution/readiness errors stay in host diagnostics. */
+export const REALTIME_VOICE_AGENT_CONTROL_FAILURE_MESSAGE =
+  "OpenClaw could not process that voice control. Please try again.";
+
 /** Build the system-style instruction that forces exact spoken status output. */
 export function buildRealtimeVoiceAgentControlSpeechMessage(text: string): string {
   return [
     "Internal OpenClaw voice control result.",
-    "Do not call openclaw_agent_consult or any other tool for this message.",
+    "Do not delegate this message or call any tools.",
     "Speak this exact OpenClaw status to the voice call, without adding, removing, or rephrasing words.",
     `Status: ${JSON.stringify(text)}`,
   ].join("\n");
@@ -305,6 +309,9 @@ export function formatRealtimeVoiceAgentQueueRejection(
   mode: RealtimeVoiceAgentControlMode,
   reason: string,
 ): string {
+  if (reason === "guarded_injection_unsupported") {
+    return "This agent runtime cannot safely accept scoped voice steering. Check status, cancel the run, or start a new explicit request. Update the runtime when guarded injection is supported.";
+  }
   if (reason === "compacting") {
     return "OpenClaw is compacting the active run and cannot accept voice steering yet.";
   }
@@ -320,10 +327,7 @@ function isRealtimeVoiceAgentControlToolEvent(event: TalkEvent): boolean {
   if (!event.type.startsWith("tool.")) {
     return false;
   }
-  const payload =
-    event.payload && typeof event.payload === "object"
-      ? (event.payload as Record<string, unknown>)
-      : {};
+  const payload = asRecord(event.payload);
   return normalizeOptionalString(payload.name) === REALTIME_VOICE_AGENT_CONTROL_TOOL_NAME;
 }
 
@@ -345,10 +349,7 @@ export function formatRealtimeVoiceAgentStatus(params: {
     (event) => event.type.startsWith("tool.") && !isRealtimeVoiceAgentControlToolEvent(event),
   );
   if (toolEvent) {
-    const payload =
-      toolEvent.payload && typeof toolEvent.payload === "object"
-        ? (toolEvent.payload as Record<string, unknown>)
-        : {};
+    const payload = asRecord(toolEvent.payload);
     const name = normalizeOptionalString(payload.name);
     const phase = normalizeOptionalString(payload.phase);
     if (toolEvent.type === "tool.call") {
@@ -372,9 +373,5 @@ export function formatRealtimeVoiceAgentStatus(params: {
   if (params.activity?.activeWorkKind === "model_call") {
     return "OpenClaw is waiting on the model.";
   }
-  if (params.activity?.activeWorkKind === "embedded_run" || params.activity?.hasActiveEmbeddedRun) {
-    return "OpenClaw is working on the current voice request.";
-  }
-
   return "OpenClaw is working on the current voice request.";
 }

@@ -4,23 +4,31 @@
  * Resolves extension, skill, prompt, and theme sources from npm, git, local paths, and project manifests.
  */
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { globSync } from "glob";
-import ignore from "ignore";
+import {
+  chmodSync,
+  existsSync,
+  globSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { minimatch } from "minimatch";
-import { CONFIG_DIR_NAME } from "../config.js";
+import { isDefaultStateDir } from "../../config/paths.js";
+import { isPathInside } from "../../infra/path-guards.js";
+import {
+  addIgnoreRules,
+  normalizeNativePathSeparators,
+  type IgnoreMatcher,
+} from "../../shared/ignore-rules.js";
+import { CONFIG_DIR_NAME } from "../package-metadata.js";
 import { type GitSource, parseGitUrl } from "../utils/git.js";
 import { canonicalizePath, isLocalPath } from "../utils/paths.js";
 import type { PackageSource, SettingsManager } from "./settings-manager.js";
-
-export interface PathMetadata {
-  source: string;
-  scope: SourceScope;
-  origin: "package" | "top-level";
-  baseDir?: string;
-}
+import type { PathMetadata, SourceScope } from "./source-info.js";
 
 export interface ResolvedResource {
   path: string;
@@ -51,8 +59,6 @@ interface PackageManagerOptions {
   settingsManager: SettingsManager;
 }
 
-type SourceScope = "user" | "project" | "temporary";
-
 type NpmSource = {
   type: "npm";
   spec: string;
@@ -72,13 +78,6 @@ interface ResourceManifest {
   skills?: string[];
   prompts?: string[];
   themes?: string[];
-}
-
-interface ResourceAccumulator {
-  extensions: Map<string, { metadata: PathMetadata; enabled: boolean }>;
-  skills: Map<string, { metadata: PathMetadata; enabled: boolean }>;
-  prompts: Map<string, { metadata: PathMetadata; enabled: boolean }>;
-  themes: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 }
 
 /**
@@ -101,16 +100,16 @@ function resourcePrecedenceRank(m: PathMetadata): number {
   return scopeBase + (m.source === "local" ? 0 : 1);
 }
 
-interface PackageFilter {
-  extensions?: string[];
-  skills?: string[];
-  prompts?: string[];
-  themes?: string[];
-}
-
 type ResourceType = "extensions" | "skills" | "prompts" | "themes";
+type TopLevelAutoResourceType = Extract<ResourceType, "prompts" | "themes">;
+type ResourceState = { metadata: PathMetadata; enabled: boolean };
+type ResourceAccumulator = Record<ResourceType, Map<string, ResourceState>>;
 
-const RESOURCE_TYPES: ResourceType[] = ["extensions", "skills", "prompts", "themes"];
+const RESOURCE_TYPES = ["extensions", "skills", "prompts", "themes"] as const;
+
+type ResolvedPackageTarget =
+  | { kind: "missing" }
+  | { kind: "file" | "directory"; path: string; baseDir: string };
 
 const FILE_PATTERNS: Record<ResourceType, RegExp> = {
   extensions: /\.(ts|js)$/,
@@ -119,75 +118,20 @@ const FILE_PATTERNS: Record<ResourceType, RegExp> = {
   themes: /\.json$/,
 };
 
-const IGNORE_FILE_NAMES = [".gitignore", ".ignore", ".fdignore"];
-
-type IgnoreMatcher = ReturnType<typeof ignore>;
-
-function toPosixPath(p: string): string {
-  return p.split(sep).join("/");
-}
-
 function getHomeDir(): string {
   return process.env.HOME || homedir();
 }
 
-function prefixIgnorePattern(line: string, prefix: string): string | null {
-  const trimmed = line.trim();
-  if (!trimmed) {
-    return null;
-  }
-  if (trimmed.startsWith("#") && !trimmed.startsWith("\\#")) {
-    return null;
-  }
-
-  let pattern = line;
-  let negated = false;
-
-  if (pattern.startsWith("!")) {
-    negated = true;
-    pattern = pattern.slice(1);
-  } else if (pattern.startsWith("\\!")) {
-    pattern = pattern.slice(1);
-  }
-
-  if (pattern.startsWith("/")) {
-    pattern = pattern.slice(1);
-  }
-
-  const prefixed = prefix ? `${prefix}${pattern}` : pattern;
-  return negated ? `!${prefixed}` : prefixed;
-}
-
-function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string): void {
-  const relativeDir = relative(rootDir, dir);
-  const prefix = relativeDir ? `${toPosixPath(relativeDir)}/` : "";
-
-  for (const filename of IGNORE_FILE_NAMES) {
-    const ignorePath = join(dir, filename);
-    if (!existsSync(ignorePath)) {
-      continue;
-    }
-    try {
-      const content = readFileSync(ignorePath, "utf-8");
-      const patterns = content
-        .split(/\r?\n/)
-        .map((line) => prefixIgnorePattern(line, prefix))
-        .filter((line): line is string => Boolean(line));
-      if (patterns.length > 0) {
-        ig.add(patterns);
-      }
-    } catch {}
-  }
+function getAgentResourceTempDir(agentDir: string): string {
+  const tempDir = join(agentDir, "tmp", "resources");
+  // Temporary packages can contain executable code, so other local users must not modify them.
+  mkdirSync(tempDir, { recursive: true, mode: 0o700 });
+  chmodSync(tempDir, 0o700);
+  return tempDir;
 }
 
 function isPattern(s: string): boolean {
-  return (
-    s.startsWith("!") ||
-    s.startsWith("+") ||
-    s.startsWith("-") ||
-    s.includes("*") ||
-    s.includes("?")
-  );
+  return isOverridePattern(s) || hasGlobPattern(s);
 }
 
 function isOverridePattern(s: string): boolean {
@@ -211,6 +155,64 @@ function splitPatterns(entries: string[]): { plain: string[]; patterns: string[]
   return { plain, patterns };
 }
 
+type CollectedDirectoryEntry = {
+  name: string;
+  fullPath: string;
+  isDirectory: boolean;
+  isFile: boolean;
+};
+
+type CollectedDirectory = {
+  entries: CollectedDirectoryEntry[];
+  ignoreMatcher?: IgnoreMatcher;
+};
+
+function collectDirectoryEntries(
+  dir: string,
+  root: string,
+  ignoreMatcher?: IgnoreMatcher,
+  options: { allowNodeModules?: boolean; requireWithinRoot?: boolean } = {},
+): CollectedDirectory {
+  if (!existsSync(dir)) {
+    return { entries: [], ignoreMatcher };
+  }
+  const entries: CollectedDirectoryEntry[] = [];
+  const ig = addIgnoreRules(dir, root, ignoreMatcher);
+  try {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (
+        entry.name.startsWith(".") ||
+        (!options.allowNodeModules && entry.name === "node_modules")
+      ) {
+        continue;
+      }
+      const fullPath = join(dir, entry.name);
+      if (options.requireWithinRoot && !isRealPathWithinRoot(root, fullPath)) {
+        continue;
+      }
+      let isDirectory = entry.isDirectory();
+      let isFile = entry.isFile();
+      if (entry.isSymbolicLink()) {
+        try {
+          const stats = statSync(fullPath);
+          isDirectory = stats.isDirectory();
+          isFile = stats.isFile();
+        } catch {
+          continue;
+        }
+      }
+      const relativePath = normalizeNativePathSeparators(relative(root, fullPath));
+      if (ig.ignores(isDirectory ? `${relativePath}/` : relativePath)) {
+        continue;
+      }
+      entries.push({ name: entry.name, fullPath, isDirectory, isFile });
+    }
+  } catch {
+    // Ignore unreadable directories.
+  }
+  return { entries, ignoreMatcher: ig };
+}
+
 function collectFiles(
   dir: string,
   filePattern: RegExp,
@@ -219,54 +221,25 @@ function collectFiles(
   rootDir?: string,
 ): string[] {
   const files: string[] = [];
-  if (!existsSync(dir)) {
-    return files;
-  }
-
   const root = rootDir ?? dir;
-  const ig = ignoreMatcher ?? ignore();
-  addIgnoreRules(ig, dir, root);
-
-  try {
-    const entries = readdirSync(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.name.startsWith(".")) {
-        continue;
-      }
-      if (skipNodeModules && entry.name === "node_modules") {
-        continue;
-      }
-
-      const fullPath = join(dir, entry.name);
-      let isDir = entry.isDirectory();
-      let isFile = entry.isFile();
-
-      if (entry.isSymbolicLink()) {
-        try {
-          const stats = statSync(fullPath);
-          isDir = stats.isDirectory();
-          isFile = stats.isFile();
-        } catch {
-          continue;
-        }
-      }
-
-      const relPath = toPosixPath(relative(root, fullPath));
-      const ignorePath = isDir ? `${relPath}/` : relPath;
-      if (ig.ignores(ignorePath)) {
-        continue;
-      }
-
-      if (isDir) {
-        files.push(...collectFiles(fullPath, filePattern, skipNodeModules, ig, root));
-      } else if (isFile && filePattern.test(entry.name)) {
-        files.push(fullPath);
-      }
+  const directory = collectDirectoryEntries(dir, root, ignoreMatcher, {
+    allowNodeModules: !skipNodeModules,
+  });
+  for (const entry of directory.entries) {
+    if (entry.isDirectory) {
+      files.push(
+        ...collectFiles(
+          entry.fullPath,
+          filePattern,
+          skipNodeModules,
+          directory.ignoreMatcher,
+          root,
+        ),
+      );
+    } else if (entry.isFile && filePattern.test(entry.name)) {
+      files.push(entry.fullPath);
     }
-  } catch {
-    // Ignore errors
   }
-
   return files;
 }
 
@@ -279,97 +252,25 @@ function collectSkillEntries(
   rootDir?: string,
 ): string[] {
   const entries: string[] = [];
-  if (!existsSync(dir)) {
-    return entries;
-  }
-
   const root = rootDir ?? dir;
-  const ig = ignoreMatcher ?? ignore();
-  addIgnoreRules(ig, dir, root);
-
-  try {
-    const dirEntries = readdirSync(dir, { withFileTypes: true });
-
-    for (const entry of dirEntries) {
-      if (entry.name !== "SKILL.md") {
-        continue;
-      }
-
-      const fullPath = join(dir, entry.name);
-      if (!isRealPathWithinRoot(root, fullPath)) {
-        continue;
-      }
-      let isFile = entry.isFile();
-      if (entry.isSymbolicLink()) {
-        try {
-          isFile = statSync(fullPath).isFile();
-        } catch {
-          continue;
-        }
-      }
-
-      const relPath = toPosixPath(relative(root, fullPath));
-      if (isFile && !ig.ignores(relPath)) {
-        entries.push(fullPath);
-        return entries;
-      }
-    }
-
-    for (const entry of dirEntries) {
-      if (entry.name.startsWith(".")) {
-        continue;
-      }
-      if (entry.name === "node_modules") {
-        continue;
-      }
-
-      const fullPath = join(dir, entry.name);
-      if (!isRealPathWithinRoot(root, fullPath)) {
-        continue;
-      }
-      let isDir = entry.isDirectory();
-      let isFile = entry.isFile();
-
-      if (entry.isSymbolicLink()) {
-        try {
-          const stats = statSync(fullPath);
-          isDir = stats.isDirectory();
-          isFile = stats.isFile();
-        } catch {
-          continue;
-        }
-      }
-
-      const relPath = toPosixPath(relative(root, fullPath));
-      if (
-        mode === "openclaw" &&
-        dir === root &&
-        isFile &&
-        entry.name.endsWith(".md") &&
-        !ig.ignores(relPath)
-      ) {
-        entries.push(fullPath);
-        continue;
-      }
-
-      if (!isDir) {
-        continue;
-      }
-      if (ig.ignores(`${relPath}/`)) {
-        continue;
-      }
-
-      entries.push(...collectSkillEntries(fullPath, mode, ig, root));
-    }
-  } catch {
-    // Ignore errors
+  const directory = collectDirectoryEntries(dir, root, ignoreMatcher, {
+    requireWithinRoot: true,
+  });
+  const skill = directory.entries.find((entry) => entry.name === "SKILL.md" && entry.isFile);
+  if (skill) {
+    return [skill.fullPath];
   }
-
+  for (const entry of directory.entries) {
+    if (mode === "openclaw" && dir === root && entry.isFile && entry.name.endsWith(".md")) {
+      entries.push(entry.fullPath);
+      continue;
+    }
+    if (!entry.isDirectory) {
+      continue;
+    }
+    entries.push(...collectSkillEntries(entry.fullPath, mode, directory.ignoreMatcher, root));
+  }
   return entries;
-}
-
-function collectAutoSkillEntries(dir: string, mode: SkillDiscoveryMode): string[] {
-  return collectSkillEntries(dir, mode);
 }
 
 function findGitRepoRoot(startDir: string): string | null {
@@ -407,99 +308,17 @@ function collectAncestorAgentsSkillDirs(startDir: string): string[] {
   return skillDirs;
 }
 
-function collectAutoPromptEntries(dir: string): string[] {
+function collectTopLevelAutoResourceEntries(
+  dir: string,
+  resourceType: TopLevelAutoResourceType,
+): string[] {
   const entries: string[] = [];
-  if (!existsSync(dir)) {
-    return entries;
-  }
-
-  const ig = ignore();
-  addIgnoreRules(ig, dir, dir);
-
-  try {
-    const dirEntries = readdirSync(dir, { withFileTypes: true });
-    for (const entry of dirEntries) {
-      if (entry.name.startsWith(".")) {
-        continue;
-      }
-      if (entry.name === "node_modules") {
-        continue;
-      }
-
-      const fullPath = join(dir, entry.name);
-      if (!isRealPathWithinRoot(dir, fullPath)) {
-        continue;
-      }
-      let isFile = entry.isFile();
-      if (entry.isSymbolicLink()) {
-        try {
-          isFile = statSync(fullPath).isFile();
-        } catch {
-          continue;
-        }
-      }
-
-      const relPath = toPosixPath(relative(dir, fullPath));
-      if (ig.ignores(relPath)) {
-        continue;
-      }
-
-      if (isFile && entry.name.endsWith(".md")) {
-        entries.push(fullPath);
-      }
+  const directory = collectDirectoryEntries(dir, dir, undefined, { requireWithinRoot: true });
+  for (const entry of directory.entries) {
+    if (entry.isFile && FILE_PATTERNS[resourceType].test(entry.name)) {
+      entries.push(entry.fullPath);
     }
-  } catch {
-    // Ignore errors
   }
-
-  return entries;
-}
-
-function collectAutoThemeEntries(dir: string): string[] {
-  const entries: string[] = [];
-  if (!existsSync(dir)) {
-    return entries;
-  }
-
-  const ig = ignore();
-  addIgnoreRules(ig, dir, dir);
-
-  try {
-    const dirEntries = readdirSync(dir, { withFileTypes: true });
-    for (const entry of dirEntries) {
-      if (entry.name.startsWith(".")) {
-        continue;
-      }
-      if (entry.name === "node_modules") {
-        continue;
-      }
-
-      const fullPath = join(dir, entry.name);
-      if (!isRealPathWithinRoot(dir, fullPath)) {
-        continue;
-      }
-      let isFile = entry.isFile();
-      if (entry.isSymbolicLink()) {
-        try {
-          isFile = statSync(fullPath).isFile();
-        } catch {
-          continue;
-        }
-      }
-
-      const relPath = toPosixPath(relative(dir, fullPath));
-      if (ig.ignores(relPath)) {
-        continue;
-      }
-
-      if (isFile && entry.name.endsWith(".json")) {
-        entries.push(fullPath);
-      }
-    }
-  } catch {
-    // Ignore errors
-  }
-
   return entries;
 }
 
@@ -545,9 +364,6 @@ function resolveExtensionEntries(dir: string, rootDir = dir): string[] | null {
 
 function collectAutoExtensionEntries(dir: string): string[] {
   const entries: string[] = [];
-  if (!existsSync(dir)) {
-    return entries;
-  }
 
   // First check if this directory itself has explicit extension entries (package.json or index)
   const rootEntries = resolveExtensionEntries(dir);
@@ -555,56 +371,18 @@ function collectAutoExtensionEntries(dir: string): string[] {
     return rootEntries;
   }
 
-  // Otherwise, discover extensions from directory contents
-  const ig = ignore();
-  addIgnoreRules(ig, dir, dir);
-
-  try {
-    const dirEntries = readdirSync(dir, { withFileTypes: true });
-    for (const entry of dirEntries) {
-      if (entry.name.startsWith(".")) {
-        continue;
-      }
-      if (entry.name === "node_modules") {
-        continue;
-      }
-
-      const fullPath = join(dir, entry.name);
-      if (!isRealPathWithinRoot(dir, fullPath)) {
-        continue;
-      }
-      let isDir = entry.isDirectory();
-      let isFile = entry.isFile();
-
-      if (entry.isSymbolicLink()) {
-        try {
-          const stats = statSync(fullPath);
-          isDir = stats.isDirectory();
-          isFile = stats.isFile();
-        } catch {
-          continue;
-        }
-      }
-
-      const relPath = toPosixPath(relative(dir, fullPath));
-      const ignorePath = isDir ? `${relPath}/` : relPath;
-      if (ig.ignores(ignorePath)) {
-        continue;
-      }
-
-      if (isFile && (entry.name.endsWith(".ts") || entry.name.endsWith(".js"))) {
-        entries.push(fullPath);
-      } else if (isDir) {
-        const resolvedEntries = resolveExtensionEntries(fullPath, dir);
-        if (resolvedEntries) {
-          entries.push(...resolvedEntries);
-        }
+  // Otherwise, discover extensions from directory contents.
+  const directory = collectDirectoryEntries(dir, dir, undefined, { requireWithinRoot: true });
+  for (const entry of directory.entries) {
+    if (entry.isFile && (entry.name.endsWith(".ts") || entry.name.endsWith(".js"))) {
+      entries.push(entry.fullPath);
+    } else if (entry.isDirectory) {
+      const resolvedEntries = resolveExtensionEntries(entry.fullPath, dir);
+      if (resolvedEntries) {
+        entries.push(...resolvedEntries);
       }
     }
-  } catch {
-    // Ignore errors
   }
-
   return entries;
 }
 
@@ -622,6 +400,13 @@ function collectResourceFiles(dir: string, resourceType: ResourceType): string[]
   return collectFiles(dir, FILE_PATTERNS[resourceType]);
 }
 
+const AUTO_RESOURCE_COLLECTORS = {
+  extensions: collectAutoExtensionEntries,
+  skills: (dir: string) => collectSkillEntries(dir, "openclaw"),
+  prompts: (dir: string) => collectTopLevelAutoResourceEntries(dir, "prompts"),
+  themes: (dir: string) => collectTopLevelAutoResourceEntries(dir, "themes"),
+} satisfies Record<ResourceType, (dir: string) => string[]>;
+
 function resolveRealPathIfPossible(path: string): string {
   try {
     return realpathSync.native(path);
@@ -630,107 +415,55 @@ function resolveRealPathIfPossible(path: string): string {
   }
 }
 
-function isPathWithinRoot(root: string, candidate: string): boolean {
-  const rel = relative(root, candidate);
-  return rel === "" || (rel !== "" && !rel.startsWith("..") && !isAbsolute(rel));
-}
-
 function isRealPathWithinRoot(root: string, candidate: string): boolean {
-  return isPathWithinRoot(
+  return isPathInside(
     resolveRealPathIfPossible(resolve(root)),
     resolveRealPathIfPossible(candidate),
   );
 }
 
-function matchesAnyPattern(filePath: string, patterns: string[], baseDir: string): boolean {
-  const rel = toPosixPath(relative(baseDir, filePath));
+function getMatchCandidates(filePath: string, baseDir: string, includeNames: boolean): string[] {
   const name = basename(filePath);
-  const filePathPosix = toPosixPath(filePath);
-  const isSkillFile = name === "SKILL.md";
-  const parentDir = isSkillFile ? dirname(filePath) : undefined;
-  const parentRel = isSkillFile ? toPosixPath(relative(baseDir, parentDir!)) : undefined;
-  const parentName = isSkillFile ? basename(parentDir!) : undefined;
-  const parentDirPosix = isSkillFile ? toPosixPath(parentDir!) : undefined;
-
-  return patterns.some((pattern) => {
-    const normalizedPattern = toPosixPath(pattern);
-    if (
-      minimatch(rel, normalizedPattern) ||
-      minimatch(name, normalizedPattern) ||
-      minimatch(filePathPosix, normalizedPattern)
-    ) {
-      return true;
-    }
-    if (!isSkillFile) {
-      return false;
-    }
-    return (
-      minimatch(parentRel!, normalizedPattern) ||
-      minimatch(parentName!, normalizedPattern) ||
-      minimatch(parentDirPosix!, normalizedPattern)
+  const candidates = [
+    normalizeNativePathSeparators(relative(baseDir, filePath)),
+    normalizeNativePathSeparators(filePath),
+  ];
+  if (includeNames) {
+    candidates.push(name);
+  }
+  if (name === "SKILL.md") {
+    const parentDir = dirname(filePath);
+    candidates.push(
+      normalizeNativePathSeparators(relative(baseDir, parentDir)),
+      normalizeNativePathSeparators(parentDir),
     );
-  });
+    if (includeNames) {
+      candidates.push(basename(parentDir));
+    }
+  }
+  return candidates;
+}
+
+function matchesAnyPattern(filePath: string, patterns: string[], baseDir: string): boolean {
+  const candidates = getMatchCandidates(filePath, baseDir, true);
+  return patterns.some(
+    (pattern) => minimatch.match(candidates, normalizeNativePathSeparators(pattern)).length > 0,
+  );
 }
 
 function normalizeExactPattern(pattern: string): string {
   const normalized =
     pattern.startsWith("./") || pattern.startsWith(".\\") ? pattern.slice(2) : pattern;
-  return toPosixPath(normalized);
+  return normalizeNativePathSeparators(normalized);
 }
 
 function matchesAnyExactPattern(filePath: string, patterns: string[], baseDir: string): boolean {
-  if (patterns.length === 0) {
-    return false;
-  }
-  const rel = toPosixPath(relative(baseDir, filePath));
-  const name = basename(filePath);
-  const filePathPosix = toPosixPath(filePath);
-  const isSkillFile = name === "SKILL.md";
-  const parentDir = isSkillFile ? dirname(filePath) : undefined;
-  const parentRel = isSkillFile ? toPosixPath(relative(baseDir, parentDir!)) : undefined;
-  const parentDirPosix = isSkillFile ? toPosixPath(parentDir!) : undefined;
-
-  return patterns.some((pattern) => {
-    const normalized = normalizeExactPattern(pattern);
-    if (normalized === rel || normalized === filePathPosix) {
-      return true;
-    }
-    if (!isSkillFile) {
-      return false;
-    }
-    return normalized === parentRel || normalized === parentDirPosix;
-  });
-}
-
-function getOverridePatterns(entries: string[]): string[] {
-  return entries.filter(
-    (pattern) => pattern.startsWith("!") || pattern.startsWith("+") || pattern.startsWith("-"),
-  );
+  const candidates = new Set(getMatchCandidates(filePath, baseDir, false));
+  return patterns.some((pattern) => candidates.has(normalizeExactPattern(pattern)));
 }
 
 function isEnabledByOverrides(filePath: string, patterns: string[], baseDir: string): boolean {
-  const overrides = getOverridePatterns(patterns);
-  const excludes = overrides
-    .filter((pattern) => pattern.startsWith("!"))
-    .map((pattern) => pattern.slice(1));
-  const forceIncludes = overrides
-    .filter((pattern) => pattern.startsWith("+"))
-    .map((pattern) => pattern.slice(1));
-  const forceExcludes = overrides
-    .filter((pattern) => pattern.startsWith("-"))
-    .map((pattern) => pattern.slice(1));
-
-  let enabled = true;
-  if (excludes.length > 0 && matchesAnyPattern(filePath, excludes, baseDir)) {
-    enabled = false;
-  }
-  if (forceIncludes.length > 0 && matchesAnyExactPattern(filePath, forceIncludes, baseDir)) {
-    enabled = true;
-  }
-  if (forceExcludes.length > 0 && matchesAnyExactPattern(filePath, forceExcludes, baseDir)) {
-    enabled = false;
-  }
-  return enabled;
+  return applyPatterns([filePath], patterns.filter(isOverridePattern), baseDir).has(filePath);
 }
 
 /**
@@ -789,6 +522,13 @@ function applyPatterns(allPaths: string[], patterns: string[], baseDir: string):
   return new Set(result);
 }
 
+function getPackageFilter(pkg: PackageSource): ResourceManifest | undefined {
+  if (typeof pkg === "string") {
+    return undefined;
+  }
+  return RESOURCE_TYPES.some((resourceType) => pkg[resourceType] !== undefined) ? pkg : undefined;
+}
+
 export class DefaultPackageManager implements PackageManager {
   private cwd: string;
   private agentDir: string;
@@ -823,32 +563,20 @@ export class DefaultPackageManager implements PackageManager {
     const globalBaseDir = this.agentDir;
     const projectBaseDir = join(this.cwd, CONFIG_DIR_NAME);
 
+    const localScopes = [
+      { scope: "project", settings: projectSettings, baseDir: projectBaseDir },
+      { scope: "user", settings: globalSettings, baseDir: globalBaseDir },
+    ] as const;
     for (const resourceType of RESOURCE_TYPES) {
-      const target = this.getTargetMap(accumulator, resourceType);
-      const globalEntries = globalSettings[resourceType] ?? [];
-      const projectEntries = projectSettings[resourceType] ?? [];
-      this.resolveLocalEntries(
-        projectEntries,
-        resourceType,
-        target,
-        {
-          source: "local",
-          scope: "project",
-          origin: "top-level",
-        },
-        projectBaseDir,
-      );
-      this.resolveLocalEntries(
-        globalEntries,
-        resourceType,
-        target,
-        {
-          source: "local",
-          scope: "user",
-          origin: "top-level",
-        },
-        globalBaseDir,
-      );
+      for (const { scope, settings, baseDir } of localScopes) {
+        this.resolveLocalEntries(
+          settings[resourceType] ?? [],
+          resourceType,
+          accumulator[resourceType],
+          { source: "local", scope, origin: "top-level" },
+          baseDir,
+        );
+      }
     }
 
     this.addAutoDiscoveredResources(
@@ -884,79 +612,89 @@ export class DefaultPackageManager implements PackageManager {
   ): Promise<void> {
     for (const { pkg, scope } of sources) {
       const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
-      const filter = typeof pkg === "object" ? pkg : undefined;
+      const filter = getPackageFilter(pkg);
       const parsed = this.parseSource(sourceStr);
       const metadata: PathMetadata = { source: sourceStr, scope, origin: "package" };
-
-      if (parsed.type === "local") {
-        const baseDir = this.getBaseDirForScope(scope);
-        this.resolveLocalExtensionSource(parsed, accumulator, filter, metadata, baseDir);
+      const target = this.resolvePackageTarget(parsed, scope);
+      if (!target) {
         continue;
       }
-
-      const handleMissing = async (): Promise<void> => {
-        if (!onMissing) {
-          return;
-        }
-        const action = await onMissing(sourceStr);
-        if (action === "error") {
+      if (target.kind === "missing") {
+        if (onMissing && (await onMissing(sourceStr)) === "error") {
           throw new Error(`Missing source: ${sourceStr}`);
         }
-      };
-
-      if (parsed.type === "npm") {
-        const installedPath = this.getNpmInstallPath(parsed, scope);
-        const missingOrWrongVersion =
-          !existsSync(installedPath) ||
-          (parsed.pinned && !this.installedNpmMatchesPinnedVersion(parsed, installedPath));
-        if (missingOrWrongVersion) {
-          await handleMissing();
-          continue;
-        }
-        metadata.baseDir = installedPath;
-        this.collectPackageResources(installedPath, accumulator, filter, metadata);
         continue;
       }
 
-      if (parsed.type === "git") {
-        const installedPath = this.getGitInstallPath(parsed, scope);
-        if (!existsSync(installedPath)) {
-          await handleMissing();
-          continue;
-        }
-        metadata.baseDir = installedPath;
-        this.collectPackageResources(installedPath, accumulator, filter, metadata);
+      metadata.baseDir = target.baseDir;
+      if (target.kind === "file") {
+        this.addResource(
+          accumulator.extensions,
+          target.path,
+          metadata,
+          this.isExtensionEnabled(target.path, filter?.extensions, target.baseDir),
+        );
+        continue;
+      }
+
+      const hasPackageLayout = this.collectPackageResources(
+        target.path,
+        accumulator,
+        filter,
+        metadata,
+      );
+      if (parsed.type === "local" && !hasPackageLayout) {
+        this.addResource(
+          accumulator.extensions,
+          target.path,
+          metadata,
+          this.isExtensionEnabled(target.path, filter?.extensions, target.baseDir),
+        );
       }
     }
   }
 
-  private resolveLocalExtensionSource(
-    source: LocalSource,
-    accumulator: ResourceAccumulator,
-    filter: PackageFilter | undefined,
-    metadata: PathMetadata,
-    baseDir: string,
-  ): void {
-    const resolved = this.resolvePathFromBase(source.path, baseDir);
-    if (!existsSync(resolved)) {
-      return;
+  private resolvePackageTarget(
+    source: ParsedSource,
+    scope: SourceScope,
+  ): ResolvedPackageTarget | undefined {
+    if (source.type === "npm") {
+      const path = this.getNpmInstallPath(source, scope);
+      return !existsSync(path) ||
+        (source.pinned && !this.installedNpmMatchesPinnedVersion(source, path))
+        ? { kind: "missing" }
+        : { kind: "directory", path, baseDir: path };
+    }
+    if (source.type === "git") {
+      const path = this.getGitInstallPath(source, scope);
+      return existsSync(path) ? { kind: "directory", path, baseDir: path } : { kind: "missing" };
     }
 
+    const path = this.resolvePathFromBase(source.path, this.getBaseDirForScope(scope));
+    if (!existsSync(path)) {
+      return { kind: "missing" };
+    }
     try {
-      const stats = statSync(resolved);
+      const stats = statSync(path);
       if (stats.isFile()) {
-        metadata.baseDir = dirname(resolved);
-        this.addResource(accumulator.extensions, resolved, metadata, true);
-        return;
+        return { kind: "file", path, baseDir: dirname(path) };
       }
       if (stats.isDirectory()) {
-        metadata.baseDir = resolved;
-        const resources = this.collectPackageResources(resolved, accumulator, filter, metadata);
-        if (!resources) {
-          this.addResource(accumulator.extensions, resolved, metadata, true);
-        }
+        return { kind: "directory", path, baseDir: path };
       }
     } catch {}
+    return undefined;
+  }
+
+  private isExtensionEnabled(
+    path: string,
+    patterns: string[] | undefined,
+    baseDir: string,
+  ): boolean {
+    if (patterns === undefined) {
+      return true;
+    }
+    return patterns.length > 0 && applyPatterns([path], patterns, baseDir).has(path);
   }
 
   private parseSource(source: string): ParsedSource {
@@ -1018,7 +756,7 @@ export class DefaultPackageManager implements PackageManager {
    * For git packages, uses normalized host/path to ensure SSH and HTTPS URLs
    * for the same repository are treated as identical.
    */
-  private getPackageIdentity(source: string, scope?: SourceScope): string {
+  private getPackageIdentity(source: string, scope: SourceScope): string {
     const parsed = this.parseSource(source);
     if (parsed.type === "npm") {
       return `npm:${parsed.name}`;
@@ -1027,11 +765,7 @@ export class DefaultPackageManager implements PackageManager {
       // Use host/path for identity to normalize SSH and HTTPS
       return `git:${parsed.host}/${parsed.path}`;
     }
-    if (scope) {
-      const baseDir = this.getBaseDirForScope(scope);
-      return `local:${this.resolvePathFromBase(parsed.path, baseDir)}`;
-    }
-    return `local:${this.resolvePath(parsed.path)}`;
+    return `local:${this.resolvePathFromBase(parsed.path, this.getBaseDirForScope(scope))}`;
   }
 
   /**
@@ -1041,24 +775,16 @@ export class DefaultPackageManager implements PackageManager {
   private dedupePackages(
     packages: Array<{ pkg: PackageSource; scope: SourceScope }>,
   ): Array<{ pkg: PackageSource; scope: SourceScope }> {
-    const seen = new Map<string, { pkg: PackageSource; scope: SourceScope }>();
-
-    for (const entry of packages) {
+    const seen = new Set<string>();
+    return packages.filter((entry) => {
       const sourceStr = typeof entry.pkg === "string" ? entry.pkg : entry.pkg.source;
       const identity = this.getPackageIdentity(sourceStr, entry.scope);
-
-      const existing = seen.get(identity);
-      if (!existing) {
-        seen.set(identity, entry);
-      } else if (entry.scope === "project" && existing.scope === "user") {
-        // Project wins over user
-        seen.set(identity, entry);
+      if (seen.has(identity)) {
+        return false;
       }
-      // If existing is project and new is global, keep existing (project)
-      // If both are same scope, keep first one
-    }
-
-    return Array.from(seen.values());
+      seen.add(identity);
+      return true;
+    });
   }
 
   private parseNpmSpec(spec: string): { name: string; version?: string } {
@@ -1096,7 +822,7 @@ export class DefaultPackageManager implements PackageManager {
       .update(`${prefix}-${suffix ?? ""}`)
       .digest("hex")
       .slice(0, 8);
-    return join(tmpdir(), "openclaw-resources", prefix, hash, suffix ?? "");
+    return join(getAgentResourceTempDir(this.agentDir), prefix, hash, suffix ?? "");
   }
 
   private getBaseDirForScope(scope: SourceScope): string {
@@ -1107,20 +833,6 @@ export class DefaultPackageManager implements PackageManager {
       return this.agentDir;
     }
     return this.cwd;
-  }
-
-  private resolvePath(input: string): string {
-    const trimmed = input.trim();
-    if (trimmed === "~") {
-      return getHomeDir();
-    }
-    if (trimmed.startsWith("~/")) {
-      return join(getHomeDir(), trimmed.slice(2));
-    }
-    if (trimmed.startsWith("~")) {
-      return join(getHomeDir(), trimmed.slice(1));
-    }
-    return resolve(this.cwd, trimmed);
   }
 
   private resolvePathFromBase(input: string, baseDir: string): string {
@@ -1140,72 +852,32 @@ export class DefaultPackageManager implements PackageManager {
   private collectPackageResources(
     packageRoot: string,
     accumulator: ResourceAccumulator,
-    filter: PackageFilter | undefined,
+    filter: ResourceManifest | undefined,
     metadata: PathMetadata,
   ): boolean {
-    if (filter) {
-      for (const resourceType of RESOURCE_TYPES) {
-        const patterns = filter[resourceType as keyof PackageFilter];
-        const target = this.getTargetMap(accumulator, resourceType);
-        if (patterns !== undefined) {
-          this.applyPackageFilter(packageRoot, patterns, resourceType, target, metadata);
-        } else {
-          this.collectDefaultResources(packageRoot, resourceType, target, metadata);
-        }
-      }
-      return true;
-    }
-
-    const manifest = this.readResourceManifest(packageRoot);
-    if (manifest) {
-      for (const resourceType of RESOURCE_TYPES) {
-        const entries = manifest[resourceType as keyof ResourceManifest];
-        this.addManifestEntries(
-          entries,
-          packageRoot,
-          resourceType,
-          this.getTargetMap(accumulator, resourceType),
-          metadata,
-        );
-      }
-      return true;
-    }
-
-    let hasAnyDir = false;
+    const manifest = readResourceManifestFile(join(packageRoot, "package.json"));
+    const hasPackageLayout =
+      manifest !== null || RESOURCE_TYPES.some((type) => existsSync(join(packageRoot, type)));
     for (const resourceType of RESOURCE_TYPES) {
+      const patterns = filter?.[resourceType];
+      const target = accumulator[resourceType];
+      if (patterns !== undefined) {
+        this.applyPackageFilter(packageRoot, patterns, resourceType, target, metadata);
+        continue;
+      }
+      const entries = manifest?.[resourceType];
+      if (manifest !== null && (!filter || entries !== undefined)) {
+        this.addManifestEntries(entries, packageRoot, resourceType, target, metadata);
+        continue;
+      }
       const dir = join(packageRoot, resourceType);
       if (existsSync(dir)) {
-        // Collect all files from the directory (all enabled by default)
-        const files = this.collectConventionResourceFiles(packageRoot, resourceType);
-        for (const f of files) {
-          this.addResource(this.getTargetMap(accumulator, resourceType), f, metadata, true);
+        for (const path of this.collectConventionResourceFiles(packageRoot, resourceType)) {
+          this.addResource(target, path, metadata, true);
         }
-        hasAnyDir = true;
       }
     }
-    return hasAnyDir;
-  }
-
-  private collectDefaultResources(
-    packageRoot: string,
-    resourceType: ResourceType,
-    target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
-    metadata: PathMetadata,
-  ): void {
-    const manifest = this.readResourceManifest(packageRoot);
-    const entries = manifest?.[resourceType as keyof ResourceManifest];
-    if (entries) {
-      this.addManifestEntries(entries, packageRoot, resourceType, target, metadata);
-      return;
-    }
-    const dir = join(packageRoot, resourceType);
-    if (existsSync(dir)) {
-      // Collect all files from the directory (all enabled by default)
-      const files = this.collectConventionResourceFiles(packageRoot, resourceType);
-      for (const f of files) {
-        this.addResource(target, f, metadata, true);
-      }
-    }
+    return hasPackageLayout;
   }
 
   private applyPackageFilter(
@@ -1215,7 +887,7 @@ export class DefaultPackageManager implements PackageManager {
     target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
     metadata: PathMetadata,
   ): void {
-    const { allFiles } = this.collectManifestFiles(packageRoot, resourceType);
+    const allFiles = this.collectManifestFiles(packageRoot, resourceType);
 
     if (userPatterns.length === 0) {
       // Empty array explicitly disables all resources of this type
@@ -1234,29 +906,20 @@ export class DefaultPackageManager implements PackageManager {
     }
   }
 
-  /**
-   * Collect all files from a package for a resource type, applying manifest patterns.
-   * Returns { allFiles, enabledByManifest } where enabledByManifest is the set of files
-   * that pass the manifest's own patterns.
-   */
-  private collectManifestFiles(
-    packageRoot: string,
-    resourceType: ResourceType,
-  ): { allFiles: string[]; enabledByManifest: Set<string> } {
-    const manifest = this.readResourceManifest(packageRoot);
-    const entries = manifest?.[resourceType as keyof ResourceManifest];
+  private collectManifestFiles(packageRoot: string, resourceType: ResourceType): string[] {
+    const manifest = readResourceManifestFile(join(packageRoot, "package.json"));
+    const entries = manifest?.[resourceType];
     if (entries && entries.length > 0) {
       const allFiles = this.collectFilesFromManifestEntries(entries, packageRoot, resourceType);
       const manifestPatterns = entries.filter(isOverridePattern);
-      const enabledByManifest =
+      return Array.from(
         manifestPatterns.length > 0
           ? applyPatterns(allFiles, manifestPatterns, packageRoot)
-          : new Set(allFiles);
-      return { allFiles: Array.from(enabledByManifest), enabledByManifest };
+          : new Set(allFiles),
+      );
     }
 
-    const allFiles = this.collectConventionResourceFiles(packageRoot, resourceType);
-    return { allFiles, enabledByManifest: new Set(allFiles) };
+    return this.collectConventionResourceFiles(packageRoot, resourceType);
   }
 
   private collectConventionResourceFiles(
@@ -1271,21 +934,6 @@ export class DefaultPackageManager implements PackageManager {
       collectResourceFiles(conventionDir, resourceType),
       packageRoot,
     );
-  }
-
-  private readResourceManifest(packageRoot: string): ResourceManifest | null {
-    const packageJsonPath = join(packageRoot, "package.json");
-    if (!existsSync(packageJsonPath)) {
-      return null;
-    }
-
-    try {
-      const content = readFileSync(packageJsonPath, "utf-8");
-      const pkg = JSON.parse(content) as { openclaw?: ResourceManifest };
-      return pkg.openclaw ?? null;
-    } catch {
-      return null;
-    }
   }
 
   private addManifestEntries(
@@ -1321,12 +969,9 @@ export class DefaultPackageManager implements PackageManager {
         return [resolve(root, entry)];
       }
 
-      return globSync(entry, {
-        cwd: root,
-        absolute: true,
-        dot: false,
-        nodir: false,
-      }).map((match) => resolve(match));
+      // The supported Node floor has stable fs globbing; its defaults exclude
+      // hidden paths and retain directories, matching package manifests.
+      return globSync(entry, { cwd: root }).map((match) => resolve(root, match));
     });
     return this.collectFilesFromPaths(
       this.filterManifestResourcePaths(resolved, root),
@@ -1339,10 +984,10 @@ export class DefaultPackageManager implements PackageManager {
     const realRoot = resolveRealPathIfPossible(resolvedRoot);
     return paths.filter((path) => {
       const resolvedPath = resolve(path);
-      if (!isPathWithinRoot(resolvedRoot, resolvedPath)) {
+      if (!isPathInside(resolvedRoot, resolvedPath)) {
         return false;
       }
-      return isPathWithinRoot(realRoot, resolveRealPathIfPossible(resolvedPath));
+      return isPathInside(realRoot, resolveRealPathIfPossible(resolvedPath));
     });
   }
 
@@ -1378,158 +1023,73 @@ export class DefaultPackageManager implements PackageManager {
     globalBaseDir: string,
     projectBaseDir: string,
   ): void {
-    const userMetadata: PathMetadata = {
-      source: "auto",
-      scope: "user",
-      origin: "top-level",
-      baseDir: globalBaseDir,
-    };
-    const projectMetadata: PathMetadata = {
-      source: "auto",
-      scope: "project",
-      origin: "top-level",
-      baseDir: projectBaseDir,
-    };
-
-    const userOverrides = {
-      extensions: globalSettings.extensions ?? [],
-      skills: globalSettings.skills ?? [],
-      prompts: globalSettings.prompts ?? [],
-      themes: globalSettings.themes ?? [],
-    };
-    const projectOverrides = {
-      extensions: projectSettings.extensions ?? [],
-      skills: projectSettings.skills ?? [],
-      prompts: projectSettings.prompts ?? [],
-      themes: projectSettings.themes ?? [],
-    };
-
-    const userDirs = {
-      extensions: join(globalBaseDir, "extensions"),
-      skills: join(globalBaseDir, "skills"),
-      prompts: join(globalBaseDir, "prompts"),
-      themes: join(globalBaseDir, "themes"),
-    };
-    const projectDirs = {
-      extensions: join(projectBaseDir, "extensions"),
-      skills: join(projectBaseDir, "skills"),
-      prompts: join(projectBaseDir, "prompts"),
-      themes: join(projectBaseDir, "themes"),
-    };
     const userAgentsSkillsDir = join(getHomeDir(), ".agents", "skills");
     const projectAgentsSkillDirs = collectAncestorAgentsSkillDirs(this.cwd).filter(
       (dir) => resolve(dir) !== resolve(userAgentsSkillsDir),
     );
+    const addScopeResources = (options: {
+      scope: Extract<SourceScope, "project" | "user">;
+      settings: ReturnType<SettingsManager["getGlobalSettings"]>;
+      baseDir: string;
+      agentsSkillDirs: string[];
+    }): void => {
+      const metadata: PathMetadata = {
+        source: "auto",
+        scope: options.scope,
+        origin: "top-level",
+        baseDir: options.baseDir,
+      };
+      const addResources = (
+        resourceType: ResourceType,
+        paths: string[],
+        resourceMetadata = metadata,
+        patternBaseDir = options.baseDir,
+      ): void => {
+        for (const path of paths) {
+          this.addResource(
+            accumulator[resourceType],
+            path,
+            resourceMetadata,
+            isEnabledByOverrides(path, options.settings[resourceType] ?? [], patternBaseDir),
+          );
+        }
+      };
 
-    const addResources = (
-      resourceType: ResourceType,
-      paths: string[],
-      metadata: PathMetadata,
-      overrides: string[],
-      baseDir: string,
-    ) => {
-      const target = this.getTargetMap(accumulator, resourceType);
-      for (const path of paths) {
-        const enabled = isEnabledByOverrides(path, overrides, baseDir);
-        this.addResource(target, path, metadata, enabled);
+      for (const resourceType of RESOURCE_TYPES) {
+        addResources(
+          resourceType,
+          AUTO_RESOURCE_COLLECTORS[resourceType](join(options.baseDir, resourceType)),
+        );
+        if (resourceType !== "skills") {
+          continue;
+        }
+        // .agents roots use different traversal and pattern bases; flattening them
+        // into the ordinary skill directory would weaken containment and overrides.
+        for (const skillsDir of options.agentsSkillDirs) {
+          const agentsBaseDir = dirname(skillsDir);
+          addResources(
+            "skills",
+            collectSkillEntries(skillsDir, "agents"),
+            { ...metadata, baseDir: agentsBaseDir },
+            agentsBaseDir,
+          );
+        }
       }
     };
 
-    // Project extensions from the embedded agent project directory.
-    addResources(
-      "extensions",
-      collectAutoExtensionEntries(projectDirs.extensions),
-      projectMetadata,
-      projectOverrides.extensions,
-      projectBaseDir,
-    );
-
-    // Project skills from the embedded agent project directory.
-    addResources(
-      "skills",
-      collectAutoSkillEntries(projectDirs.skills, "openclaw"),
-      projectMetadata,
-      projectOverrides.skills,
-      projectBaseDir,
-    );
-
-    // Project skills from .agents/ (each with its own baseDir)
-    for (const agentsSkillsDir of projectAgentsSkillDirs) {
-      const agentsBaseDir = dirname(agentsSkillsDir); // the .agents directory
-      const agentsMetadata: PathMetadata = {
-        ...projectMetadata,
-        baseDir: agentsBaseDir,
-      };
-      addResources(
-        "skills",
-        collectAutoSkillEntries(agentsSkillsDir, "agents"),
-        agentsMetadata,
-        projectOverrides.skills,
-        agentsBaseDir,
-      );
-    }
-
-    addResources(
-      "prompts",
-      collectAutoPromptEntries(projectDirs.prompts),
-      projectMetadata,
-      projectOverrides.prompts,
-      projectBaseDir,
-    );
-    addResources(
-      "themes",
-      collectAutoThemeEntries(projectDirs.themes),
-      projectMetadata,
-      projectOverrides.themes,
-      projectBaseDir,
-    );
-
-    // User extensions from ~/.openclaw/agent/
-    addResources(
-      "extensions",
-      collectAutoExtensionEntries(userDirs.extensions),
-      userMetadata,
-      userOverrides.extensions,
-      globalBaseDir,
-    );
-
-    // User skills from ~/.openclaw/agent/
-    addResources(
-      "skills",
-      collectAutoSkillEntries(userDirs.skills, "openclaw"),
-      userMetadata,
-      userOverrides.skills,
-      globalBaseDir,
-    );
-
-    // User skills from ~/.agents/ (with its own baseDir)
-    const userAgentsBaseDir = dirname(userAgentsSkillsDir);
-    const userAgentsMetadata: PathMetadata = {
-      ...userMetadata,
-      baseDir: userAgentsBaseDir,
-    };
-    addResources(
-      "skills",
-      collectAutoSkillEntries(userAgentsSkillsDir, "agents"),
-      userAgentsMetadata,
-      userOverrides.skills,
-      userAgentsBaseDir,
-    );
-
-    addResources(
-      "prompts",
-      collectAutoPromptEntries(userDirs.prompts),
-      userMetadata,
-      userOverrides.prompts,
-      globalBaseDir,
-    );
-    addResources(
-      "themes",
-      collectAutoThemeEntries(userDirs.themes),
-      userMetadata,
-      userOverrides.themes,
-      globalBaseDir,
-    );
+    addScopeResources({
+      scope: "project",
+      settings: projectSettings,
+      baseDir: projectBaseDir,
+      agentsSkillDirs: projectAgentsSkillDirs,
+    });
+    addScopeResources({
+      scope: "user",
+      settings: globalSettings,
+      baseDir: globalBaseDir,
+      // Home-scoped personal skills belong only to the default install.
+      agentsSkillDirs: isDefaultStateDir() ? [userAgentsSkillsDir] : [],
+    });
   }
 
   private collectFilesFromPaths(paths: string[], resourceType: ResourceType): string[] {
@@ -1551,24 +1111,6 @@ export class DefaultPackageManager implements PackageManager {
       }
     }
     return files;
-  }
-
-  private getTargetMap(
-    accumulator: ResourceAccumulator,
-    resourceType: ResourceType,
-  ): Map<string, { metadata: PathMetadata; enabled: boolean }> {
-    switch (resourceType) {
-      case "extensions":
-        return accumulator.extensions;
-      case "skills":
-        return accumulator.skills;
-      case "prompts":
-        return accumulator.prompts;
-      case "themes":
-        return accumulator.themes;
-      default:
-        throw new Error(`Unknown resource type: ${String(resourceType)}`);
-    }
   }
 
   private addResource(
@@ -1626,3 +1168,4 @@ export class DefaultPackageManager implements PackageManager {
     };
   }
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

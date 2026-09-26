@@ -22,31 +22,10 @@
  * @module @openclaw/oc-path/emit
  */
 
-import type { FrontmatterEntry, MdAst } from "./ast.js";
+import type { MdAst } from "./ast.js";
+import { emitWithMode, type EmitOptions } from "./emit-mode.js";
+import { formatFrontmatterValue } from "./frontmatter-format.js";
 import { guardSentinel } from "./sentinel.js";
-
-/**
- * Emit options. `mode: 'roundtrip'` (default) returns `ast.raw` if
- * present and not flagged as dirty; `mode: 'render'` always
- * re-renders.
- */
-export interface EmitOptions {
-  readonly mode?: "roundtrip" | "render";
-  /**
-   * When provided, the emitter walks every emitted leaf string through
-   * `guardSentinel(value, ocPath)`. Default uses the file name
-   * (`oc://<file>`) when the field-precise path can't be determined.
-   * Callers that want richer error context can supply `ocPathFor` to
-   * compute a path per leaf.
-   */
-  readonly fileNameForGuard?: string;
-  /**
-   * See `JsoncEmitOptions.acceptPreExistingSentinel` for the rationale.
-   * Default `true` — round-trip echoes parsed bytes without scanning
-   * for the sentinel. Render mode scans every leaf regardless.
-   */
-  readonly acceptPreExistingSentinel?: boolean;
-}
 
 /**
  * Emit the AST. In render mode, throws `OcEmitSentinelError` if any
@@ -55,88 +34,51 @@ export interface EmitOptions {
  * `acceptPreExistingSentinel: false`).
  */
 export function emitMd(ast: MdAst, opts: EmitOptions = {}): string {
-  const mode = opts.mode ?? "roundtrip";
-  const guardPath = opts.fileNameForGuard ? `oc://${opts.fileNameForGuard}` : "oc://";
-  const acceptPreExisting = opts.acceptPreExistingSentinel ?? true;
-
-  if (mode === "roundtrip") {
-    // Round-trip trusts parsed bytes — see emit-policy comment in
-    // jsonc/emit.ts. A markdown file legitimately containing the
-    // sentinel literal (in a code block, in a pasted error log) would
-    // otherwise become a workspace-wide emit DoS.
-    if (!acceptPreExisting && ast.raw.includes("__OPENCLAW_REDACTED__")) {
-      guardSentinel("__OPENCLAW_REDACTED__", `${guardPath}/[raw]`);
+  return emitWithMode(ast, opts, (guardPath) => {
+    for (const fm of ast.frontmatter) {
+      guardSentinel(fm.value, `${guardPath}/[frontmatter]/${fm.key}`);
     }
-    return ast.raw;
-  }
+    if (ast.preamble.length > 0) {
+      guardSentinel(ast.preamble, `${guardPath}/[preamble]`);
+    }
+    for (const block of ast.blocks) {
+      if (block.bodyText.length > 0) {
+        guardSentinel(block.bodyText, `${guardPath}/${block.slug}/[body]`);
+        for (const item of block.items) {
+          if (item.kv) {
+            guardSentinel(item.kv.value, `${guardPath}/${block.slug}/${item.slug}/${item.kv.key}`);
+          }
+        }
+      }
+    }
+    return rebuildMdRaw(ast).raw;
+  });
+}
 
-  // Render mode: rebuild from structural fields. This loses
-  // formatting details (extra blank lines, custom whitespace, etc.)
-  // but is correct.
+// Editing guards new values separately, preserving unrelated pre-existing sentinel text.
+export function rebuildMdRaw(ast: MdAst): MdAst {
   const parts: string[] = [];
-
   if (ast.frontmatter.length > 0) {
     parts.push("---");
     for (const fm of ast.frontmatter) {
-      guardSentinel(fm.value, `${guardPath}/[frontmatter]/${fm.key}`);
       parts.push(`${fm.key}: ${formatFrontmatterValue(fm.value)}`);
     }
     parts.push("---");
   }
-
   if (ast.preamble.length > 0) {
-    guardSentinel(ast.preamble, `${guardPath}/[preamble]`);
     if (parts.length > 0) {
       parts.push("");
     }
     parts.push(ast.preamble);
   }
-
   for (const block of ast.blocks) {
     if (parts.length > 0) {
       parts.push("");
     }
     parts.push(`## ${block.heading}`);
     if (block.bodyText.length > 0) {
-      // Walk items + frontmatter-key value strings for sentinels;
-      // body text is also walked as one big string in case of any raw
-      // sentinel.
-      guardSentinel(block.bodyText, `${guardPath}/${block.slug}/[body]`);
-      for (const item of block.items) {
-        if (item.kv) {
-          guardSentinel(item.kv.value, `${guardPath}/${block.slug}/${item.slug}/${item.kv.key}`);
-        }
-      }
       parts.push(block.bodyText);
     }
   }
-
-  return parts.join("\n");
+  return { ...ast, raw: parts.join("\n") };
 }
-
-function formatFrontmatterValue(value: string): string {
-  // Frontmatter is yaml-ish; quote values with structural chars.
-  if (value.length === 0) {
-    return '""';
-  }
-  if (/[:#&*?|<>=!%@`,[\]{}\r\n]/.test(value)) {
-    return JSON.stringify(value);
-  }
-  return value;
-}
-
-/**
- * Mark an AST as "dirty" — useful for callers that mutate the AST
- * structurally and want emitMd() to re-render rather than round-trip.
- *
- * Currently a no-op flag — emitMd() decides based on `opts.mode`. Kept
- * as an extension point for a future invariant where the AST tracks
- * its own dirty state.
- */
-export function markDirty(_ast: MdAst): void {
-  // intentionally empty
-}
-
-// Re-export the frontmatter type for convenience so tests don't need
-// to import from ast.ts.
-export type { FrontmatterEntry };

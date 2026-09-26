@@ -1,5 +1,7 @@
 // Tool image tests cover image payload sanitization before tool outputs are
 // returned to model-visible content blocks.
+
+import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it } from "vitest";
 import {
   createNoisyPngBuffer,
@@ -7,7 +9,11 @@ import {
   createTinyJpegBuffer,
 } from "../../test/helpers/image-fixtures.js";
 import { getImageMetadata } from "../media/image-ops.js";
-import { sanitizeContentBlocksImages, sanitizeImageBlocks } from "./tool-images.js";
+import {
+  sanitizeContentBlocksImages,
+  sanitizeImageBlocks,
+  sanitizeToolResultImages,
+} from "./tool-images.js";
 
 describe("tool image sanitizing", () => {
   const getImageBlock = (
@@ -57,7 +63,9 @@ describe("tool image sanitizing", () => {
     });
     expect(dropped).toBe(0);
     expect(out.length).toBe(1);
-    const meta = await getImageMetadata(Buffer.from(out[0].data, "base64"));
+    const meta = await getImageMetadata(
+      Buffer.from(expectDefined(out[0], "out[0] test invariant").data, "base64"),
+    );
     expect(meta?.width).toBeLessThanOrEqual(120);
     expect(meta?.height).toBeLessThanOrEqual(120);
   }, 20_000);
@@ -115,6 +123,39 @@ describe("tool image sanitizing", () => {
     const image = getImageBlock(out);
     expect(image.mimeType).toBe("image/jpeg");
     expect(image.data).toBe(jpeg.toString("base64"));
+  });
+
+  it("screenshot-shaped tool result round-trips with valid image block", async () => {
+    const png = createSolidPngBuffer(100, 100, { r: 0, g: 128, b: 0 });
+    const base64 = png.toString("base64");
+
+    const result = {
+      content: [{ type: "image" as const, data: base64, mimeType: "image/png" }],
+      details: { path: "/tmp/screenshot.png" },
+    };
+    const sanitized = await sanitizeToolResultImages(result, "browser:screenshot");
+    const imageBlock = sanitized.content.find((b) => b.type === "image");
+    expect(imageBlock).toMatchObject({ type: "image", data: base64, mimeType: "image/png" });
+  });
+
+  it("screenshot-shaped tool result with malformed image produces text fallback", async () => {
+    const result = {
+      content: [
+        {
+          type: "image" as const,
+          data: undefined as unknown as string,
+          mimeType: undefined as unknown as string,
+        },
+      ],
+      details: {},
+    };
+    const sanitized = await sanitizeToolResultImages(result, "browser:screenshot");
+    const imageBlocks = sanitized.content.filter((b) => b.type === "image");
+    expect(imageBlocks).toHaveLength(0);
+    const textFallback = sanitized.content.find(
+      (b) => b.type === "text" && (b as { text: string }).text.includes("missing data or mimeType"),
+    );
+    expect(textFallback).toBeDefined();
   });
 
   it("drops malformed image base64 payloads", async () => {

@@ -1,4 +1,3 @@
-// Discord plugin module implements components.message behavior.
 import {
   ButtonStyle,
   ComponentType,
@@ -68,7 +67,10 @@ export abstract class AnySelectMenu extends BaseMessageInteractiveComponent {
   maxValues?: number;
   disabled = false;
   required?: boolean;
-  abstract serializeOptions(): Record<string, unknown>;
+  defaultValues?: unknown[];
+  serializeOptions(): Record<string, unknown> {
+    return { type: this.type, default_values: this.defaultValues };
+  }
   serialize() {
     return clean({
       ...this.serializeOptions(),
@@ -85,40 +87,27 @@ export abstract class AnySelectMenu extends BaseMessageInteractiveComponent {
 export abstract class StringSelectMenu extends AnySelectMenu {
   readonly type = ComponentType.StringSelect;
   abstract options: APIStringSelectComponent["options"];
-  serializeOptions() {
+  override serializeOptions() {
     return { type: this.type, options: this.options };
   }
 }
 
 export abstract class UserSelectMenu extends AnySelectMenu {
   readonly type = ComponentType.UserSelect;
-  defaultValues?: unknown[];
-  serializeOptions() {
-    return { type: this.type, default_values: this.defaultValues };
-  }
 }
 
 export abstract class RoleSelectMenu extends AnySelectMenu {
   readonly type = ComponentType.RoleSelect;
-  defaultValues?: unknown[];
-  serializeOptions() {
-    return { type: this.type, default_values: this.defaultValues };
-  }
 }
 
 export abstract class MentionableSelectMenu extends AnySelectMenu {
   readonly type = ComponentType.MentionableSelect;
-  defaultValues?: unknown[];
-  serializeOptions() {
-    return { type: this.type, default_values: this.defaultValues };
-  }
 }
 
 export abstract class ChannelSelectMenu extends AnySelectMenu {
   readonly type = ComponentType.ChannelSelect;
   channelTypes?: APIChannelSelectComponent["channel_types"];
-  defaultValues?: unknown[];
-  serializeOptions() {
+  override serializeOptions() {
     return {
       type: this.type,
       default_values: this.defaultValues,
@@ -137,12 +126,6 @@ export class Row<T extends BaseMessageInteractiveComponent> extends BaseComponen
   }
   addComponent(component: T): void {
     this.components.push(component);
-  }
-  removeComponent(component: T): void {
-    this.components = this.components.filter((entry) => entry !== component);
-  }
-  removeAllComponents(): void {
-    this.components = [];
   }
   serialize(): APIActionRowComponent<APIComponentInMessageActionRow> {
     return {

@@ -1,4 +1,3 @@
-// Mattermost plugin module implements model picker behavior.
 import { createHash } from "node:crypto";
 import {
   resolveStoredModelOverride,
@@ -7,10 +6,12 @@ import {
 import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
 import { parseStrictInteger } from "openclaw/plugin-sdk/number-runtime";
 import { normalizeProviderId } from "openclaw/plugin-sdk/provider-model-shared";
-import { loadSessionStore, resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
+import { getSessionEntry, resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
 import {
+  asFiniteNumber,
   normalizeOptionalString,
   normalizeStringifiedOptionalString,
+  readStringField,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { MattermostInteractiveButtonInput } from "./interactions.js";
 
@@ -45,29 +46,17 @@ function splitModelRef(modelRef?: string | null): { provider: string; model: str
   if (!match) {
     return null;
   }
-  const provider = normalizeProviderId(match[1]);
+  const rawProvider = match[1];
+  if (!rawProvider) {
+    return null;
+  }
+  const provider = normalizeProviderId(rawProvider);
   // Mattermost copy should normalize accidental whitespace around the model.
   const model = normalizeOptionalString(match[2]);
   if (!provider || !model) {
     return null;
   }
   return { provider, model };
-}
-
-function readContextString(context: Record<string, unknown>, key: string, fallback = ""): string {
-  const value = context[key];
-  return typeof value === "string" ? value : fallback;
-}
-
-function readContextNumber(context: Record<string, unknown>, key: string): number | undefined {
-  const value = context[key];
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
-  }
-  if (typeof value === "string") {
-    return parseStrictInteger(value);
-  }
-  return undefined;
 }
 
 function normalizePage(value: number | undefined): number {
@@ -89,18 +78,6 @@ function paginateItems<T>(items: T[], page?: number, pageSize = MODELS_PAGE_SIZE
     hasNext: safePage < totalPages,
     totalItems: items.length,
   };
-}
-
-function buildContext(state: MattermostModelPickerState): Record<string, unknown> {
-  return {
-    [MATTERMOST_MODEL_PICKER_CONTEXT_KEY]: true,
-    ...state,
-  };
-}
-
-function buildButtonId(state: MattermostModelPickerState): string {
-  const digest = createHash("sha256").update(JSON.stringify(state)).digest("hex").slice(0, 12);
-  return `${ACTION_IDS[state.action]}${digest}`;
 }
 
 function buildButton(params: {
@@ -133,12 +110,13 @@ function buildButton(params: {
             model: normalizeStringifiedOptionalString(params.model) ?? "",
           };
 
+  const digest = createHash("sha256").update(JSON.stringify(baseState)).digest("hex").slice(0, 12);
   return {
     // Mattermost requires action IDs to be unique within a post.
-    id: buildButtonId(baseState),
+    id: `${ACTION_IDS[baseState.action]}${digest}`,
     text: params.text,
     ...(params.style ? { style: params.style } : {}),
-    context: buildContext(baseState),
+    context: { [MATTERMOST_MODEL_PICKER_CONTEXT_KEY]: true, ...baseState },
   };
 }
 
@@ -181,8 +159,8 @@ export function parseMattermostModelPickerContext(
     return null;
   }
 
-  const ownerUserId = normalizeOptionalString(readContextString(context, "ownerUserId")) ?? "";
-  const action = normalizeOptionalString(readContextString(context, "action")) ?? "";
+  const ownerUserId = normalizeOptionalString(context.ownerUserId) ?? "";
+  const action = normalizeOptionalString(context.action) ?? "";
   if (!ownerUserId) {
     return null;
   }
@@ -191,8 +169,8 @@ export function parseMattermostModelPickerContext(
     return { action, ownerUserId };
   }
 
-  const provider = normalizeProviderId(readContextString(context, "provider"));
-  const page = readContextNumber(context, "page");
+  const provider = normalizeProviderId(readStringField(context, "provider") ?? "");
+  const page = asFiniteNumber(context.page) ?? parseStrictInteger(context.page);
   if (!provider) {
     return null;
   }
@@ -207,7 +185,7 @@ export function parseMattermostModelPickerContext(
   }
 
   if (action === "select") {
-    const model = normalizeOptionalString(readContextString(context, "model")) ?? "";
+    const model = normalizeOptionalString(context.model) ?? "";
     if (!model) {
       return null;
     }
@@ -237,21 +215,28 @@ export function resolveMattermostModelPickerCurrentModel(params: {
   cfg: OpenClawConfig;
   route: { agentId: string; sessionKey: string };
   data: ModelsProviderData;
-  skipCache?: boolean;
+  readConsistency?: "latest";
 }): string {
   const fallback = `${params.data.resolvedDefault.provider}/${params.data.resolvedDefault.model}`;
   try {
     const storePath = resolveStorePath(params.cfg.session?.store, {
       agentId: params.route.agentId,
     });
-    const sessionStore = params.skipCache
-      ? loadSessionStore(storePath, { skipCache: true })
-      : loadSessionStore(storePath);
-    const sessionEntry = sessionStore[params.route.sessionKey];
+    const sessionEntry = getSessionEntry({
+      storePath,
+      sessionKey: params.route.sessionKey,
+      ...(params.readConsistency === "latest" ? { readConsistency: "latest" as const } : {}),
+    });
     const override = resolveStoredModelOverride({
       sessionEntry,
-      sessionStore,
+      loadSessionEntry: (sessionKey) =>
+        getSessionEntry({
+          storePath,
+          sessionKey,
+          ...(params.readConsistency === "latest" ? { readConsistency: "latest" as const } : {}),
+        }),
       sessionKey: params.route.sessionKey,
+      parentSessionKey: sessionEntry?.parentSessionKey,
       defaultProvider: params.data.resolvedDefault.provider,
     });
     if (!override?.model) {

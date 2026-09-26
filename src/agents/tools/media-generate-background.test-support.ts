@@ -5,6 +5,7 @@ import { expect, vi } from "vitest";
 type MockWithReset = {
   mockReset(): void;
   mockResolvedValue?(value: unknown): void;
+  mockReturnValue?(value: unknown): void;
 };
 
 export const taskExecutorMocks = {
@@ -16,6 +17,7 @@ export const taskExecutorMocks = {
 
 export const announceDeliveryMocks = {
   deliverSubagentAnnouncement: vi.fn(),
+  loadRequesterSessionEntry: vi.fn(() => ({ entry: undefined })),
 };
 
 export const taskDeliveryRuntimeMocks = {
@@ -35,6 +37,7 @@ type TaskDeliveryBackgroundMocks = {
 
 type AnnouncementBackgroundMocks = {
   deliverSubagentAnnouncement: MockWithReset;
+  loadRequesterSessionEntry: MockWithReset;
 };
 
 type MediaBackgroundResetMocks = {
@@ -56,15 +59,6 @@ type ProgressExpectation = {
   progressSummary: string;
 };
 
-type DirectSendExpectation = {
-  sendMessageMock: unknown;
-  channel: string;
-  to: string;
-  threadId: string;
-  content: string;
-  mediaUrls: string[];
-};
-
 type FallbackAnnouncementExpectation = {
   deliverAnnouncementMock: unknown;
   requesterSessionKey: string;
@@ -77,7 +71,6 @@ type FallbackAnnouncementExpectation = {
 };
 
 type CompletionFixtureParams = {
-  directSend?: boolean;
   mediaUrls?: string[];
   result: string;
   runId: string;
@@ -104,16 +97,12 @@ function requireRecordArray(value: unknown, label: string): Record<string, unkno
 }
 
 export function createMediaCompletionFixture({
-  directSend,
   mediaUrls,
   result,
   runId,
   taskLabel,
 }: CompletionFixtureParams) {
   return {
-    ...(directSend
-      ? { config: { tools: { media: { asyncCompletion: { directSend: true } } } } }
-      : {}),
     handle: {
       taskId: "task-123",
       runId,
@@ -150,6 +139,8 @@ export function resetMediaBackgroundMocks({
     result: { messageId: "msg-1" },
   });
   announceDeliveryMocksLocal.deliverSubagentAnnouncement.mockReset();
+  announceDeliveryMocksLocal.loadRequesterSessionEntry.mockReset();
+  announceDeliveryMocksLocal.loadRequesterSessionEntry.mockReturnValue?.({ entry: undefined });
 }
 
 export function expectQueuedTaskRun({
@@ -180,22 +171,6 @@ export function expectRecordedTaskProgress({
   expect(params.progressSummary).toBe(progressSummary);
 }
 
-export function expectDirectMediaSend({
-  sendMessageMock,
-  channel,
-  to,
-  threadId,
-  content,
-  mediaUrls,
-}: DirectSendExpectation): void {
-  const params = requireMockFirstParam(sendMessageMock, "sendMessage params");
-  expect(params.channel).toBe(channel);
-  expect(params.to).toBe(to);
-  expect(params.threadId).toBe(threadId);
-  expect(params.content).toBe(content);
-  expect(params.mediaUrls).toEqual(mediaUrls);
-}
-
 export function expectFallbackMediaAnnouncement({
   deliverAnnouncementMock,
   requesterSessionKey,
@@ -214,9 +189,12 @@ export function expectFallbackMediaAnnouncement({
     "deliverSubagentAnnouncement params",
   );
   expect(params.requesterSessionKey).toBe(requesterSessionKey);
-  const requesterOrigin = requireRecord(params.requesterOrigin, "requesterOrigin");
-  expect(requesterOrigin.channel).toBe(channel);
-  expect(requesterOrigin.to).toBe(to);
+  const requesterSessionOrigin = requireRecord(
+    params.requesterSessionOrigin,
+    "requesterSessionOrigin",
+  );
+  expect(requesterSessionOrigin.channel).toBe(channel);
+  expect(requesterSessionOrigin.to).toBe(to);
   expect(params.expectsCompletionMessage).toBe(true);
 
   const event = requireRecordArray(params.internalEvents, "internalEvents").find(

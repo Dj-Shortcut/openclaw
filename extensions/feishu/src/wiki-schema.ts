@@ -1,5 +1,6 @@
 // Feishu helper module supports wiki schema behavior.
-import { Type, type Static } from "typebox";
+import { optionalPositiveIntegerSchema } from "openclaw/plugin-sdk/channel-actions";
+import { Type } from "typebox";
 
 const WIKI_SPACE_ID_DESCRIPTION =
   "Knowledge space ID. Treat as an opaque string and keep it quoted; never pass numeric-looking IDs as numbers.";
@@ -7,6 +8,11 @@ const WIKI_SPACE_ID_DESCRIPTION =
 export const FeishuWikiSchema = Type.Union([
   Type.Object({
     action: Type.Literal("spaces"),
+    page_size: optionalPositiveIntegerSchema({
+      maximum: 50,
+      description: "Page size (1-50, default 50)",
+    }),
+    page_token: Type.Optional(Type.String({ description: "Pagination token" })),
   }),
   Type.Object({
     action: Type.Literal("nodes"),
@@ -14,6 +20,11 @@ export const FeishuWikiSchema = Type.Union([
     parent_node_token: Type.Optional(
       Type.String({ description: "Parent node token (optional, omit for root)" }),
     ),
+    page_size: optionalPositiveIntegerSchema({
+      maximum: 50,
+      description: "Page size (1-50, default 50)",
+    }),
+    page_token: Type.Optional(Type.String({ description: "Pagination token" })),
   }),
   Type.Object({
     action: Type.Literal("get"),
@@ -66,5 +77,3 @@ export const FeishuWikiSchema = Type.Union([
     title: Type.String({ description: "New title" }),
   }),
 ]);
-
-export type FeishuWikiParams = Static<typeof FeishuWikiSchema>;

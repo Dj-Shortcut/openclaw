@@ -4,24 +4,35 @@
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { WebSocket } from "ws";
+import { acquireTestPortBlock } from "../test-utils/port-claims.js";
 import {
   BACKEND_GATEWAY_CLIENT,
   connectReq,
   CONTROL_UI_CLIENT,
   ConnectErrorDetailCodes,
   createSignedDevice,
-  getFreePort,
+  GATEWAY_CLIENT_MODES,
+  GATEWAY_CLIENT_NAMES,
   readConnectChallengeNonce,
   openWs,
   originForPort,
   rpcReq,
   restoreGatewayToken,
-  startGatewayServer,
+  startTestGatewayServer,
   testState,
+  testTailscaleWhois,
   installGatewayTestHooks,
-} from "./server.auth.shared.js";
+} from "./server.auth.test-helpers.js";
 
 installGatewayTestHooks({ scope: "suite" });
+
+const CLI_CLIENT = {
+  id: GATEWAY_CLIENT_NAMES.CLI,
+  version: "1.0.0",
+  platform: "test",
+  mode: GATEWAY_CLIENT_MODES.CLI,
+};
 
 function expectAuthErrorDetails(params: {
   details: unknown;
@@ -45,6 +56,36 @@ function expectAuthErrorDetails(params: {
   }
 }
 
+async function expectProxyUpgradeRejected(port: number, headers: Record<string, string>) {
+  await new Promise<void>((resolve, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}`, { headers });
+    const timer = setTimeout(() => {
+      ws.terminate();
+      reject(new Error("timed out waiting for proxy upgrade rejection"));
+    }, 5_000);
+    ws.once("open", () => {
+      clearTimeout(timer);
+      ws.terminate();
+      reject(new Error("expected proxy-shaped upgrade to be rejected"));
+    });
+    ws.once("unexpected-response", (_request, response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk: string) => {
+        body += chunk;
+      });
+      response.on("end", () => {
+        clearTimeout(timer);
+        expect(response.statusCode).toBe(403);
+        expect(body).toContain("proxy_attribution_required");
+        expect(body).toContain("gateway.trustedProxies");
+        resolve();
+      });
+    });
+    ws.once("error", () => {});
+  });
+}
+
 async function expectSharedOperatorScopesCleared(
   port: number,
   auth: { token?: string; password?: string },
@@ -66,15 +107,16 @@ async function expectSharedOperatorScopesCleared(
   }
 }
 
-async function expectLocalBackendGatewayClientScopesPreserved(
+async function expectLocalSharedAuthScopesPreserved(
   port: number,
   auth: { token?: string; password?: string; skipDefaultAuth?: boolean },
+  client: typeof BACKEND_GATEWAY_CLIENT | typeof CLI_CLIENT,
 ) {
   const ws = await openWs(port);
   try {
     const res = await connectReq(ws, {
       ...auth,
-      client: { ...BACKEND_GATEWAY_CLIENT },
+      client: { ...client },
       scopes: ["operator.admin"],
       device: null,
     });
@@ -98,21 +140,22 @@ async function expectLocalBackendGatewayClientScopesPreserved(
 
 describe("gateway auth compatibility baseline", () => {
   describe("token mode", () => {
-    let server: Awaited<ReturnType<typeof startGatewayServer>>;
+    let server: Awaited<ReturnType<typeof startTestGatewayServer>>;
     let port = 0;
-    let prevToken: string | undefined;
+    let previousCredential: string | undefined;
 
     beforeAll(async () => {
-      prevToken = process.env.OPENCLAW_GATEWAY_TOKEN;
+      previousCredential = process.env.OPENCLAW_GATEWAY_TOKEN;
       testState.gatewayAuth = { mode: "token", token: "secret" };
       process.env.OPENCLAW_GATEWAY_TOKEN = "secret";
-      port = await getFreePort();
-      server = await startGatewayServer(port);
+      const portClaim = await acquireTestPortBlock({ offsets: [0, 1, 2, 3, 4] });
+      port = portClaim.port;
+      server = await startTestGatewayServer(portClaim);
     });
 
     afterAll(async () => {
       await server.close();
-      restoreGatewayToken(prevToken);
+      restoreGatewayToken(previousCredential);
     });
 
     test("keeps valid shared-token connect behavior unchanged", async () => {
@@ -130,7 +173,11 @@ describe("gateway auth compatibility baseline", () => {
     });
 
     test("preserves scopes for direct-local backend shared-token connects without device identity", async () => {
-      await expectLocalBackendGatewayClientScopesPreserved(port, { token: "secret" });
+      await expectLocalSharedAuthScopesPreserved(port, { token: "secret" }, BACKEND_GATEWAY_CLIENT);
+    });
+
+    test("preserves scopes for direct-local CLI shared-token connects without device identity", async () => {
+      await expectLocalSharedAuthScopesPreserved(port, { token: "secret" }, CLI_CLIENT);
     });
 
     test("returns stable token-missing details for control ui without token", async () => {
@@ -193,14 +240,15 @@ describe("gateway auth compatibility baseline", () => {
     test("keeps local backend device-token reconnects out of pairing", async () => {
       const identityPath = path.join(
         os.tmpdir(),
-        `openclaw-backend-device-${process.pid}-${port}.json`,
+        `openclaw-backend-device-${process.pid}-${port}.sqlite`,
       );
       const { loadOrCreateDeviceIdentity, publicKeyRawBase64UrlFromPem } =
         await import("../infra/device-identity.js");
-      const { approveDevicePairing, requestDevicePairing, rotateDeviceToken } =
-        await import("../infra/device-pairing.js");
+      const { approveDevicePairing } = await import("../infra/device-pairing-approval.js");
+      const { rotateDeviceToken } = await import("../infra/device-pairing-tokens.js");
+      const { requestDevicePairing } = await import("../infra/device-pairing.js");
 
-      const identity = loadOrCreateDeviceIdentity(identityPath);
+      const identity = loadOrCreateDeviceIdentity({ path: identityPath });
       const pending = await requestDevicePairing({
         deviceId: identity.deviceId,
         publicKey: publicKeyRawBase64UrlFromPem(identity.publicKeyPem),
@@ -255,8 +303,56 @@ describe("gateway auth compatibility baseline", () => {
     });
   });
 
+  describe("unattributable proxy ingress", () => {
+    let server: Awaited<ReturnType<typeof startTestGatewayServer>>;
+    let port = 0;
+    let prevToken: string | undefined;
+
+    beforeAll(async () => {
+      prevToken = process.env.OPENCLAW_GATEWAY_TOKEN;
+      testState.gatewayAuth = {
+        mode: "token",
+        token: "secret",
+        rateLimit: { maxAttempts: 1, windowMs: 60_000, lockoutMs: 60_000 },
+      };
+      process.env.OPENCLAW_GATEWAY_TOKEN = "secret";
+      const portClaim = await acquireTestPortBlock({ offsets: [0, 1, 2, 3, 4] });
+      port = portClaim.port;
+      server = await startTestGatewayServer(portClaim);
+    });
+
+    afterAll(async () => {
+      await server.close();
+      restoreGatewayToken(prevToken);
+    });
+
+    test("rejects before credentials can bypass attribution", async () => {
+      testTailscaleWhois.value = { login: "spoofed@example.com", name: "Spoofed" };
+      const headers = {
+        "x-forwarded-for": "203.0.113.10",
+        "x-forwarded-proto": "https",
+        "x-forwarded-host": "gateway.example.com",
+        "tailscale-user-login": "spoofed@example.com",
+      };
+      await expectProxyUpgradeRejected(port, headers);
+    });
+
+    test("rejects browser-origin upgrades before browser auth fallback", async () => {
+      await expectProxyUpgradeRejected(port, {
+        origin: "https://control.example.com",
+        "x-forwarded-for": "203.0.113.10",
+      });
+    });
+
+    test("keeps headerless loopback transport indistinguishable from direct local", async () => {
+      const ws = await openWs(port);
+      expect(ws.readyState).toBe(WebSocket.OPEN);
+      ws.close();
+    });
+  });
+
   describe("password mode", () => {
-    let server: Awaited<ReturnType<typeof startGatewayServer>>;
+    let server: Awaited<ReturnType<typeof startTestGatewayServer>>;
     let port = 0;
     let prevToken: string | undefined;
 
@@ -264,8 +360,9 @@ describe("gateway auth compatibility baseline", () => {
       prevToken = process.env.OPENCLAW_GATEWAY_TOKEN;
       testState.gatewayAuth = { mode: "password", password: "secret" };
       delete process.env.OPENCLAW_GATEWAY_TOKEN;
-      port = await getFreePort();
-      server = await startGatewayServer(port);
+      const portClaim = await acquireTestPortBlock({ offsets: [0, 1, 2, 3, 4] });
+      port = portClaim.port;
+      server = await startTestGatewayServer(portClaim);
     });
 
     afterAll(async () => {
@@ -304,12 +401,20 @@ describe("gateway auth compatibility baseline", () => {
     });
 
     test("preserves scopes for direct-local backend shared-password connects without device identity", async () => {
-      await expectLocalBackendGatewayClientScopesPreserved(port, { password: "secret" });
+      await expectLocalSharedAuthScopesPreserved(
+        port,
+        { password: "secret" },
+        BACKEND_GATEWAY_CLIENT,
+      );
+    });
+
+    test("preserves scopes for direct-local CLI shared-password connects without device identity", async () => {
+      await expectLocalSharedAuthScopesPreserved(port, { password: "secret" }, CLI_CLIENT);
     });
   });
 
   describe("none mode", () => {
-    let server: Awaited<ReturnType<typeof startGatewayServer>>;
+    let server: Awaited<ReturnType<typeof startTestGatewayServer>>;
     let port = 0;
     let prevToken: string | undefined;
 
@@ -317,8 +422,9 @@ describe("gateway auth compatibility baseline", () => {
       prevToken = process.env.OPENCLAW_GATEWAY_TOKEN;
       testState.gatewayAuth = { mode: "none" };
       delete process.env.OPENCLAW_GATEWAY_TOKEN;
-      port = await getFreePort();
-      server = await startGatewayServer(port, { controlUiEnabled: true });
+      const portClaim = await acquireTestPortBlock({ offsets: [0, 1, 2, 3, 4] });
+      port = portClaim.port;
+      server = await startTestGatewayServer(portClaim, { controlUiEnabled: true });
     });
 
     afterAll(async () => {
@@ -337,7 +443,11 @@ describe("gateway auth compatibility baseline", () => {
     });
 
     test("allows auth-none local backend connects without device identity", async () => {
-      await expectLocalBackendGatewayClientScopesPreserved(port, { skipDefaultAuth: true });
+      await expectLocalSharedAuthScopesPreserved(
+        port,
+        { skipDefaultAuth: true },
+        BACKEND_GATEWAY_CLIENT,
+      );
     });
 
     test("rejects auth-none browser-origin backend connects without device identity", async () => {
@@ -364,7 +474,7 @@ describe("gateway auth compatibility baseline", () => {
       try {
         const deviceIdentityPath = path.join(
           os.tmpdir(),
-          `openclaw-auth-none-control-ui-first-${process.pid}-${port}.json`,
+          `openclaw-auth-none-control-ui-first-${process.pid}-${port}.sqlite`,
         );
         const res = await connectReq(ws, {
           skipDefaultAuth: true,
@@ -391,16 +501,16 @@ describe("gateway auth compatibility baseline", () => {
       try {
         const { loadOrCreateDeviceIdentity, publicKeyRawBase64UrlFromPem } =
           await import("../infra/device-identity.js");
-        const { approveDevicePairing, requestDevicePairing } =
-          await import("../infra/device-pairing.js");
+        const { approveDevicePairing } = await import("../infra/device-pairing-approval.js");
+        const { requestDevicePairing } = await import("../infra/device-pairing.js");
         const nonce = await readConnectChallengeNonce(ws);
         const identityPath = path.join(
           os.tmpdir(),
-          `openclaw-auth-none-control-ui-${process.pid}-${port}.json`,
+          `openclaw-auth-none-control-ui-${process.pid}-${port}.sqlite`,
         );
         const staleIdentityPath = path.join(
           os.tmpdir(),
-          `openclaw-auth-none-control-ui-stale-${process.pid}-${port}.json`,
+          `openclaw-auth-none-control-ui-stale-${process.pid}-${port}.sqlite`,
         );
         const { identity, device } = await createSignedDevice({
           token: null,
@@ -410,7 +520,7 @@ describe("gateway auth compatibility baseline", () => {
           identityPath,
           nonce,
         });
-        const staleIdentity = loadOrCreateDeviceIdentity(staleIdentityPath);
+        const staleIdentity = loadOrCreateDeviceIdentity({ path: staleIdentityPath });
         const pending = await requestDevicePairing({
           deviceId: identity.deviceId,
           publicKey: publicKeyRawBase64UrlFromPem(staleIdentity.publicKeyPem),

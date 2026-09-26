@@ -3,7 +3,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
-import { registerAgentRunContext, resetAgentRunContextForTest } from "../infra/agent-events.js";
+import { resetAgentEventsForTest } from "../infra/agent-events.js";
+import { registerAgentRunContext } from "../infra/agent-run-registry.js";
 
 const hoisted = vi.hoisted(() => ({
   loadConfigMock: vi.fn<() => OpenClawConfig>(),
@@ -18,7 +19,7 @@ vi.mock("./session-utils.js", async () => {
   const actual = await vi.importActual<typeof import("./session-utils.js")>("./session-utils.js");
   return {
     ...actual,
-    loadCombinedSessionStoreForGateway: (
+    loadCombinedSessionStoreForGatewayCore: (
       cfg: OpenClawConfig,
       opts?: { agentId?: string; configuredAgentsOnly?: boolean },
     ) => hoisted.loadCombinedSessionStoreForGatewayMock(cfg, opts),
@@ -40,13 +41,13 @@ describe("resolveSessionKeyForRun", () => {
   beforeEach(() => {
     hoisted.loadConfigMock.mockReset();
     hoisted.loadCombinedSessionStoreForGatewayMock.mockReset();
-    resetAgentRunContextForTest();
+    resetAgentEventsForTest();
     resetResolvedSessionKeyForRunCacheForTest();
   });
 
   afterEach(() => {
     vi.useRealTimers();
-    resetAgentRunContextForTest();
+    resetAgentEventsForTest();
     resetResolvedSessionKeyForRunCacheForTest();
   });
 
@@ -136,6 +137,20 @@ describe("resolveSessionKeyForRun", () => {
     });
   });
 
+  it("keeps qualified global main run ownership before collapsing its key", () => {
+    mockCombinedSessionStore(
+      {
+        session: { scope: "global" },
+        agents: { ownership: "explicit", entries: { ops: {}, research: {} } },
+      },
+      {},
+    );
+    registerAgentRunContext("qualified-global-run", { sessionKey: "agent:research:main" });
+
+    expect(resolveSessionKeyForRun("qualified-global-run", { agentId: "research" })).toBe("main");
+    expect(resolveSessionKeyForRun("qualified-global-run", { agentId: "ops" })).toBeUndefined();
+  });
+
   it("does not overwrite active run context when a scoped lookup finds another agent store entry", () => {
     hoisted.loadConfigMock.mockReturnValue({});
     registerAgentRunContext("run-1", { sessionKey: "agent:retired:acp:run-1" });
@@ -187,16 +202,6 @@ describe("resolveSessionKeyForRun", () => {
     registerAgentRunContext("run-live-main", { sessionKey: "main" });
 
     expect(resolveSessionKeyForRun("run-live-main")).toBe("main");
-    expect(hoisted.loadCombinedSessionStoreForGatewayMock).not.toHaveBeenCalled();
-  });
-
-  it("uses active legacy run contexts for the configured default agent", () => {
-    hoisted.loadConfigMock.mockReturnValue({
-      agents: { list: [{ id: "work", default: true }] },
-    });
-    registerAgentRunContext("run-live-work", { sessionKey: "main" });
-
-    expect(resolveSessionKeyForRun("run-live-work")).toBe("main");
     expect(hoisted.loadCombinedSessionStoreForGatewayMock).not.toHaveBeenCalled();
   });
 

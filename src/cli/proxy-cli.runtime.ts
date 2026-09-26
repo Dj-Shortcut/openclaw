@@ -2,8 +2,9 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import process from "node:process";
+import { expectDefined } from "@openclaw/normalization-core";
 import { colorize, isRich, theme } from "../../packages/terminal-core/src/theme.js";
-import { getRuntimeConfig } from "../config/config.js";
+import { loadPinnedRuntimeConfigAsync } from "../config/runtime-snapshot.js";
 import {
   runProxyValidation,
   type ProxyValidationResult,
@@ -21,10 +22,12 @@ import {
   getDebugProxyCaptureStore,
 } from "../proxy-capture/store.sqlite.js";
 import type { CaptureQueryPreset } from "../proxy-capture/types.js";
+import { defaultRuntime, writeRuntimeJson } from "../runtime.js";
+import { resolveSubprocessExitCode } from "./subprocess-exit-code.js";
 
 export async function runDebugProxyStartCommand(opts: { host?: string; port?: number }) {
   const settings = resolveDebugProxySettings();
-  const store = getDebugProxyCaptureStore(settings.dbPath, settings.blobDir);
+  const store = getDebugProxyCaptureStore();
   store.upsertSession({
     id: settings.sessionId,
     startedAt: Date.now(),
@@ -32,8 +35,6 @@ export async function runDebugProxyStartCommand(opts: { host?: string; port?: nu
     sourceScope: "openclaw",
     sourceProcess: "openclaw",
     proxyUrl: settings.proxyUrl,
-    dbPath: settings.dbPath,
-    blobDir: settings.blobDir,
   });
   initializeDebugProxyCapture("proxy-start", settings);
   const ca = await ensureDebugProxyCa(settings.certDir);
@@ -44,7 +45,7 @@ export async function runDebugProxyStartCommand(opts: { host?: string; port?: nu
   });
   process.stdout.write(`Debug proxy: ${server.proxyUrl}\n`);
   process.stdout.write(`CA cert: ${ca.certPath}\n`);
-  process.stdout.write(`Capture DB: ${settings.dbPath}\n`);
+  process.stdout.write(`Capture DB: ${store.dbPath}\n`);
   process.stdout.write("Press Ctrl+C to stop.\n");
   const shutdown = async () => {
     process.off("SIGINT", onSignal);
@@ -81,15 +82,13 @@ export async function runDebugProxyRunCommand(opts: {
     ...baseSettings,
     sessionId,
   };
-  getDebugProxyCaptureStore(settings.dbPath, settings.blobDir).upsertSession({
+  getDebugProxyCaptureStore().upsertSession({
     id: sessionId,
     startedAt: Date.now(),
     mode: "proxy-run",
     sourceScope: "openclaw",
     sourceProcess: "openclaw",
     proxyUrl: undefined,
-    dbPath: settings.dbPath,
-    blobDir: settings.blobDir,
   });
   const server = await startDebugProxyServer({
     host: opts.host,
@@ -100,26 +99,24 @@ export async function runDebugProxyRunCommand(opts: {
   const childEnv = applyDebugProxyEnv(process.env, {
     proxyUrl: server.proxyUrl,
     sessionId,
-    dbPath: settings.dbPath,
-    blobDir: settings.blobDir,
     certDir: settings.certDir,
   });
   try {
     await new Promise<void>((resolve, reject) => {
-      const child = spawn(command, args, {
+      const child = spawn(expectDefined(command, "proxy cli.runtime command"), args, {
         stdio: "inherit",
         env: childEnv,
         cwd: process.cwd(),
       });
       child.once("error", reject);
       child.once("exit", (code, signal) => {
-        process.exitCode = signal ? 1 : (code ?? 1);
+        process.exitCode = resolveSubprocessExitCode(code, signal);
         resolve();
       });
     });
   } finally {
     await server.stop();
-    getDebugProxyCaptureStore(settings.dbPath, settings.blobDir).endSession(sessionId);
+    getDebugProxyCaptureStore().endSession(sessionId);
   }
 }
 
@@ -141,25 +138,7 @@ function redactProxyUrl(value: string | undefined): string | undefined {
   }
 }
 
-function redactProxyValidationResult(result: ProxyValidationResult): ProxyValidationResult {
-  return {
-    ...result,
-    config: {
-      ...result.config,
-      proxyUrl: redactProxyUrl(result.config.proxyUrl),
-    },
-  };
-}
-
-type ProxyValidationTextColors = {
-  heading: (value: string) => string;
-  success: (value: string) => string;
-  error: (value: string) => string;
-  muted: (value: string) => string;
-  warn: (value: string) => string;
-};
-
-function getProxyValidationTextColors(): ProxyValidationTextColors {
+function getProxyValidationTextColors() {
   const rich = isRich();
   const apply = (color: (value: string) => string) => (value: string) =>
     colorize(rich, color, value);
@@ -174,7 +153,7 @@ function getProxyValidationTextColors(): ProxyValidationTextColors {
 
 function formatProxyCheckLine(
   check: ProxyValidationResult["checks"][number],
-  colors: ProxyValidationTextColors,
+  colors: ReturnType<typeof getProxyValidationTextColors>,
 ): string {
   const icon = check.ok ? colors.success("✓") : colors.error("✗");
   const paddedKind = colors.muted(check.kind.padEnd(7, " "));
@@ -191,11 +170,6 @@ function formatProxyCheckLine(
 function formatProxyValidationNextSteps(result: ProxyValidationResult): string[] {
   if (result.ok) {
     return [];
-  }
-  if (result.config.errors.some((error) => error.includes("proxy.enabled"))) {
-    return [
-      "Enable proxy.enabled with proxy.proxyUrl or OPENCLAW_PROXY_URL, or pass --proxy-url for an explicit one-off validation.",
-    ];
   }
   if (result.config.errors.some((error) => error.includes("proxy CA file could not be read"))) {
     return [
@@ -268,7 +242,11 @@ export async function runProxyValidateCommand(opts: {
   apnsAuthority?: string;
   timeoutMs?: number;
 }) {
-  const config = getRuntimeConfig();
+  const config = await loadPinnedRuntimeConfigAsync(async (assertCurrent) => {
+    const { getRuntimeConfig } = await import("../config/config.js");
+    assertCurrent();
+    return { config: getRuntimeConfig() };
+  });
   const result = await runProxyValidation({
     config: config?.proxy,
     env: process.env,
@@ -280,7 +258,10 @@ export async function runProxyValidateCommand(opts: {
     apnsAuthority: opts.apnsAuthority,
     timeoutMs: opts.timeoutMs,
   });
-  const outputResult = redactProxyValidationResult(result);
+  const outputResult = {
+    ...result,
+    config: { ...result.config, proxyUrl: redactProxyUrl(result.config.proxyUrl) },
+  };
   process.stdout.write(
     opts.json === true
       ? `${JSON.stringify(outputResult, null, 2)}\n`
@@ -291,45 +272,36 @@ export async function runProxyValidateCommand(opts: {
   }
 }
 
-export async function runDebugProxySessionsCommand(opts: { limit?: number }) {
-  const settings = resolveDebugProxySettings();
-  const sessions = getDebugProxyCaptureStore(settings.dbPath, settings.blobDir).listSessions(
-    opts.limit ?? 20,
-  );
-  process.stdout.write(`${JSON.stringify(sessions, null, 2)}\n`);
+export async function runDebugProxySessionsCommand(opts: { json?: boolean; limit?: number }) {
+  const sessions = getDebugProxyCaptureStore().listSessions(opts.limit ?? 20);
+  writeRuntimeJson(defaultRuntime, opts.json ? { sessions } : sessions);
   closeDebugProxyCaptureStore();
 }
 
 export async function runDebugProxyQueryCommand(opts: {
+  json?: boolean;
   preset: CaptureQueryPreset;
   sessionId?: string;
 }) {
-  const settings = resolveDebugProxySettings();
-  const rows = getDebugProxyCaptureStore(settings.dbPath, settings.blobDir).queryPreset(
-    opts.preset,
-    opts.sessionId,
-  );
-  process.stdout.write(`${JSON.stringify(rows, null, 2)}\n`);
+  const rows = getDebugProxyCaptureStore().queryPreset(opts.preset, opts.sessionId);
+  writeRuntimeJson(defaultRuntime, opts.json ? { rows } : rows);
   closeDebugProxyCaptureStore();
 }
 
 export async function runDebugProxyCoverageCommand() {
-  process.stdout.write(`${JSON.stringify(buildDebugProxyCoverageReport(), null, 2)}\n`);
+  const report = buildDebugProxyCoverageReport();
+  writeRuntimeJson(defaultRuntime, report);
   closeDebugProxyCaptureStore();
 }
 
 export async function runDebugProxyPurgeCommand() {
-  const settings = resolveDebugProxySettings();
-  const result = getDebugProxyCaptureStore(settings.dbPath, settings.blobDir).purgeAll();
+  const result = getDebugProxyCaptureStore().purgeAll();
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   closeDebugProxyCaptureStore();
 }
 
 export async function readDebugProxyBlobCommand(opts: { blobId: string }) {
-  const settings = resolveDebugProxySettings();
-  const content = getDebugProxyCaptureStore(settings.dbPath, settings.blobDir).readBlob(
-    opts.blobId,
-  );
+  const content = getDebugProxyCaptureStore().readBlob(opts.blobId);
   if (content == null) {
     closeDebugProxyCaptureStore();
     throw new Error(`Unknown blob: ${opts.blobId}`);

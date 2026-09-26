@@ -1,3 +1,4 @@
+export { normalizeE164, resolveUserPath } from "openclaw/plugin-sdk/text-utility-runtime";
 // Whatsapp API module exposes the plugin public contract.
 export { whatsappPlugin } from "./src/channel.js";
 export { whatsappSetupPlugin } from "./src/channel.setup.js";
@@ -25,14 +26,12 @@ export {
   isSelfChatMode,
   jidToE164,
   markdownToWhatsApp,
-  normalizeE164,
   resolveJidToE164,
-  resolveUserPath,
   toWhatsappJid,
   toWhatsappJidWithLid,
   type JidToE164Options,
   type WebChannel,
-} from "./src/text-runtime.js";
+} from "./src/targets-runtime.js";
 export {
   type WebChannelHealthState,
   type WebChannelStatus,
@@ -42,13 +41,12 @@ export {
 export {
   type ActiveWebListener,
   type ActiveWebSendOptions,
-  type LegacyFlatWebInboundMessage,
   type WebInboundCallbackMessage,
   type WebInboundMessage,
-  type WebInboundMessageInput,
   type WebListenerCloseReason,
   type WhatsAppStructuredContactContext,
 } from "./src/inbound/types.js";
+export type { WhatsAppInboundAdmission } from "./src/inbound/admission.js";
 export {
   listWhatsAppDirectoryGroupsFromConfig,
   listWhatsAppDirectoryPeersFromConfig,
@@ -62,8 +60,6 @@ export {
   normalizeWhatsAppMessagingTarget,
   normalizeWhatsAppTarget,
 } from "./src/normalize-target.js";
-export { resolveWhatsAppGroupIntroHint } from "./src/runtime-api.js";
-export { testing as whatsappAccessControlTesting } from "./src/inbound/access-control.js";
 export {
   startWhatsAppQaDriverSession,
   type WhatsAppQaDriverObservedMessage,

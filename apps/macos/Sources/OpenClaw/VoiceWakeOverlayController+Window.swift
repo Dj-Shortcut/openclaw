@@ -24,7 +24,7 @@ extension VoiceWakeOverlayController {
                     level: .info,
                     "overlay present windowShown textLen=\(self.model.text.count, privacy: .public)")
                 // Keep the status item in “listening” mode until we explicitly dismiss the overlay.
-                AppStateStore.shared.triggerVoiceEars(ttl: nil)
+                AppStateStore.shared.startVoiceEars()
             },
             onAlreadyVisible: { window in
                 self.updateWindowFrame(animate: true)
@@ -92,7 +92,6 @@ extension VoiceWakeOverlayController {
 
         let contentHeight = ceil(used.height + (textInset.height * 2))
         let total = contentHeight + self.verticalPadding * 2
-        self.model.isOverflowing = total > self.maxHeight
         return max(self.minHeight, min(total, self.maxHeight))
     }
 

@@ -1,6 +1,9 @@
 // Dev Tooling Safety tests cover dev tooling safety script behavior.
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { existsSync, readFileSync } from "node:fs";
 import fs from "node:fs/promises";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -18,8 +21,201 @@ import {
   redactHomePath,
   redactJsonValueForDevToolLog,
 } from "../../scripts/lib/dev-tooling-safety.ts";
+import { createVitestResourceOwner } from "../../scripts/lib/vitest-resource-ownership.mts";
+import { scriptProcessEntrypoints } from "../../scripts/script-process-runtime.test-support.js";
+import {
+  resolveRuntimeWorkerArgv,
+  resolveRuntimeWorkerUrl,
+} from "../../src/infra/runtime-worker-url.js";
+import { resolveTestNodeExecPath } from "../../src/test-utils/node-process.js";
+import { killPidIfAlive } from "../../src/test-utils/process-tree.js";
+import { isProcessAlive, waitForChildClose, waitForDead } from "../helpers/process-wait.js";
+import { runQaGatewayFixture } from "../helpers/qa-gateway-cleanup.js";
 
 const tempDirs: string[] = [];
+const testNodeExecPath = resolveTestNodeExecPath();
+const promptProbeUrl = resolveRuntimeWorkerUrl(scriptProcessEntrypoints.anthropicPromptProbe);
+
+async function waitForCondition(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
+  }
+  throw new Error("timed out waiting for condition");
+}
+
+// writeFileSync is not atomic for concurrent readers: the pid file can exist
+// before its payload is flushed, so wait for non-empty content or the parse
+// races into NaN under parallel-suite load.
+async function waitForPidFile(pidPath: string, timeoutMs = 15_000): Promise<number> {
+  let content = "";
+  await waitForCondition(() => {
+    try {
+      content = readFileSync(pidPath, "utf8").trim();
+    } catch {
+      return false;
+    }
+    return content.length > 0;
+  }, timeoutMs);
+  return Number.parseInt(content, 10);
+}
+
+function quotePosixShellArg(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+async function writeFakePromptCli(
+  root: string,
+  descendantPidPath: string,
+  mode: "blocking" | "leader-exit" | "escaped-output" = "blocking",
+): Promise<string> {
+  const descendantPath = path.join(root, "fake-prompt-descendant.mjs");
+  await fs.writeFile(
+    descendantPath,
+    [
+      'import fs from "node:fs";',
+      'process.on("SIGINT", () => {});',
+      'process.on("SIGTERM", () => {});',
+      "fs.writeFileSync(process.argv[2], String(process.pid));",
+      "setInterval(() => {}, 1000);",
+      ...(mode === "escaped-output" ? ['fs.writeFileSync(process.argv[3], "ready");'] : []),
+      "",
+    ].join("\n"),
+  );
+
+  const fakeCli = path.join(root, "fake-prompt-cli.sh");
+  if (mode === "escaped-output") {
+    const leaderPath = path.join(root, "fake-prompt-leader.mjs");
+    await fs.writeFile(
+      leaderPath,
+      [
+        'import { spawn } from "node:child_process";',
+        'import fs from "node:fs";',
+        `const child = spawn(${JSON.stringify(testNodeExecPath)}, ${JSON.stringify([
+          descendantPath,
+          descendantPidPath,
+          path.join(root, "escaped.ready"),
+        ])}, { detached: true, stdio: ["ignore", "inherit", "inherit"] });`,
+        `fs.appendFileSync(${JSON.stringify(path.join(root, "launches.jsonl"))}, JSON.stringify({ pid: child.pid, args: process.argv.slice(2) }) + "\\n");`,
+        `fs.writeFileSync(${JSON.stringify(descendantPidPath)}, String(child.pid));`,
+        "child.unref();",
+        "setInterval(() => {}, 1000);",
+        "",
+      ].join("\n"),
+    );
+    await fs.writeFile(
+      fakeCli,
+      [
+        "#!/bin/sh",
+        `exec ${quotePosixShellArg(testNodeExecPath)} ${quotePosixShellArg(leaderPath)} "$@"`,
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    return fakeCli;
+  }
+  await fs.writeFile(
+    fakeCli,
+    [
+      "#!/bin/sh",
+      `${quotePosixShellArg(testNodeExecPath)} ${quotePosixShellArg(descendantPath)} ${quotePosixShellArg(descendantPidPath)} >/dev/null 2>&1 &`,
+      `while [ ! -s ${quotePosixShellArg(descendantPidPath)} ]; do sleep 0.01; done`,
+      mode === "leader-exit" ? "exit 0" : "while :; do sleep 1; done",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  return fakeCli;
+}
+
+async function writeBlockingPromptCli(root: string): Promise<string> {
+  const fakeCli = path.join(root, "blocking-prompt-cli.sh");
+  await fs.writeFile(fakeCli, ["#!/bin/sh", "while :; do sleep 1; done", ""].join("\n"), {
+    mode: 0o755,
+  });
+  return fakeCli;
+}
+
+async function waitForChildExit(
+  child: ReturnType<typeof spawn>,
+  timeoutMs = 8_000,
+): Promise<{ status: number | null; signal: NodeJS.Signals | null }> {
+  return await Promise.race([
+    new Promise<{ status: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (status, signal) => resolve({ status, signal }));
+    }),
+    new Promise<never>((_, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("timed out waiting for child exit")),
+        timeoutMs,
+      );
+      timer.unref();
+    }),
+  ]);
+}
+
+type CliResult = {
+  status: number | null;
+  stderr: string;
+  stdout: string;
+};
+
+function runCli(scriptPath: string, args: string[]): Promise<CliResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(testNodeExecPath, ["--import", "tsx", scriptPath, ...args], {
+      cwd: process.cwd(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.once("error", reject);
+    child.once("close", (status) => resolve({ status, stderr, stdout }));
+  });
+}
+
+function createCliPair(
+  scriptPath: string,
+  firstArgs: string[],
+  secondArgs: string[],
+): () => Promise<[CliResult, CliResult]> {
+  let result: Promise<[CliResult, CliResult]> | undefined;
+  return () => {
+    // Pair only sibling entrypoint probes: process proof stays real while peak
+    // child concurrency stays capped at two.
+    result ??= Promise.all([runCli(scriptPath, firstArgs), runCli(scriptPath, secondArgs)]);
+    return result;
+  };
+}
+
+const getDiscordCliResults = createCliPair(
+  "scripts/dev/discord-acp-plain-language-smoke.ts",
+  ["--wat"],
+  ["--help"],
+);
+const getTuiPtyCliResults = createCliPair(
+  "scripts/dev/tui-pty-test-watch.ts",
+  ["--help"],
+  ["--wat"],
+);
+const getClaudeUsageCliResults = createCliPair(
+  "scripts/debug-claude-usage.ts",
+  ["--help"],
+  ["--agent"],
+);
 
 afterEach(async () => {
   vi.useRealTimers();
@@ -43,8 +239,8 @@ describe("dev tooling safety helpers", () => {
       nested: [{ message: `Authorization: Bearer ${token}` }],
     }) as { nested: Array<{ message: string }> };
 
-    expect(redacted.nested[0].message).not.toContain(token);
-    expect(redacted.nested[0].message).toContain("Authorization");
+    expect(redacted.nested[0]?.message).not.toContain(token);
+    expect(redacted.nested[0]?.message).toContain("Authorization");
   });
 
   it("parses boolean env values explicitly", () => {
@@ -70,12 +266,48 @@ describe("dev tooling safety helpers", () => {
     );
     expect(maskIdentifier("session-key-abcdef123456")).toBe("sessio...3456");
   });
+
+  it("does not split boundary emoji in script log previews", () => {
+    expect(previewForDevToolLog("123456😀tail", 10)).toBe("123456...");
+  });
 });
 
 describe("script-specific dev tooling hardening", () => {
   it("rejects unknown Discord smoke drivers instead of silently using token mode", () => {
     expect(discordSmokeTesting.parseDriverMode("webhook")).toBe("webhook");
     expect(() => discordSmokeTesting.parseDriverMode("curl")).toThrow(/Invalid --driver/u);
+  });
+
+  it("rejects unknown Discord smoke args before live Discord/OpenClaw work", async () => {
+    expect(() => discordSmokeTesting.parseArgs(["--wat"])).toThrow("Unknown argument: --wat");
+    const [result] = await getDiscordCliResults();
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr.trim()).toBe("Unknown argument: --wat");
+  });
+
+  it("prints Discord smoke usage without starting live validation", async () => {
+    const [, result] = await getDiscordCliResults();
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Usage: bun scripts/dev/discord-acp-plain-language-smoke.ts");
+    expect(result.stderr).toBe("");
+  });
+
+  it("rejects missing Discord smoke option values before env fallbacks", () => {
+    expect(() => discordSmokeTesting.parseArgs(["--channel"])).toThrow(
+      "--channel requires a value",
+    );
+    expect(() => discordSmokeTesting.parseArgs(["--channel="])).toThrow(
+      "--channel requires a value",
+    );
+    expect(() => discordSmokeTesting.parseArgs(["--channel", "--json"])).toThrow(
+      "--channel requires a value",
+    );
+    for (const flag of ["--channel", "--token", "--timeout-ms", "--state-dir"]) {
+      expect(() => discordSmokeTesting.parseArgs([flag, "-h"])).toThrow(`${flag} requires a value`);
+    }
   });
 
   it("redacts Discord webhook tokens from API paths", () => {
@@ -87,10 +319,17 @@ describe("script-specific dev tooling hardening", () => {
   });
 
   it("computes the remaining Discord smoke timeout budget", () => {
-    expect(discordSmokeTesting.remainingTimeoutMs(1_500, 1_000)).toBe(500);
-    expect(() => discordSmokeTesting.remainingTimeoutMs(1_000, 1_000)).toThrow(
+    expect(discordSmokeTesting.remainingTimeoutMs(1_500, undefined, 1_000)).toBe(500);
+    expect(() => discordSmokeTesting.remainingTimeoutMs(1_000, undefined, 1_000)).toThrow(
       /exceeded total timeout/u,
     );
+    expect(() =>
+      discordSmokeTesting.remainingTimeoutMs(
+        1_000,
+        () => new Error("request-specific timeout"),
+        1_000,
+      ),
+    ).toThrow("request-specific timeout");
   });
 
   it("aborts stalled Discord smoke fetches at the request timeout", async () => {
@@ -113,6 +352,7 @@ describe("script-specific dev tooling hardening", () => {
   });
 
   it("times out stalled Discord smoke response body reads", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     const response = new Response(
       new ReadableStream({
         start() {},
@@ -129,9 +369,11 @@ describe("script-specific dev tooling hardening", () => {
       fetchImpl: (() => Promise.resolve(response)) as typeof fetch,
     });
 
-    await expect(request).rejects.toThrow(
+    const rejection = expect(request).rejects.toThrow(
       /Discord API GET \/channels\/123\/messages exceeded timeout/u,
     );
+    await vi.advanceTimersByTimeAsync(5);
+    await rejection;
   });
 
   it("bounds Discord smoke response bodies by content-length", async () => {
@@ -180,6 +422,7 @@ describe("script-specific dev tooling hardening", () => {
   });
 
   it("does not launch another Discord smoke retry after the timeout budget expires", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     let calls = 0;
     const response = {
       ok: false,
@@ -205,43 +448,56 @@ describe("script-specific dev tooling hardening", () => {
     expect(calls).toBe(1);
   });
 
+  it("prints TUI PTY watch usage without launching the watcher", async () => {
+    const [result] = await getTuiPtyCliResults();
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Usage: node --import tsx scripts/dev/tui-pty-test-watch.ts");
+    expect(result.stderr).toBe("");
+  });
+
+  it("rejects unknown TUI PTY watch args before launching the watcher", async () => {
+    expect(() => tuiPtyWatchTesting.parseOptions(["--wat"])).toThrow("Unknown argument: --wat");
+    const [, result] = await getTuiPtyCliResults();
+
+    expect(result.status).toBe(1);
+    expect(result.stderr.trim()).toBe("Unknown argument: --wat");
+    expect(result.stdout).toBe("");
+  });
+
+  it("rejects short flags as TUI PTY watch option values", () => {
+    for (const flag of ["--mode", "--mirror-path"]) {
+      expect(() => tuiPtyWatchTesting.parseOptions([flag, "-h"])).toThrow(
+        `${flag} requires a value`,
+      );
+    }
+  });
+
+  it("keeps TUI PTY watch vitest args behind the separator", () => {
+    expect(tuiPtyWatchTesting.parseOptions(["--mode", "all", "--", "--help"])).toMatchObject({
+      mode: "all",
+      vitestArgs: ["--help"],
+    });
+  });
+
   it("escalates stalled TUI PTY watch children after interrupt cleanup", async () => {
     vi.useFakeTimers();
     const signals: NodeJS.Signals[] = [];
     const stopper = tuiPtyWatchTesting.createChildStopper(
       { kill: () => true },
-      {
-        signalChild(_child, signal: NodeJS.Signals): void {
-          signals.push(signal);
-        },
-        sigkillGraceMs: 20,
-        sigtermGraceMs: 10,
+      (_child, signal: NodeJS.Signals): void => {
+        signals.push(signal);
       },
     );
 
     stopper.stop();
     expect(signals).toEqual(["SIGINT"]);
 
-    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(500);
     expect(signals).toEqual(["SIGINT", "SIGTERM"]);
 
-    await vi.advanceTimersByTimeAsync(20);
+    await vi.advanceTimersByTimeAsync(5_000);
     expect(signals).toEqual(["SIGINT", "SIGTERM", "SIGKILL"]);
-  });
-
-  it("reads TUI PTY mirror updates incrementally with a bounded chunk", async () => {
-    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tui-watch-test-"));
-    tempDirs.push(tempRoot);
-    const mirrorPath = path.join(tempRoot, "mirror.ansi");
-    await fs.writeFile(mirrorPath, "first-second-third", "utf8");
-
-    const first = await tuiPtyWatchTesting.readNewMirrorData(mirrorPath, 0, 6);
-    expect(first.chunk.toString("utf8")).toBe("first-");
-    expect(first.offset).toBe(6);
-
-    const second = await tuiPtyWatchTesting.readNewMirrorData(mirrorPath, first.offset, 6);
-    expect(second.chunk.toString("utf8")).toBe("second");
-    expect(second.offset).toBe(12);
   });
 
   it("restarts TUI PTY mirror reads when the mirror file is truncated", async () => {
@@ -284,42 +540,6 @@ describe("script-specific dev tooling hardening", () => {
     expect(retained.toString("utf8")).toBe("89abcdef");
   });
 
-  it.runIf(process.platform !== "win32")(
-    "signals the TUI PTY watch process group before falling back to the child",
-    () => {
-      const kill = vi.spyOn(process, "kill").mockReturnValue(true);
-      const childKill = vi.fn(() => true);
-
-      try {
-        tuiPtyWatchTesting.signalChildProcessTree({ pid: 123, kill: childKill }, "SIGTERM");
-        expect(kill).toHaveBeenCalledWith(-123, "SIGTERM");
-        expect(childKill).not.toHaveBeenCalled();
-      } finally {
-        kill.mockRestore();
-      }
-    },
-  );
-
-  it.runIf(process.platform !== "win32")(
-    "falls back to direct TUI PTY watch child signaling when the process group is gone",
-    () => {
-      const kill = vi.spyOn(process, "kill").mockImplementation(() => {
-        const error = new Error("missing process group") as NodeJS.ErrnoException;
-        error.code = "ESRCH";
-        throw error;
-      });
-      const childKill = vi.fn(() => true);
-
-      try {
-        tuiPtyWatchTesting.signalChildProcessTree({ pid: 123, kill: childKill }, "SIGTERM");
-        expect(kill).toHaveBeenCalledWith(-123, "SIGTERM");
-        expect(childKill).toHaveBeenCalledWith("SIGTERM");
-      } finally {
-        kill.mockRestore();
-      }
-    },
-  );
-
   it("aborts stalled OpenAI realtime smoke fetches at the request timeout", async () => {
     let signal: AbortSignal | undefined;
     const request = realtimeSmokeTesting.createOpenAIClientSecret("test-key", {
@@ -359,15 +579,105 @@ describe("script-specific dev tooling hardening", () => {
     );
   });
 
-  it("bounds OpenAI realtime smoke response body reads by content-length", async () => {
-    const maxBytes = realtimeSmokeTesting.OPENAI_HTTP_RESPONSE_MAX_BYTES;
-    const response = new Response("{}", {
-      headers: { "content-length": String(maxBytes + 1) },
+  it("formats OpenAI realtime smoke help without launching live checks", () => {
+    expect(realtimeSmokeTesting.parseRealtimeSmokeArgs(["--help"])).toEqual({
+      help: true,
+      openAIAudioCycles: 1,
+      openAIOnly: false,
     });
+    expect(realtimeSmokeTesting.parseRealtimeSmokeArgs(["--openai-only"])).toEqual({
+      help: false,
+      openAIAudioCycles: 1,
+      openAIOnly: true,
+    });
+    expect(realtimeSmokeTesting.parseRealtimeSmokeArgs(["--openai-audio-cycles", "3"])).toEqual({
+      help: false,
+      openAIAudioCycles: 3,
+      openAIOnly: false,
+    });
+    expect(realtimeSmokeTesting.usage()).toContain(
+      "Usage: node --import tsx scripts/dev/realtime-talk-live-smoke.ts",
+    );
+    expect(realtimeSmokeTesting.usage()).toContain("--openai-only");
+    expect(realtimeSmokeTesting.usage()).toContain("--openai-audio-cycles");
+  });
+
+  it("rejects unknown OpenAI realtime smoke args before runtime setup", () => {
+    expect(() => realtimeSmokeTesting.parseRealtimeSmokeArgs(["--wat"])).toThrow(
+      "Unknown argument: --wat",
+    );
+    expect(() => realtimeSmokeTesting.parseRealtimeSmokeArgs(["--openai-audio-cycles"])).toThrow(
+      "--openai-audio-cycles requires a value",
+    );
+    expect(() =>
+      realtimeSmokeTesting.parseRealtimeSmokeArgs(["--openai-audio-cycles", "0"]),
+    ).toThrow("--openai-audio-cycles must be an integer >= 1");
+    expect(() =>
+      realtimeSmokeTesting.parseRealtimeSmokeArgs(["--openai-audio-cycles", "11"]),
+    ).toThrow("--openai-audio-cycles must be <= 10");
+  });
+
+  it("chunks PCM input without copying or dropping bytes", async () => {
+    const sent: Buffer[] = [];
+    const chunkCount = await realtimeSmokeTesting.sendPcmAudioInChunks(
+      {
+        sendAudio: (audio: Buffer) => sent.push(audio),
+      } as never,
+      Buffer.from([1, 2, 3, 4, 5]),
+      { chunkBytes: 2, delayMs: 0 },
+    );
+
+    expect(chunkCount).toBe(3);
+    expect(Buffer.concat(sent)).toEqual(Buffer.from([1, 2, 3, 4, 5]));
+    expect(sent.map((chunk) => chunk.byteLength)).toEqual([2, 2, 1]);
+    await expect(
+      realtimeSmokeTesting.sendPcmAudioInChunks({ sendAudio: vi.fn() } as never, Buffer.alloc(1), {
+        chunkBytes: 0,
+        delayMs: 0,
+      }),
+    ).rejects.toThrow("PCM audio chunk size must be a positive integer");
+  });
+
+  it("matches normalized live audio transcript markers", () => {
+    expect(realtimeSmokeTesting.transcriptIncludesMarker(["Glacier."], "glacier")).toBe(true);
+    expect(
+      realtimeSmokeTesting.transcriptIncludesMarker(
+        ["Please reply with the single-word GLACIER!"],
+        "single word glacier",
+      ),
+    ).toBe(true);
+    expect(realtimeSmokeTesting.transcriptIncludesMarker(["ocean"], "glacier")).toBe(false);
+  });
+
+  it("resolves the realtime relay smoke to an existing Control UI module", () => {
+    const modulePath = realtimeSmokeTesting.resolveGatewayRelayModulePath(process.cwd());
+
+    expect(modulePath.endsWith("/ui/src/pages/chat/talk/gateway-relay.ts")).toBe(true);
+    expect(existsSync(modulePath.slice("/@fs/".length))).toBe(true);
+  });
+
+  it("rejects unsafe OpenAI realtime SDP answer content-length values before reading", async () => {
+    const maxBytes = realtimeSmokeTesting.OPENAI_HTTP_RESPONSE_MAX_BYTES;
+    const body = {
+      cancel: vi.fn(() => Promise.resolve()),
+      getReader: vi.fn(() => {
+        throw new Error("reader should not be acquired");
+      }),
+    };
+    const response = {
+      headers: new Headers({ "content-length": "9007199254740993" }),
+      body,
+    } as unknown as Response;
 
     await expect(
-      realtimeSmokeTesting.readBoundedText(response, "OpenAI Realtime test", maxBytes),
-    ).rejects.toThrow(`OpenAI Realtime test response body exceeded ${maxBytes} bytes`);
+      realtimeSmokeTesting.readOpenAIRealtimeBrowserResponseText(
+        response,
+        "OpenAI Realtime SDP answer",
+        maxBytes,
+      ),
+    ).rejects.toThrow(`OpenAI Realtime SDP answer response body exceeded ${maxBytes} bytes`);
+    expect(body.getReader).not.toHaveBeenCalled();
+    expect(body.cancel).toHaveBeenCalledTimes(1);
   });
 
   it("bounds OpenAI realtime smoke response body reads by streamed bytes", async () => {
@@ -461,6 +771,215 @@ describe("script-specific dev tooling hardening", () => {
     await fs.rm(keepRoot, { force: true, recursive: true });
   });
 
+  it.runIf(process.platform !== "win32")(
+    "rejects Anthropic direct prompt success while its descendant remains active",
+    async () => {
+      const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-direct-normal-exit-"));
+      tempDirs.push(tempRoot);
+      const descendantPidPath = path.join(tempRoot, "descendant.pid");
+      const fakeClaudeBin = await writeFakePromptCli(tempRoot, descendantPidPath, "leader-exit");
+      let descendantPid = 0;
+      const result = promptProbeTesting.runDirectPrompt("normal exit cleanup proof", {
+        claudeBin: fakeClaudeBin,
+        timeoutMs: 5_000,
+      });
+      void result.catch(() => undefined);
+
+      await runQaGatewayFixture(
+        async () => {
+          descendantPid = await waitForPidFile(descendantPidPath);
+          await expect(result).rejects.toMatchObject({
+            code: "EPROCESSGROUP_CLEANUP_FAILED",
+            processTreeState: "terminated",
+          });
+          expect(isProcessAlive(descendantPid)).toBe(false);
+        },
+        async () => {
+          if (descendantPid && isProcessAlive(descendantPid)) {
+            process.kill(descendantPid, "SIGKILL");
+          }
+          await result.catch(() => undefined);
+          if (descendantPid) {
+            await waitForDead(descendantPid, 5_000);
+          }
+        },
+      );
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "reports Anthropic direct cleanup uncertainty on parent signal",
+    async () => {
+      const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-direct-unjoined-"));
+      const owner = createVitestResourceOwner(tempRoot);
+      const descendantPidPath = path.join(tempRoot, "descendant.pid");
+      const fakeClaudeBin = await writeFakePromptCli(tempRoot, descendantPidPath, "escaped-output");
+      const probe = spawn(process.execPath, resolveRuntimeWorkerArgv(promptProbeUrl), {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          CLAUDE_BIN: fakeClaudeBin,
+          OPENCLAW_PROMPT_TRANSPORT: "direct",
+          OPENCLAW_PROMPT_CAPTURE: "0",
+          OPENCLAW_PROMPT_KEEP_TMP: "0",
+          OPENCLAW_PROMPT_TIMEOUT_MS: "10000",
+          OPENCLAW_PROMPT_LIST_JSON: JSON.stringify(["cleanup uncertainty", "must not run"]),
+          TMPDIR: tempRoot,
+          TMP: tempRoot,
+          TEMP: tempRoot,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      let descendantPid = 0;
+      probe.stdout.on("data", (chunk) => (stdout += String(chunk)));
+      probe.stderr.on("data", (chunk) => (stderr += String(chunk)));
+      const closed = waitForChildClose(probe, 10_000);
+      void closed.catch(() => undefined);
+
+      await runQaGatewayFixture(
+        async () => {
+          descendantPid = await waitForPidFile(descendantPidPath);
+          await waitForCondition(() => {
+            const readyPath = path.join(tempRoot, "escaped.ready");
+            return existsSync(readyPath) && readFileSync(readyPath, "utf8") === "ready";
+          });
+          expect(isProcessAlive(descendantPid)).toBe(true);
+          probe.kill("SIGTERM");
+          const exit = await closed;
+
+          expect(isProcessAlive(descendantPid)).toBe(true);
+          expect(() => owner.assertReleased()).toThrow("Unreleased Vitest resource claim");
+          expect(exit).toEqual({ code: 1, signal: null });
+          expect(stderr).toContain(
+            "Managed command cleanup could not verify child, process group, and output closure",
+          );
+          expect(stdout).toBe("");
+          const launches = (await fs.readFile(path.join(tempRoot, "launches.jsonl"), "utf8"))
+            .trim()
+            .split("\n");
+          expect(launches).toHaveLength(1);
+        },
+        async () => {
+          const failures: unknown[] = [];
+          const cleanupClosed =
+            probe.stdout.closed &&
+            probe.stderr.closed &&
+            (probe.exitCode !== null || probe.signalCode !== null)
+              ? Promise.resolve()
+              : waitForChildClose(probe);
+          if (probe.exitCode === null && probe.signalCode === null) {
+            probe.kill("SIGTERM");
+          }
+          try {
+            await cleanupClosed;
+          } catch (error) {
+            failures.push(error);
+          }
+          // Rescue extra launches too, even when the one-prompt assertion fails.
+          const ownedPids = new Set(descendantPid > 1 ? [descendantPid] : []);
+          try {
+            const journal = await fs.readFile(path.join(tempRoot, "launches.jsonl"), "utf8");
+            for (const line of journal.trim().split("\n").filter(Boolean)) {
+              const entry: unknown = JSON.parse(line);
+              if (
+                !entry ||
+                typeof entry !== "object" ||
+                !("pid" in entry) ||
+                typeof entry.pid !== "number" ||
+                !Number.isSafeInteger(entry.pid) ||
+                entry.pid <= 1
+              ) {
+                throw new Error("Invalid escaped-child PID in the owned launch journal");
+              }
+              ownedPids.add(entry.pid);
+            }
+          } catch (error) {
+            failures.push(error);
+          }
+          for (const pid of ownedPids) {
+            try {
+              killPidIfAlive(pid);
+            } catch (error) {
+              failures.push(error);
+            }
+          }
+          const cleanup = await Promise.allSettled(
+            [...ownedPids].map((pid) => waitForDead(pid, 5_000)),
+          );
+          failures.push(
+            ...cleanup.flatMap((result) => (result.status === "rejected" ? [result.reason] : [])),
+          );
+          if (failures.length > 0) {
+            throw new AggregateError(failures, `Fixture cleanup failed; retained ${tempRoot}`);
+          }
+          tempDirs.push(tempRoot);
+        },
+      );
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "returns a terminal result after an Anthropic direct prompt timeout",
+    async () => {
+      const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-direct-prompt-tree-"));
+      tempDirs.push(tempRoot);
+      const fakeClaudeBin = await writeBlockingPromptCli(tempRoot);
+
+      await expect(
+        promptProbeTesting.runDirectPrompt("timeout cleanup proof", {
+          claudeBin: fakeClaudeBin,
+          timeoutMs: 500,
+        }),
+      ).resolves.toMatchObject({
+        exitCode: null,
+        ok: false,
+        signal: "SIGKILL",
+      });
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "cleans Anthropic direct prompt descendants on parent signal",
+    async () => {
+      const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-direct-parent-signal-"));
+      tempDirs.push(tempRoot);
+      const descendantPidPath = path.join(tempRoot, "descendant.pid");
+      let descendantPid = 0;
+      const fakeClaudeBin = await writeFakePromptCli(tempRoot, descendantPidPath);
+      const probe = spawn(process.execPath, resolveRuntimeWorkerArgv(promptProbeUrl), {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          CLAUDE_BIN: fakeClaudeBin,
+          OPENCLAW_PROMPT_TEXT: "parent signal cleanup proof",
+          OPENCLAW_PROMPT_TIMEOUT_MS: "10000",
+          OPENCLAW_PROMPT_TRANSPORT: "direct",
+        },
+        stdio: "ignore",
+      });
+
+      try {
+        descendantPid = await waitForPidFile(descendantPidPath);
+        expect(Number.isInteger(descendantPid)).toBe(true);
+        expect(isProcessAlive(descendantPid)).toBe(true);
+
+        const probeExit = waitForChildExit(probe);
+        process.kill(probe.pid!, "SIGTERM");
+        await expect(probeExit).resolves.toEqual({ status: 143, signal: null });
+        await waitForCondition(() => !isProcessAlive(descendantPid));
+      } finally {
+        if (probe.pid && isProcessAlive(probe.pid)) {
+          process.kill(probe.pid, "SIGKILL");
+        }
+        if (descendantPid && isProcessAlive(descendantPid)) {
+          process.kill(descendantPid, "SIGKILL");
+        }
+      }
+    },
+  );
+
   it("waits for the Anthropic prompt gateway child after SIGKILL cleanup", async () => {
     const events = new EventEmitter();
     const signals: NodeJS.Signals[] = [];
@@ -528,6 +1047,146 @@ describe("script-specific dev tooling hardening", () => {
     expect(closeCalls).toBe(1);
   });
 
+  it.runIf(process.platform !== "win32")(
+    "cleans Anthropic prompt gateway descendants after leader exit",
+    async () => {
+      const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-prompt-gateway-tree-"));
+      tempDirs.push(tempRoot);
+      const descendantPidPath = path.join(tempRoot, "descendant.pid");
+      let descendantPid = 0;
+      const descendantScript = [
+        "process.on('SIGINT', () => {});",
+        "process.on('SIGTERM', () => {});",
+        "setInterval(() => {}, 1000);",
+      ].join("");
+      const leaderScript = [
+        "import childProcess from 'node:child_process';",
+        "import fs from 'node:fs';",
+        "const descendant = childProcess.spawn(process.execPath, [",
+        "  '--input-type=module',",
+        `  '--eval', ${JSON.stringify(descendantScript)},`,
+        "], { stdio: 'ignore' });",
+        `fs.writeFileSync(${JSON.stringify(descendantPidPath)}, String(descendant.pid));`,
+        "process.on('SIGINT', () => process.exit(0));",
+        "setInterval(() => {}, 1000);",
+      ].join("\n");
+      const child = spawn(process.execPath, ["--input-type=module", "--eval", leaderScript], {
+        detached: true,
+        stdio: "ignore",
+      });
+      let closeCalls = 0;
+
+      try {
+        await waitForCondition(() => isProcessAlive(child.pid!));
+        descendantPid = await waitForPidFile(descendantPidPath);
+        expect(Number.isInteger(descendantPid)).toBe(true);
+        expect(isProcessAlive(descendantPid)).toBe(true);
+
+        const stopped = await promptProbeTesting.stopGatewayPromptChild(
+          child as Parameters<typeof promptProbeTesting.stopGatewayPromptChild>[0],
+          {
+            close: async () => {
+              closeCalls += 1;
+            },
+          },
+          50,
+          100,
+        );
+
+        expect(stopped).toBe(true);
+        expect(closeCalls).toBe(1);
+        await waitForCondition(() => !isProcessAlive(descendantPid));
+      } finally {
+        if (child.pid && isProcessAlive(child.pid)) {
+          process.kill(-child.pid, "SIGKILL");
+        }
+        if (descendantPid && isProcessAlive(descendantPid)) {
+          process.kill(descendantPid, "SIGKILL");
+        }
+      }
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "cleans Anthropic prompt gateway descendants when the child attaches after parent signal",
+    async () => {
+      const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-prompt-parent-signal-"));
+      tempDirs.push(tempRoot);
+      const descendantPidPath = path.join(tempRoot, "descendant.pid");
+      const readyPath = path.join(tempRoot, "ready");
+      const runnerPath = path.join(tempRoot, "parent-signal-runner.mjs");
+      let descendantPid = 0;
+      const descendantScript = [
+        "process.on('SIGINT', () => {});",
+        "process.on('SIGTERM', () => {});",
+        "setInterval(() => {}, 1000);",
+      ].join("");
+      const leaderScript = [
+        "import childProcess from 'node:child_process';",
+        "import fs from 'node:fs';",
+        "const descendant = childProcess.spawn(process.execPath, [",
+        "  '--input-type=module',",
+        `  '--eval', ${JSON.stringify(descendantScript)},`,
+        "], { stdio: 'ignore' });",
+        `fs.writeFileSync(${JSON.stringify(descendantPidPath)}, String(descendant.pid));`,
+        "process.on('SIGINT', () => process.exit(0));",
+        "setInterval(() => {}, 1000);",
+      ].join("\n");
+      await fs.writeFile(
+        runnerPath,
+        [
+          "import childProcess from 'node:child_process';",
+          "import fs from 'node:fs';",
+          `const { testing } = await import(${JSON.stringify(promptProbeUrl.href)});`,
+          "const signalController = testing.createPromptProbeParentSignalController();",
+          `const child = childProcess.spawn(process.execPath, ['--input-type=module', '--eval', ${JSON.stringify(leaderScript)}], { detached: true, stdio: 'ignore' });`,
+          "let stopPromise;",
+          "const stopGateway = () => {",
+          "  stopPromise ??= testing.stopGatewayPromptChild(child, { close: async () => {} }, 50, 100);",
+          "  return stopPromise;",
+          "};",
+          "process.on('SIGTERM', () => {",
+          "  signalController.attach({",
+          "    stop: stopGateway,",
+          "    forceKill: () => {",
+          "      try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }",
+          "    },",
+          "  });",
+          "});",
+          `fs.writeFileSync(${JSON.stringify(readyPath)}, String(process.pid));`,
+          "setInterval(() => {}, 1000);",
+        ].join("\n"),
+        "utf8",
+      );
+      const runner = spawn(
+        process.execPath,
+        [...resolveRuntimeWorkerArgv(promptProbeUrl).slice(0, -1), runnerPath],
+        {
+          stdio: "ignore",
+        },
+      );
+
+      try {
+        await waitForCondition(() => existsSync(readyPath));
+        descendantPid = await waitForPidFile(descendantPidPath);
+        expect(Number.isInteger(descendantPid)).toBe(true);
+        expect(isProcessAlive(descendantPid)).toBe(true);
+
+        const runnerExit = waitForChildExit(runner);
+        process.kill(runner.pid!, "SIGTERM");
+        await expect(runnerExit).resolves.toEqual({ status: 143, signal: null });
+        await waitForCondition(() => !isProcessAlive(descendantPid));
+      } finally {
+        if (runner.pid && isProcessAlive(runner.pid)) {
+          process.kill(runner.pid, "SIGKILL");
+        }
+        if (descendantPid && isProcessAlive(descendantPid)) {
+          process.kill(descendantPid, "SIGKILL");
+        }
+      }
+    },
+  );
+
   it("waits for Anthropic prompt gateway log writes before closing the log file", async () => {
     let resolveWrite: (() => void) | undefined;
     const order: string[] = [];
@@ -570,6 +1229,46 @@ describe("script-specific dev tooling hardening", () => {
     expect(claudeUsageTesting.CLAUDE_COOKIE_HOST_SQL).not.toContain("%claude.ai%");
   });
 
+  it("rejects malformed Claude usage args before reading auth or browser state", () => {
+    expect(claudeUsageTesting.parseArgs(["--agent", "work", "--session-key=abc"])).toEqual({
+      agentId: "work",
+      help: false,
+      reveal: false,
+      sessionKey: "abc",
+    });
+    expect(claudeUsageTesting.parseArgs(["--help"])).toEqual({
+      agentId: "main",
+      help: true,
+      reveal: false,
+      sessionKey: undefined,
+    });
+    expect(() => claudeUsageTesting.parseArgs(["--wat"])).toThrow("Unknown argument: --wat");
+    expect(() => claudeUsageTesting.parseArgs(["--agent"])).toThrow("--agent requires a value");
+    expect(() => claudeUsageTesting.parseArgs(["--agent="])).toThrow("--agent requires a value");
+    expect(() => claudeUsageTesting.parseArgs(["--session-key", "--reveal"])).toThrow(
+      "--session-key requires a value",
+    );
+    expect(() => claudeUsageTesting.parseArgs(["--session-key= "])).toThrow(
+      "--session-key requires a value",
+    );
+  });
+
+  it("prints Claude usage help without opening auth stores", async () => {
+    const [result] = await getClaudeUsageCliResults();
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Usage: node --import tsx scripts/debug-claude-usage.ts");
+    expect(result.stderr).toBe("");
+  });
+
+  it("fails missing Claude usage option values before defaulting to main auth", async () => {
+    const [, result] = await getClaudeUsageCliResults();
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("--agent requires a value");
+  });
+
   it("aborts stalled Claude usage fetches at the request timeout", async () => {
     let signal: AbortSignal | undefined;
     const request = claudeUsageTesting.fetchAnthropicOAuthUsage("test-token", {
@@ -607,24 +1306,21 @@ describe("script-specific dev tooling hardening", () => {
   });
 
   it("bounds Claude usage response body reads by content-length", async () => {
-    const maxBytes = claudeUsageTesting.FETCH_RESPONSE_MAX_BYTES;
+    const maxBytes = 256 * 1024;
     const response = new Response("{}", {
       headers: { "content-length": String(maxBytes + 1) },
     });
-    const controller = new AbortController();
 
     await expect(
-      claudeUsageTesting.readBoundedResponseText(
-        response,
-        "Claude usage test",
-        controller.signal,
-        maxBytes,
-      ),
-    ).rejects.toThrow(`Claude usage test response body exceeded ${maxBytes} bytes`);
+      claudeUsageTesting.fetchAnthropicOAuthUsage("test-token", {
+        fetchImpl: async () => response,
+        timeoutMs: 1_000,
+      }),
+    ).rejects.toThrow(`Anthropic OAuth usage request response body exceeded ${maxBytes} bytes`);
   });
 
   it("bounds Claude usage response body reads by streamed bytes", async () => {
-    const maxBytes = claudeUsageTesting.FETCH_RESPONSE_MAX_BYTES;
+    const maxBytes = 256 * 1024;
     const response = new Response(
       new ReadableStream({
         start(controller) {
@@ -633,15 +1329,103 @@ describe("script-specific dev tooling hardening", () => {
         },
       }),
     );
-    const controller = new AbortController();
 
     await expect(
-      claudeUsageTesting.readBoundedResponseText(
-        response,
-        "Claude usage test",
-        controller.signal,
-        maxBytes,
-      ),
-    ).rejects.toThrow(`Claude usage test response body exceeded ${maxBytes} bytes`);
+      claudeUsageTesting.fetchAnthropicOAuthUsage("test-token", {
+        fetchImpl: async () => response,
+        timeoutMs: 1_000,
+      }),
+    ).rejects.toThrow(`Anthropic OAuth usage request response body exceeded ${maxBytes} bytes`);
+  });
+
+  it.each([
+    { name: "before response headers", sendsHeaders: false },
+    { name: "during the response body", sendsHeaders: true },
+  ])("bounds an Anthropic upstream stall $name", async ({ sendsHeaders }) => {
+    const nativeFetch = globalThis.fetch;
+    const upstream = http.createServer((_request, response) => {
+      if (sendsHeaders) {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.flushHeaders();
+      }
+    });
+    await new Promise<void>((resolve, reject) => {
+      upstream.once("error", reject);
+      upstream.listen(0, "127.0.0.1", () => {
+        upstream.off("error", reject);
+        resolve();
+      });
+    });
+    const upstreamAddress = upstream.address();
+    if (!upstreamAddress || typeof upstreamAddress === "string") {
+      throw new Error("upstream did not bind to a TCP port");
+    }
+    const upstreamUrl = `http://127.0.0.1:${upstreamAddress.port}/v1/messages`;
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation((_input, init) => nativeFetch(upstreamUrl, init));
+    let proxy: Awaited<ReturnType<typeof promptProbeTesting.startAnthropicProxy>> | undefined;
+
+    try {
+      proxy = await promptProbeTesting.startAnthropicProxy({
+        port: 0,
+        upstreamBaseUrl: "https://api.anthropic.com",
+        timeoutMs: 100,
+      });
+      const startedAt = Date.now();
+      const proxyUrl = `http://127.0.0.1:${proxy.port}/v1/messages`;
+      const request = sendsHeaders
+        ? new Promise<{ status: number; body: string }>((resolve, reject) => {
+            const downstream = spawn(
+              testNodeExecPath,
+              [
+                "-e",
+                `fetch(process.argv[1], { method: "POST", body: "{}" })
+                  .then(async response => ({ status: response.status, body: await response.text() }))
+                  .then(result => process.stdout.write(JSON.stringify(result)))
+                  .catch(error => { process.stderr.write(String(error)); process.exitCode = 1; });`,
+                proxyUrl,
+              ],
+              { stdio: ["ignore", "pipe", "pipe"] },
+            );
+            let stdout = "";
+            let stderr = "";
+            downstream.stdout.on("data", (chunk) => (stdout += chunk));
+            downstream.stderr.on("data", (chunk) => (stderr += chunk));
+            downstream.once("error", reject);
+            downstream.once("close", (code) => {
+              if (code === 0) {
+                resolve(JSON.parse(stdout));
+              } else {
+                reject(new Error(stderr || `proxy client exited ${String(code)}`));
+              }
+            });
+          })
+        : nativeFetch(proxyUrl, { method: "POST", body: "{}" }).then(async (response) => ({
+            status: response.status,
+            body: await response.text(),
+          }));
+
+      if (sendsHeaders) {
+        await expect(request).rejects.toThrow();
+      } else {
+        await expect(request).resolves.toMatchObject({
+          status: 502,
+          body: expect.stringMatching(/Anthropic upstream timed out after 100ms/u),
+        });
+      }
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+      expect(fetchSpy).toHaveBeenCalledWith(
+        "https://api.anthropic.com/v1/messages",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    } finally {
+      fetchSpy.mockRestore();
+      await proxy?.stop();
+      upstream.closeAllConnections();
+      await new Promise<void>((resolve, reject) => {
+        upstream.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
   });
 });

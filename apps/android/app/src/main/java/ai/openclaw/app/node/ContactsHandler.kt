@@ -7,19 +7,14 @@ import android.content.ContentResolver
 import android.content.Context
 import android.provider.ContactsContract
 import androidx.core.content.ContextCompat
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.buildJsonArray
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
 
 private const val DEFAULT_CONTACTS_LIMIT = 25
 
-/**
- * Normalized Android contact row returned through the contacts commands.
- */
+@Serializable
 internal data class ContactRecord(
   val identifier: String,
   val displayName: String,
@@ -30,17 +25,11 @@ internal data class ContactRecord(
   val emails: List<String>,
 )
 
-/**
- * Parsed contacts.search request with bounded result count.
- */
 internal data class ContactsSearchRequest(
   val query: String?,
   val limit: Int,
 )
 
-/**
- * Parsed contacts.add request before ContentProviderOperation batching.
- */
 internal data class ContactsAddRequest(
   val givenName: String?,
   val familyName: String?,
@@ -50,9 +39,6 @@ internal data class ContactsAddRequest(
   val emails: List<String>,
 )
 
-/**
- * Injectable ContactsProvider facade for command tests and Android runtime access.
- */
 internal interface ContactsDataSource {
   fun hasReadPermission(context: Context): Boolean
 
@@ -218,14 +204,28 @@ private object SystemContactsDataSource : ContactsDataSource {
   ): ContactRecord {
     val nameRow = loadNameRow(resolver, contactId)
     val organization = loadOrganization(resolver, contactId)
-    val phones = loadPhones(resolver, contactId)
-    val emails = loadEmails(resolver, contactId)
+    val phones =
+      queryContactValues(
+        resolver = resolver,
+        contentUri = ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+        valueColumn = ContactsContract.CommonDataKinds.Phone.NUMBER,
+        contactIdColumn = ContactsContract.CommonDataKinds.Phone.CONTACT_ID,
+        contactId = contactId,
+      )
+    val emails =
+      queryContactValues(
+        resolver = resolver,
+        contentUri = ContactsContract.CommonDataKinds.Email.CONTENT_URI,
+        valueColumn = ContactsContract.CommonDataKinds.Email.ADDRESS,
+        contactIdColumn = ContactsContract.CommonDataKinds.Email.CONTACT_ID,
+        contactId = contactId,
+      )
     val displayName =
-      when {
-        !nameRow.displayName.isNullOrEmpty() -> nameRow.displayName
-        !fallbackDisplayName.isNullOrEmpty() -> fallbackDisplayName
-        else -> listOfNotNull(nameRow.givenName, nameRow.familyName).joinToString(" ").trim()
-      }.ifEmpty { "(unnamed)" }
+      (nameRow.displayName ?: fallbackDisplayName).ifEmpty {
+        listOfNotNull(nameRow.givenName, nameRow.familyName).joinToString(" ").ifEmpty {
+          organization ?: phones.firstOrNull() ?: emails.firstOrNull() ?: "(unnamed)"
+        }
+      }
     return ContactRecord(
       identifier = contactId.toString(),
       displayName = displayName,
@@ -294,30 +294,6 @@ private object SystemContactsDataSource : ContactsDataSource {
 
   private fun escapeLikePattern(pattern: String): String = pattern.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-  private fun loadPhones(
-    resolver: ContentResolver,
-    contactId: Long,
-  ): List<String> =
-    queryContactValues(
-      resolver = resolver,
-      contentUri = ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-      valueColumn = ContactsContract.CommonDataKinds.Phone.NUMBER,
-      contactIdColumn = ContactsContract.CommonDataKinds.Phone.CONTACT_ID,
-      contactId = contactId,
-    )
-
-  private fun loadEmails(
-    resolver: ContentResolver,
-    contactId: Long,
-  ): List<String> =
-    queryContactValues(
-      resolver = resolver,
-      contentUri = ContactsContract.CommonDataKinds.Email.CONTENT_URI,
-      valueColumn = ContactsContract.CommonDataKinds.Email.ADDRESS,
-      contactIdColumn = ContactsContract.CommonDataKinds.Email.CONTACT_ID,
-      contactId = contactId,
-    )
-
   private fun queryContactValues(
     resolver: ContentResolver,
     contentUri: android.net.Uri,
@@ -345,16 +321,10 @@ private object SystemContactsDataSource : ContactsDataSource {
   }
 }
 
-/**
- * Handles contacts.search and contacts.add gateway commands through Android ContactsProvider.
- */
-class ContactsHandler private constructor(
+class ContactsHandler internal constructor(
   private val appContext: Context,
-  private val dataSource: ContactsDataSource,
+  private val dataSource: ContactsDataSource = SystemContactsDataSource,
 ) {
-  constructor(appContext: Context) : this(appContext = appContext, dataSource = SystemContactsDataSource)
-
-  /** Searches contacts by optional display-name substring with bounded result count. */
   fun handleContactsSearch(paramsJson: String?): GatewaySession.InvokeResult {
     if (!dataSource.hasReadPermission(appContext)) {
       return GatewaySession.InvokeResult.error(
@@ -370,16 +340,7 @@ class ContactsHandler private constructor(
         )
     return try {
       val contacts = dataSource.search(appContext, request)
-      GatewaySession.InvokeResult.ok(
-        buildJsonObject {
-          put(
-            "contacts",
-            buildJsonArray {
-              contacts.forEach { add(contactJson(it)) }
-            },
-          )
-        }.toString(),
-      )
+      GatewaySession.InvokeResult.ok(Json.encodeToString(mapOf("contacts" to contacts)))
     } catch (err: Throwable) {
       GatewaySession.InvokeResult.error(
         code = "CONTACTS_UNAVAILABLE",
@@ -388,7 +349,6 @@ class ContactsHandler private constructor(
     }
   }
 
-  /** Adds a local contact after validating that at least one user-visible field is present. */
   fun handleContactsAdd(paramsJson: String?): GatewaySession.InvokeResult {
     if (!dataSource.hasWritePermission(appContext)) {
       return GatewaySession.InvokeResult.error(
@@ -414,11 +374,7 @@ class ContactsHandler private constructor(
     }
     return try {
       val contact = dataSource.add(appContext, request)
-      GatewaySession.InvokeResult.ok(
-        buildJsonObject {
-          put("contact", contactJson(contact))
-        }.toString(),
-      )
+      GatewaySession.InvokeResult.ok(Json.encodeToString(mapOf("contact" to contact)))
     } catch (err: Throwable) {
       GatewaySession.InvokeResult.error(
         code = "CONTACTS_UNAVAILABLE",
@@ -431,12 +387,7 @@ class ContactsHandler private constructor(
     if (paramsJson.isNullOrBlank()) {
       return ContactsSearchRequest(query = null, limit = DEFAULT_CONTACTS_LIMIT)
     }
-    val params =
-      try {
-        Json.parseToJsonElement(paramsJson).asObjectOrNull()
-      } catch (_: Throwable) {
-        null
-      } ?: return null
+    val params = parseJsonParamsObject(paramsJson) ?: return null
     val query = (params["query"] as? JsonPrimitive)?.content?.trim()?.ifEmpty { null }
     // Keep gateway-driven searches bounded even if the model asks for a large contact dump.
     val limit = ((params["limit"] as? JsonPrimitive)?.content?.toIntOrNull() ?: DEFAULT_CONTACTS_LIMIT).coerceIn(1, 200)
@@ -444,17 +395,12 @@ class ContactsHandler private constructor(
   }
 
   private fun parseAddRequest(paramsJson: String?): ContactsAddRequest? {
-    val params =
-      try {
-        paramsJson?.let { Json.parseToJsonElement(it).asObjectOrNull() }
-      } catch (_: Throwable) {
-        null
-      } ?: return null
+    val params = parseJsonParamsObject(paramsJson) ?: return null
     return ContactsAddRequest(
-      givenName = (params["givenName"] as? JsonPrimitive)?.content?.trim()?.ifEmpty { null },
-      familyName = (params["familyName"] as? JsonPrimitive)?.content?.trim()?.ifEmpty { null },
-      organizationName = (params["organizationName"] as? JsonPrimitive)?.content?.trim()?.ifEmpty { null },
-      displayName = (params["displayName"] as? JsonPrimitive)?.content?.trim()?.ifEmpty { null },
+      givenName = parseJsonString(params, "givenName")?.trim()?.ifEmpty { null },
+      familyName = parseJsonString(params, "familyName")?.trim()?.ifEmpty { null },
+      organizationName = parseJsonString(params, "organizationName")?.trim()?.ifEmpty { null },
+      displayName = parseJsonString(params, "displayName")?.trim()?.ifEmpty { null },
       phoneNumbers = stringArray(params["phoneNumbers"] as? JsonArray),
       // Store emails case-normalized so repeated model calls do not create casing-only duplicates.
       emails = stringArray(params["emails"] as? JsonArray).map { it.lowercase() },
@@ -464,26 +410,7 @@ class ContactsHandler private constructor(
   private fun stringArray(array: JsonArray?): List<String> {
     if (array == null) return emptyList()
     return array.mapNotNull { element ->
-      (element as? JsonPrimitive)?.content?.trim()?.ifEmpty { null }
+      element.asStringOrNull()?.trim()?.ifEmpty { null }
     }
-  }
-
-  private fun contactJson(contact: ContactRecord): JsonObject =
-    buildJsonObject {
-      put("identifier", JsonPrimitive(contact.identifier))
-      put("displayName", JsonPrimitive(contact.displayName))
-      put("givenName", JsonPrimitive(contact.givenName))
-      put("familyName", JsonPrimitive(contact.familyName))
-      put("organizationName", JsonPrimitive(contact.organizationName))
-      put("phoneNumbers", buildJsonArray { contact.phoneNumbers.forEach { add(JsonPrimitive(it)) } })
-      put("emails", buildJsonArray { contact.emails.forEach { add(JsonPrimitive(it)) } })
-    }
-
-  companion object {
-    /** Creates a handler with an injected contacts source for parser and payload tests. */
-    internal fun forTesting(
-      appContext: Context,
-      dataSource: ContactsDataSource,
-    ): ContactsHandler = ContactsHandler(appContext = appContext, dataSource = dataSource)
   }
 }

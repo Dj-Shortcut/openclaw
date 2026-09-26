@@ -7,7 +7,7 @@ import {
 } from "./pw-tools-core.test-harness.js";
 
 installPwToolsCoreTestHooks();
-const mod = await import("./pw-tools-core.js");
+const mod = await import("./pw-tools-core.interactions.js");
 
 describe("pw-tools-core", () => {
   it("clamps timeoutMs for scrollIntoView", async () => {
@@ -22,22 +22,14 @@ describe("pw-tools-core", () => {
       timeoutMs: 50,
     });
 
-    expect(scrollIntoViewIfNeeded).toHaveBeenCalledWith({ timeout: 500 });
+    expect(scrollIntoViewIfNeeded).toHaveBeenCalledWith({
+      timeout: 500,
+      signal: expect.any(AbortSignal),
+    });
   });
-  it.each([
-    {
-      name: "strict mode violations for scrollIntoView",
-      errorMessage: 'Error: strict mode violation: locator("aria-ref=1") resolved to 2 elements',
-      expectedMessage: /Run a new snapshot/i,
-    },
-    {
-      name: "not-visible timeouts for scrollIntoView",
-      errorMessage: 'Timeout 5000ms exceeded. waiting for locator("aria-ref=1") to be visible',
-      expectedMessage: /not found or not visible/i,
-    },
-  ])("rewrites $name", async ({ errorMessage, expectedMessage }) => {
+  it("rewrites strict mode violations for scrollIntoView", async () => {
     const scrollIntoViewIfNeeded = vi.fn(async () => {
-      throw new Error(errorMessage);
+      throw new Error('Error: strict mode violation: locator("aria-ref=1") resolved to 2 elements');
     });
     setPwToolsCoreCurrentRefLocator({ scrollIntoViewIfNeeded });
     setPwToolsCoreCurrentPage({});
@@ -48,7 +40,7 @@ describe("pw-tools-core", () => {
         targetId: "T1",
         ref: "1",
       }),
-    ).rejects.toThrow(expectedMessage);
+    ).rejects.toThrow(/Run a new snapshot/i);
   });
   it.each([
     {

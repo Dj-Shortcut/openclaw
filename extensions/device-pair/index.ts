@@ -1,42 +1,25 @@
-// Device Pair plugin entrypoint registers its OpenClaw integration.
 import { rm } from "node:fs/promises";
+import { isIP } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
 import { definePluginEntry, type OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
-
-type DevicePairApiModule = typeof import("./api.js");
+import { buildDevicePairPairingQrChannelData } from "./pairing-qr-channel-data.js";
 type NotifyModule = typeof import("./notify.js");
-type PairCommandApproveModule = typeof import("./pair-command-approve.js");
-type PairCommandAuthModule = typeof import("./pair-command-auth.js");
 
-let devicePairApiModulePromise: Promise<DevicePairApiModule> | undefined;
-let notifyModulePromise: Promise<NotifyModule> | undefined;
-let pairCommandApproveModulePromise: Promise<PairCommandApproveModule> | undefined;
-let pairCommandAuthModulePromise: Promise<PairCommandAuthModule> | undefined;
+const loadDevicePairApiModule = createLazyRuntimeModule(() => import("./api.js"));
 
-function loadDevicePairApiModule(): Promise<DevicePairApiModule> {
-  devicePairApiModulePromise ??= import("./api.js");
-  return devicePairApiModulePromise;
-}
+const loadNotifyModule = createLazyRuntimeModule(() => import("./notify.js"));
 
-function loadNotifyModule(): Promise<NotifyModule> {
-  notifyModulePromise ??= import("./notify.js");
-  return notifyModulePromise;
-}
+const loadPairCommandApproveModule = createLazyRuntimeModule(
+  () => import("./pair-command-approve.js"),
+);
 
-function loadPairCommandApproveModule(): Promise<PairCommandApproveModule> {
-  pairCommandApproveModulePromise ??= import("./pair-command-approve.js");
-  return pairCommandApproveModulePromise;
-}
-
-function loadPairCommandAuthModule(): Promise<PairCommandAuthModule> {
-  pairCommandAuthModulePromise ??= import("./pair-command-auth.js");
-  return pairCommandAuthModulePromise;
-}
+const loadPairCommandAuthModule = createLazyRuntimeModule(() => import("./pair-command-auth.js"));
 
 function formatDurationMinutes(expiresAtMs: number): string {
   const msRemaining = Math.max(0, expiresAtMs - Date.now());
@@ -52,16 +35,13 @@ type SetupPayload = {
   url: string;
   bootstrapToken: string;
   expiresAtMs: number;
+  access: "full" | "limited";
+  accessDowngraded?: true;
 };
 
 type ResolveUrlResult = {
   url?: string;
   source?: string;
-  error?: string;
-};
-
-type ResolveAuthLabelResult = {
-  label?: "token" | "password";
   error?: string;
 };
 
@@ -74,62 +54,14 @@ type QrCommandContext = {
   messageThreadId?: string | number;
 };
 
-type QrChannelSender = {
-  createOpts: (params: {
-    ctx: QrCommandContext;
-    qrFilePath: string;
-    mediaLocalRoots: string[];
-    accountId?: string;
-  }) => Record<string, unknown>;
-};
-
-const QR_CHANNEL_SENDERS: Record<string, QrChannelSender> = {
-  telegram: {
-    createOpts: ({ ctx, qrFilePath, mediaLocalRoots, accountId }) => ({
-      mediaUrl: qrFilePath,
-      mediaLocalRoots,
-      ...(ctx.messageThreadId != null ? { threadId: ctx.messageThreadId } : {}),
-      ...(accountId ? { accountId } : {}),
-    }),
-  },
-  discord: {
-    createOpts: ({ qrFilePath, mediaLocalRoots, accountId }) => ({
-      mediaUrl: qrFilePath,
-      mediaLocalRoots,
-      ...(accountId ? { accountId } : {}),
-    }),
-  },
-  slack: {
-    createOpts: ({ ctx, qrFilePath, mediaLocalRoots, accountId }) => ({
-      mediaUrl: qrFilePath,
-      mediaLocalRoots,
-      ...(ctx.messageThreadId != null ? { threadId: String(ctx.messageThreadId) } : {}),
-      ...(accountId ? { accountId } : {}),
-    }),
-  },
-  signal: {
-    createOpts: ({ qrFilePath, mediaLocalRoots, accountId }) => ({
-      mediaUrl: qrFilePath,
-      mediaLocalRoots,
-      ...(accountId ? { accountId } : {}),
-    }),
-  },
-  imessage: {
-    createOpts: ({ qrFilePath, mediaLocalRoots, accountId }) => ({
-      mediaUrl: qrFilePath,
-      mediaLocalRoots,
-      ...(accountId ? { accountId } : {}),
-    }),
-  },
-  whatsapp: {
-    createOpts: ({ qrFilePath, mediaLocalRoots, accountId }) => ({
-      verbose: false,
-      mediaUrl: qrFilePath,
-      mediaLocalRoots,
-      ...(accountId ? { accountId } : {}),
-    }),
-  },
-};
+const QR_SUPPORTED_CHANNELS = new Set([
+  "telegram",
+  "discord",
+  "slack",
+  "signal",
+  "imessage",
+  "whatsapp",
+]);
 
 const GATEWAY_SCHEME_WITHOUT_AUTHORITY_RE = /^(?:https?|wss?):(?!\/\/)/i;
 const SCHEME_LIKE_PATH_RE = /^[A-Za-z][A-Za-z0-9+.-]*:\//;
@@ -204,7 +136,7 @@ function isLoopbackHost(host: string): boolean {
   if (!normalized) {
     return false;
   }
-  if (normalized === "localhost" || normalized === "0.0.0.0" || normalized === "::") {
+  if (normalized === "localhost") {
     return true;
   }
   const octets = parseIPv4Octets(normalized);
@@ -212,16 +144,6 @@ function isLoopbackHost(host: string): boolean {
     return octets[0] === 127;
   }
   return normalized === "::1" || normalized === "0:0:0:0:0:0:0:1";
-}
-
-function resolveScheme(
-  cfg: OpenClawPluginApi["config"],
-  opts?: { forceSecure?: boolean },
-): "ws" | "wss" {
-  if (opts?.forceSecure) {
-    return "wss";
-  }
-  return cfg.gateway?.tls?.enabled === true ? "wss" : "ws";
 }
 
 function parseIPv4Octets(address: string): [number, number, number, number] | null {
@@ -257,12 +179,24 @@ function isPrivateIPv4(address: string): boolean {
   return false;
 }
 
+function isPrivateLanIPv6(address: string): boolean {
+  if (isIP(address) !== 6) {
+    return false;
+  }
+  const firstHextet = address.split(":", 1)[0] ?? "";
+  if (!/^[0-9a-f]{4}$/.test(firstHextet)) {
+    return false;
+  }
+  const value = Number.parseInt(firstHextet, 16);
+  return (value & 0xfe00) === 0xfc00 || (value & 0xffc0) === 0xfe80;
+}
+
 function isPrivateLanCleartextHost(host: string): boolean {
   const normalized = normalizeHostForIpCheck(host);
   if (normalized.endsWith(".local")) {
     return true;
   }
-  if (isPrivateIPv4(normalized)) {
+  if (isPrivateIPv4(normalized) || isPrivateLanIPv6(normalized)) {
     return true;
   }
   const octets = parseIPv4Octets(normalized);
@@ -306,6 +240,17 @@ function validateMobilePairingUrl(url: string, source?: string): string | null {
   return describeSecureMobilePairingFix(source);
 }
 
+function isFullAccessMobilePairingUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return (
+      parsed.protocol === "wss:" || (parsed.protocol === "ws:" && isLoopbackHost(parsed.hostname))
+    );
+  } catch {
+    return false;
+  }
+}
+
 function pickMatchingIPv4(predicate: (address: string) => boolean): string | null {
   const nets = os.networkInterfaces();
   for (const entries of Object.values(nets)) {
@@ -331,14 +276,6 @@ function pickMatchingIPv4(predicate: (address: string) => boolean): string | nul
   return null;
 }
 
-function pickLanIPv4(): string | null {
-  return pickMatchingIPv4(isPrivateIPv4);
-}
-
-function pickTailnetIPv4(): string | null {
-  return pickMatchingIPv4(isTailnetIPv4);
-}
-
 async function resolveTailnetHost(): Promise<string | null> {
   const { resolveTailnetHostWithRunner, runPluginCommandWithTimeout } =
     await loadDevicePairApiModule();
@@ -350,55 +287,12 @@ async function resolveTailnetHost(): Promise<string | null> {
   );
 }
 
-function resolveAuthLabel(cfg: OpenClawPluginApi["config"]): ResolveAuthLabelResult {
-  const mode = cfg.gateway?.auth?.mode;
-  const token =
-    pickFirstDefined([process.env.OPENCLAW_GATEWAY_TOKEN, cfg.gateway?.auth?.token]) ?? undefined;
-  const password =
-    pickFirstDefined([process.env.OPENCLAW_GATEWAY_PASSWORD, cfg.gateway?.auth?.password]) ??
-    undefined;
-
-  if (mode === "token" || mode === "password") {
-    return resolveRequiredAuthLabel(mode, { token, password });
-  }
-  if (token) {
-    return { label: "token" };
-  }
-  if (password) {
-    return { label: "password" };
-  }
-  return { error: "Gateway auth is not configured (no token or password)." };
-}
-
-function pickFirstDefined(candidates: Array<unknown>): string | null {
-  for (const value of candidates) {
-    const trimmed = normalizeOptionalString(value);
-    if (trimmed) {
-      return trimmed;
-    }
-  }
-  return null;
-}
-
-function resolveRequiredAuthLabel(
-  mode: "token" | "password",
-  values: { token?: string; password?: string },
-): ResolveAuthLabelResult {
-  if (mode === "token") {
-    return values.token
-      ? { label: "token" }
-      : { error: "Gateway auth is set to token, but no token is configured." };
-  }
-  return values.password
-    ? { label: "password" }
-    : { error: "Gateway auth is set to password, but no password is configured." };
-}
-
 async function resolveGatewayUrl(api: OpenClawPluginApi): Promise<ResolveUrlResult> {
-  const { resolveGatewayBindUrl, resolveGatewayPort } = await loadDevicePairApiModule();
+  const { resolveAdvertisedLanHost, resolveGatewayBindUrl, resolveGatewayPort } =
+    await loadDevicePairApiModule();
   const cfg = api.config;
   const pluginCfg = (api.pluginConfig ?? {}) as DevicePairPluginConfig;
-  const scheme = resolveScheme(cfg);
+  const scheme = cfg.gateway?.tls?.enabled === true ? "wss" : "ws";
   const port = resolveGatewayPort(cfg);
 
   const configuredPublicUrl = normalizeOptionalString(pluginCfg.publicUrl);
@@ -429,13 +323,14 @@ async function resolveGatewayUrl(api: OpenClawPluginApi): Promise<ResolveUrlResu
     return { url: remoteUrl, source: "gateway.remote.url" };
   }
 
+  const advertisedLanHost = cfg.gateway?.bind === "lan" ? await resolveAdvertisedLanHost() : null;
   const bindResult = resolveGatewayBindUrl({
     bind: cfg.gateway?.bind,
     customBindHost: cfg.gateway?.customBindHost,
     scheme,
     port,
-    pickTailnetHost: pickTailnetIPv4,
-    pickLanHost: pickLanIPv4,
+    pickTailnetHost: () => pickMatchingIPv4(isTailnetIPv4),
+    pickLanHost: () => advertisedLanHost,
   });
   if (bindResult) {
     return bindResult;
@@ -460,9 +355,7 @@ async function resolveMobilePairingGatewayUrl(api: OpenClawPluginApi): Promise<R
 }
 
 function encodeSetupCode(payload: SetupPayload): string {
-  const json = JSON.stringify(payload);
-  const base64 = Buffer.from(json, "utf8").toString("base64");
-  return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
 }
 
 function buildPairingFlowLines(stepTwo: string): string[] {
@@ -515,6 +408,7 @@ function formatSetupReply(payload: SetupPayload, authLabel: string): string {
     "",
     `Gateway: ${payload.url}`,
     `Auth: ${authLabel}`,
+    ...buildAccessLines(payload),
     ...buildSecurityNoticeLines({
       kind: "setup code",
       expiresAtMs: payload.expiresAtMs,
@@ -539,45 +433,23 @@ function buildQrInfoLines(params: {
   payload: SetupPayload;
   authLabel: string;
   autoNotifyArmed: boolean;
-  expiresAtMs: number;
+  markdown?: boolean;
 }): string[] {
+  const prefix = params.markdown ? "- " : "";
   return [
-    `Gateway: ${params.payload.url}`,
-    `Auth: ${params.authLabel}`,
+    `${prefix}Gateway: ${params.payload.url}`,
+    `${prefix}Auth: ${params.authLabel}`,
+    ...buildAccessLines(params.payload, params.markdown),
     ...buildSecurityNoticeLines({
       kind: "QR code",
-      expiresAtMs: params.expiresAtMs,
+      expiresAtMs: params.payload.expiresAtMs,
+      markdown: params.markdown,
     }),
     "",
     ...buildQrFollowUpLines(params.autoNotifyArmed),
     "",
     "If your camera still won’t lock on, run `/pair` for a pasteable setup code.",
   ];
-}
-
-function formatQrInfoMarkdown(params: {
-  payload: SetupPayload;
-  authLabel: string;
-  autoNotifyArmed: boolean;
-  expiresAtMs: number;
-}): string {
-  return [
-    `- Gateway: ${params.payload.url}`,
-    `- Auth: ${params.authLabel}`,
-    ...buildSecurityNoticeLines({
-      kind: "QR code",
-      expiresAtMs: params.expiresAtMs,
-      markdown: true,
-    }),
-    "",
-    ...buildQrFollowUpLines(params.autoNotifyArmed),
-    "",
-    "If your camera still won’t lock on, run `/pair` for a pasteable setup code.",
-  ].join("\n");
-}
-
-function canSendQrPngToChannel(channel: string): boolean {
-  return channel in QR_CHANNEL_SENDERS;
 }
 
 function resolveQrReplyTarget(ctx: QrCommandContext): string {
@@ -597,16 +469,46 @@ function resolveQrReplyTarget(ctx: QrCommandContext): string {
   );
 }
 
-async function issueSetupPayload(url: string): Promise<SetupPayload> {
+function buildAccessLines(payload: SetupPayload, markdown = false): string[] {
+  const prefix = markdown ? "- " : "";
+  return [
+    `${prefix}Access: ${payload.access}`,
+    ...(payload.accessDowngraded
+      ? [
+          `${prefix}Plaintext ws:// was limited for safety. Use wss:// or Tailscale Serve, then generate a new code for full access.`,
+        ]
+      : []),
+  ];
+}
+
+async function issueSetupPayload(params: {
+  url: string;
+  allowFullAccess: boolean;
+  assertCurrent?: () => void;
+}): Promise<SetupPayload> {
+  const assertCurrent = params.assertCurrent;
   const { issueDeviceBootstrapToken, PAIRING_SETUP_BOOTSTRAP_PROFILE } =
     await loadDevicePairApiModule();
+  const hasPlaintextRoute = !isFullAccessMobilePairingUrl(params.url);
+  // Admin handoff needs both an authorized issuer and TLS (or same-host loopback).
+  const fullAccess = params.allowFullAccess && !hasPlaintextRoute;
+  const accessDowngraded = params.allowFullAccess && hasPlaintextRoute;
   const issuedBootstrap = await issueDeviceBootstrapToken({
-    profile: PAIRING_SETUP_BOOTSTRAP_PROFILE,
+    ...(assertCurrent ? { assertCurrent } : {}),
+    profile: fullAccess
+      ? {
+          roles: [...PAIRING_SETUP_BOOTSTRAP_PROFILE.roles],
+          scopes: ["operator.admin", ...PAIRING_SETUP_BOOTSTRAP_PROFILE.scopes],
+          purpose: "mobile-full",
+        }
+      : PAIRING_SETUP_BOOTSTRAP_PROFILE,
   });
   return {
-    url,
+    url: params.url,
     bootstrapToken: issuedBootstrap.token,
     expiresAtMs: issuedBootstrap.expiresAtMs,
+    access: fullAccess ? "full" : "limited",
+    ...(accessDowngraded ? { accessDowngraded: true } : {}),
   };
 }
 
@@ -619,10 +521,6 @@ async function sendQrPngToSupportedChannel(params: {
 }): Promise<boolean> {
   const mediaLocalRoots = [path.dirname(params.qrFilePath)];
   const accountId = normalizeOptionalString(params.ctx.accountId) || undefined;
-  const sender = QR_CHANNEL_SENDERS[params.ctx.channel];
-  if (!sender) {
-    return false;
-  }
   const adapter = await params.api.runtime.channel.outbound.loadAdapter(params.ctx.channel);
   const send = adapter?.sendMedia;
   if (!send) {
@@ -632,12 +530,19 @@ async function sendQrPngToSupportedChannel(params: {
     cfg: params.api.config,
     to: params.target,
     text: params.caption,
-    ...sender.createOpts({
-      ctx: params.ctx,
-      qrFilePath: params.qrFilePath,
-      mediaLocalRoots,
-      accountId,
-    }),
+    ...(params.ctx.channel === "whatsapp" ? { verbose: false } : {}),
+    mediaUrl: params.qrFilePath,
+    mediaLocalRoots,
+    ...(params.ctx.messageThreadId != null &&
+    (params.ctx.channel === "telegram" || params.ctx.channel === "slack")
+      ? {
+          threadId:
+            params.ctx.channel === "slack"
+              ? String(params.ctx.messageThreadId)
+              : params.ctx.messageThreadId,
+        }
+      : {}),
+    ...(accountId ? { accountId } : {}),
   });
   return true;
 }
@@ -665,8 +570,13 @@ export default definePluginEntry({
       name: "pair",
       description: "Generate setup codes and approve device pairing requests.",
       acceptsArgs: true,
+      clientPresentation: {
+        when: "no-arguments",
+        action: { kind: "device-pairing" },
+      },
       requiredScopes: ["operator.pairing"],
       handler: async (ctx) => {
+        const assertAdmittedOwner = ctx.assertOwnerCurrent;
         const args = normalizeOptionalString(ctx.args) ?? "";
         const tokens = args.split(/\s+/).filter(Boolean);
         const action = normalizeLowercaseStringOrEmpty(tokens[0]);
@@ -676,6 +586,7 @@ export default definePluginEntry({
         const {
           buildMissingPairingScopeReply,
           buildMissingSetupHandoffScopeReply,
+          resolveAuthLabel,
           resolvePairingCommandAuthState,
         } = await loadPairCommandAuthModule();
         const authState = resolvePairingCommandAuthState({
@@ -683,6 +594,9 @@ export default definePluginEntry({
           gatewayClientScopes,
           senderIsOwner: ctx.senderIsOwner,
         });
+        const assertOwnerCurrent = authState.isInternalGatewayCaller
+          ? undefined
+          : assertAdmittedOwner;
         api.logger.info?.(
           `device-pair: /pair invoked channel=${ctx.channel} sender=${ctx.senderId ?? "unknown"} action=${
             action || "new"
@@ -692,6 +606,7 @@ export default definePluginEntry({
         if (authState.isMissingPairingPrivilege) {
           return buildMissingPairingScopeReply();
         }
+        assertOwnerCurrent?.();
 
         if (action === "status" || action === "pending") {
           const [{ listDevicePairing }, { formatPendingRequests }] = await Promise.all([
@@ -699,6 +614,7 @@ export default definePluginEntry({
             loadNotifyModule(),
           ]);
           const list = await listDevicePairing();
+          assertOwnerCurrent?.();
           return { text: formatPendingRequests(list.pending) };
         }
 
@@ -707,7 +623,7 @@ export default definePluginEntry({
           const { handleNotifyCommand } = await loadNotifyModule();
           return await handleNotifyCommand({
             api,
-            ctx,
+            ctx: { ...ctx, assertOwnerCurrent },
             action: notifyAction,
           });
         }
@@ -732,12 +648,13 @@ export default definePluginEntry({
           return await approvePendingPairingRequest({
             requestId: pending.requestId,
             callerScopes: authState.approvalCallerScopes,
+            assertCurrent: assertOwnerCurrent,
           });
         }
 
         if (action === "cleanup" || action === "clear" || action === "revoke") {
           const { clearDeviceBootstrapTokens } = await loadDevicePairApiModule();
-          const cleared = await clearDeviceBootstrapTokens();
+          const cleared = await clearDeviceBootstrapTokens({ assertCurrent: assertOwnerCurrent });
           return {
             text:
               cleared.removed > 0
@@ -768,7 +685,10 @@ export default definePluginEntry({
           if (channel === "telegram" && target) {
             try {
               const { armPairNotifyOnce } = await loadNotifyModule();
-              autoNotifyArmed = await armPairNotifyOnce({ api, ctx });
+              autoNotifyArmed = await armPairNotifyOnce({
+                api,
+                ctx: { ...ctx, assertOwnerCurrent },
+              });
             } catch (err) {
               api.logger.warn?.(
                 `device-pair: failed to arm one-shot pairing notify (${(err as Error)?.message ?? err})`,
@@ -776,17 +696,20 @@ export default definePluginEntry({
             }
           }
 
-          let payload = await issueSetupPayload(urlResult.url);
+          let payload = await issueSetupPayload({
+            url: urlResult.url,
+            allowFullAccess: authState.canIssueFullAccessSetup,
+            assertCurrent: assertOwnerCurrent,
+          });
           let setupCode = encodeSetupCode(payload);
 
           const infoLines = buildQrInfoLines({
             payload,
             authLabel,
             autoNotifyArmed,
-            expiresAtMs: payload.expiresAtMs,
           });
 
-          if (target && canSendQrPngToChannel(channel)) {
+          if (target && QR_SUPPORTED_CHANNELS.has(channel)) {
             let qrFilePath: string | undefined;
             try {
               const { resolvePreferredOpenClawTmpDir, writeQrPngTempFile } =
@@ -821,7 +744,11 @@ export default definePluginEntry({
                 `device-pair: QR image send failed channel=${channel}, falling back (${(err as Error)?.message ?? err})`,
               );
               await revokeDeviceBootstrapToken({ token: payload.bootstrapToken }).catch(() => {});
-              payload = await issueSetupPayload(urlResult.url);
+              payload = await issueSetupPayload({
+                url: urlResult.url,
+                allowFullAccess: authState.canIssueFullAccessSetup,
+                assertCurrent: assertOwnerCurrent,
+              });
               setupCode = encodeSetupCode(payload);
             } finally {
               if (qrFilePath) {
@@ -834,17 +761,20 @@ export default definePluginEntry({
 
           api.logger.info?.(`device-pair: QR fallback channel=${channel} target=${target}`);
           if (channel === "webchat") {
-            let qrDataUrl: string;
             try {
               const { renderQrPngDataUrl } = await loadDevicePairApiModule();
-              qrDataUrl = await renderQrPngDataUrl(setupCode);
+              await renderQrPngDataUrl(setupCode);
             } catch (err) {
               const { revokeDeviceBootstrapToken } = await loadDevicePairApiModule();
               api.logger.warn?.(
                 `device-pair: webchat QR render failed, falling back (${(err as Error)?.message ?? err})`,
               );
               await revokeDeviceBootstrapToken({ token: payload.bootstrapToken }).catch(() => {});
-              payload = await issueSetupPayload(urlResult.url);
+              payload = await issueSetupPayload({
+                url: urlResult.url,
+                allowFullAccess: authState.canIssueFullAccessSetup,
+                assertCurrent: assertOwnerCurrent,
+              });
               return {
                 text:
                   "QR image delivery is not available on this channel right now, so I generated a pasteable setup code instead.\n\n" +
@@ -855,14 +785,17 @@ export default definePluginEntry({
               text: [
                 "Scan this QR code with the OpenClaw iOS app:",
                 "",
-                formatQrInfoMarkdown({
+                buildQrInfoLines({
                   payload,
                   authLabel,
                   autoNotifyArmed,
-                  expiresAtMs: payload.expiresAtMs,
-                }),
+                  markdown: true,
+                }).join("\n"),
               ].join("\n"),
-              mediaUrl: qrDataUrl,
+              channelData: buildDevicePairPairingQrChannelData({
+                setupCode,
+                expiresAtMs: payload.expiresAtMs,
+              }),
               sensitiveMedia: true,
             };
           }
@@ -879,7 +812,11 @@ export default definePluginEntry({
           normalizeOptionalString(ctx.from) ||
           normalizeOptionalString(ctx.to) ||
           "";
-        const payload = await issueSetupPayload(urlResult.url);
+        const payload = await issueSetupPayload({
+          url: urlResult.url,
+          allowFullAccess: authState.canIssueFullAccessSetup,
+          assertCurrent: assertOwnerCurrent,
+        });
 
         if (channel === "telegram" && target) {
           try {
@@ -925,3 +862,4 @@ export default definePluginEntry({
     });
   },
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

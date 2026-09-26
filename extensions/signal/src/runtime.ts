@@ -6,9 +6,8 @@ const {
   setRuntime: setSignalRuntime,
   getRuntime: getSignalRuntime,
   tryGetRuntime: getOptionalSignalRuntime,
-  clearRuntime: clearSignalRuntime,
 } = createPluginRuntimeStore<PluginRuntime>({
   pluginId: "signal",
   errorMessage: "Signal runtime not initialized",
 });
-export { clearSignalRuntime, getOptionalSignalRuntime, getSignalRuntime, setSignalRuntime };
+export { getOptionalSignalRuntime, getSignalRuntime, setSignalRuntime };

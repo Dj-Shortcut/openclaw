@@ -1,16 +1,11 @@
-/**
- * Integration-style tests for the public Bash/process tool barrel.
- * Exercises exec and process behavior through the shared exported tool factory.
- */
+/** Integration tests for the public Bash/process tool barrel and shared tool factory. */
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { drainFormattedSystemEvents } from "../auto-reply/reply/session-system-events.js";
 import type { OpenClawConfig } from "../config/config.js";
-import {
-  resetHeartbeatWakeStateForTests,
-  setHeartbeatWakeHandler,
-} from "../infra/heartbeat-wake.js";
-import { applyPathPrepend, findPathKey } from "../infra/path-prepend.js";
+import { requestHeartbeatAndWait, setHeartbeatWakeHandler } from "../infra/heartbeat-wake.js";
+import { findPathKey } from "../infra/path-prepend.js";
 import {
   peekSystemEventEntries,
   peekSystemEvents,
@@ -23,11 +18,15 @@ import {
   getFinishedSession,
   markBackgrounded,
   markExited,
-  resetProcessRegistryForTests,
   type ProcessSession,
+  resolveProcessCleanupMs,
+  waitForExecScope,
 } from "./bash-process-registry.js";
+import { resetProcessRegistryForTests } from "./bash-process-registry.test-support.js";
+import * as supervisorExit from "./bash-tools.exec-runtime.test-support.js";
 import { createExecTool, createProcessTool } from "./bash-tools.js";
-import { resolveShellFromPath, sanitizeBinaryOutput } from "./shell-utils.js";
+import { acknowledgeInternalToolResult } from "./runtime/internal-hooks.js";
+import { getBashShellConfig, sanitizeBinaryOutput } from "./shell-utils.js";
 
 vi.mock("../infra/channel-summary.js", () => ({
   buildChannelSummary: vi.fn(async () => []),
@@ -53,7 +52,7 @@ vi.mock("../infra/exec-approval-surface.js", () => ({
     !channel || channel === "internal" || channel === "tui",
 }));
 
-vi.mock("../utils/delivery-context.js", () => ({
+vi.mock("../utils/delivery-context.shared.js", () => ({
   normalizeDeliveryContext: (context?: {
     channel?: string | null;
     to?: string | number | null;
@@ -80,7 +79,6 @@ vi.mock("../utils/delivery-context.js", () => ({
 }));
 
 vi.mock("./bash-tools.exec-approval-followup.js", () => ({
-  buildExecApprovalFollowupPrompt: (text: string) => text,
   sendExecApprovalFollowup: vi.fn(async () => false),
 }));
 
@@ -99,10 +97,10 @@ vi.mock("../infra/shell-env.js", async () => {
   };
 });
 
-vi.mock("../process/supervisor/index.js", () => {
+vi.mock("../process/supervisor/index.js", async () => {
+  const { takeHeldSupervisorExit } = await import("./bash-tools.exec-runtime.test-support.js");
   type SpawnInput = {
     argv?: string[];
-    ptyCommand?: string;
     env?: NodeJS.ProcessEnv;
     onStdout?: (chunk: string) => void;
   };
@@ -117,7 +115,7 @@ vi.mock("../process/supervisor/index.js", () => {
   const writeEnvPath = (env: NodeJS.ProcessEnv, value: string) => {
     env[readPathKey(env)] = value;
   };
-  const extractCommand = (input: SpawnInput) => input.ptyCommand ?? input.argv?.at(-1) ?? "";
+  const extractCommand = (input: SpawnInput) => input.argv?.at(-1) ?? "";
   const parseShellSingleQuoted = (input: string) => {
     if (!input.startsWith("'")) {
       return null;
@@ -195,6 +193,7 @@ vi.mock("../process/supervisor/index.js", () => {
   return {
     getProcessSupervisor: () => ({
       spawn: async (input: SpawnInput) => {
+        const exitGate = takeHeldSupervisorExit();
         const command = extractCommand(input);
         const output = commandOutput(command, input.env);
         const exitCode = splitCommands(unwrapSnapshotEvalCommand(command)).includes("exit 1")
@@ -207,17 +206,26 @@ vi.mock("../process/supervisor/index.js", () => {
         if (stagedOutput) {
           input.onStdout?.(stagedOutput);
         }
+        const activity = { resultSettled: false, lastOutputAtMs: Date.now() };
         return {
+          activity,
           runId: "mock-bash-run",
           startedAtMs: Date.now(),
           pid: 123,
           stdin: undefined,
           wait: async () => {
-            await immediate();
-            await immediate();
+            if (exitGate) {
+              exitGate.markStarted();
+              await exitGate.wait;
+            } else {
+              await immediate();
+              await immediate();
+            }
             if (deferredOutput) {
               input.onStdout?.(deferredOutput);
+              activity.lastOutputAtMs = Date.now();
             }
+            activity.resultSettled = true;
             return {
               reason: "exit" as const,
               exitCode,
@@ -234,8 +242,6 @@ vi.mock("../process/supervisor/index.js", () => {
       },
       cancel: vi.fn(),
       cancelScope: vi.fn(),
-      reconcileOrphans: vi.fn(),
-      getRecord: vi.fn(),
     }),
   };
 });
@@ -243,7 +249,7 @@ vi.mock("../process/supervisor/index.js", () => {
 const isWin = process.platform === "win32";
 const defaultShell = isWin
   ? undefined
-  : process.env.OPENCLAW_TEST_SHELL || resolveShellFromPath("bash") || process.env.SHELL || "sh";
+  : process.env.OPENCLAW_TEST_SHELL || getBashShellConfig().shell;
 // PowerShell: Start-Sleep for delays, ; for command separation, $null for null device
 const shortDelayCmd = isWin ? "Start-Sleep -Milliseconds 4" : "sleep 0.004";
 const POLL_INTERVAL_MS = isWin ? 15 : 2;
@@ -277,6 +283,7 @@ const TEST_EXEC_DEFAULTS = {
   host: "gateway" as const,
   security: "full" as const,
   ask: "off" as const,
+  bypassHostApprovalFloors: true,
 };
 const DEFAULT_NOTIFY_SESSION_KEY = "agent:main:main";
 const ECHO_HI_COMMAND = shellEcho("hi");
@@ -306,7 +313,6 @@ const createNotifyOnExitExecTool = (overrides: Partial<ExecToolConfig> = {}) =>
     allowBackground: true,
     backgroundMs: 0,
     notifyOnExit: true,
-    notifyOnExitEmptySuccess: true,
     sessionKey: DEFAULT_NOTIFY_SESSION_KEY,
     ...overrides,
   });
@@ -345,22 +351,6 @@ const readTotalLines = (details: unknown) => (details as { totalLines?: number }
 const readProcessStatus = (details: unknown) => (details as { status?: string }).status;
 const readProcessStatusOrRunning = (details: unknown) =>
   readProcessStatus(details) ?? PROCESS_STATUS_RUNNING;
-const expectTextContainsValues = (
-  text: string,
-  values: string[] | undefined,
-  shouldContain: boolean,
-) => {
-  if (!values) {
-    return;
-  }
-  for (const value of values) {
-    if (shouldContain) {
-      expect(text).toContain(value);
-    } else {
-      expect(text).not.toContain(value);
-    }
-  }
-};
 type ProcessSessionSummary = { sessionId: string; name?: string };
 const hasSession = (sessions: ProcessSessionSummary[], sessionId: string) =>
   sessions.some((session) => session.sessionId === sessionId);
@@ -411,17 +401,6 @@ function useCapturedEnv(keys: string[], afterCapture?: () => void) {
   });
 }
 
-async function waitForCompletion(sessionId: string) {
-  let status = PROCESS_STATUS_RUNNING;
-  await expect
-    .poll(async () => {
-      status = (await pollProcessSession({ tool: processTool, sessionId })).status;
-      return status;
-    }, BACKGROUND_POLL_OPTIONS)
-    .not.toBe(PROCESS_STATUS_RUNNING);
-  return status;
-}
-
 function requireSessionId(details: { sessionId?: string }): string {
   if (!details.sessionId) {
     throw new Error("expected sessionId in exec result details");
@@ -433,24 +412,28 @@ const requireRunningSessionId = (result: { details: unknown }) => {
   return requireSessionId(result.details as { sessionId?: string });
 };
 
-function hasNotifyEventForPrefix(prefix: string, sessionKey = DEFAULT_NOTIFY_SESSION_KEY): boolean {
-  return peekSystemEvents(sessionKey).some((event) => event.includes(prefix));
+function hasNotifyEventForSession(
+  sessionId: string,
+  sessionKey = DEFAULT_NOTIFY_SESSION_KEY,
+): boolean {
+  return peekSystemEventEntries(sessionKey).some(
+    (event) => event.contextKey === `exec:${sessionId}`,
+  );
 }
 
 async function waitForNotifyEvent(sessionId: string, sessionKey = DEFAULT_NOTIFY_SESSION_KEY) {
-  const prefix = sessionId.slice(0, 8);
   let finished = getFinishedSession(sessionId);
-  let hasEvent = hasNotifyEventForPrefix(prefix, sessionKey);
+  let hasEvent = hasNotifyEventForSession(sessionId, sessionKey);
   await expect
     .poll(() => {
       finished = getFinishedSession(sessionId);
-      hasEvent = hasNotifyEventForPrefix(prefix, sessionKey);
+      hasEvent = hasNotifyEventForSession(sessionId, sessionKey);
       return Boolean(finished && hasEvent);
     }, NOTIFY_POLL_OPTIONS)
     .toBe(true);
   return {
     finished: finished ?? getFinishedSession(sessionId),
-    hasEvent: hasEvent || hasNotifyEventForPrefix(prefix),
+    hasEvent: hasEvent || hasNotifyEventForSession(sessionId),
   };
 }
 
@@ -477,16 +460,11 @@ async function expectNotifyOnExitWake(tool: ExecToolInstance, expected: Record<s
 async function drainNotifyEvents(sessionKey = DEFAULT_NOTIFY_SESSION_KEY) {
   return await drainFormattedSystemEvents({
     cfg: notifyCfg,
+    agentId: "main",
     sessionKey,
     isMainSession: false,
     isNewSession: false,
   });
-}
-
-async function runBackgroundCommandToCompletion(tool: ExecToolInstance, command: string) {
-  const sessionId = await startBackgroundCommand(tool, command);
-  const status = await waitForCompletion(sessionId);
-  return { sessionId, status };
 }
 
 type ProcessLogWindow = { offset?: number; limit?: number };
@@ -498,27 +476,6 @@ async function readProcessLog(sessionId: string, options: ProcessLogWindow = {})
   });
 }
 
-const LONG_LOG_LINE_COUNT = 201;
-type LongLogExpectationCase = LabeledCase & {
-  options?: ProcessLogWindow;
-  firstLine: string;
-  lastLine?: string;
-  mustContain?: string[];
-  mustNotContain?: string[];
-};
-type ShortLogExpectationCase = LabeledCase & {
-  lines: string[];
-  options: ProcessLogWindow;
-  expectedText: string;
-  expectedTotalLines: number;
-};
-type ProcessLogSnapshot = {
-  text: string;
-  normalizedText: string;
-  lines: string[];
-  totalLines: number | undefined;
-};
-const EXPECTED_TOTAL_LINES_THREE = 3;
 type DisallowedElevationCase = LabeledCase & {
   defaultLevel: "off" | "on";
   overrides?: Partial<ExecToolConfig>;
@@ -527,12 +484,26 @@ type DisallowedElevationCase = LabeledCase & {
   expectedOutputIncludes?: string;
 };
 type NotifyNoopCase = LabeledCase & {
-  notifyOnExitEmptySuccess: boolean;
+  defaults?: Partial<ExecToolConfig>;
+  expectNotification: boolean;
 };
 const NOOP_NOTIFY_CASES: NotifyNoopCase[] = [
-  withLabel("default behavior skips no-op completion events", { notifyOnExitEmptySuccess: false }),
+  withLabel("default behavior skips no-op completion events", { expectNotification: false }),
+  withLabel("chat providers default no-op completion notifications on", {
+    defaults: { messageProvider: " Telegram " },
+    expectNotification: true,
+  }),
+  withLabel("explicit false keeps chat provider no-op completions silent", {
+    defaults: { messageProvider: "telegram", notifyOnExitEmptySuccess: false },
+    expectNotification: false,
+  }),
+  withLabel("generic providers keep no-op completions silent by default", {
+    defaults: { messageProvider: "generic" },
+    expectNotification: false,
+  }),
   withLabel("explicitly enabling no-op completion emits completion events", {
-    notifyOnExitEmptySuccess: true,
+    defaults: { notifyOnExitEmptySuccess: true },
+    expectNotification: true,
   }),
 ];
 const DISALLOWED_ELEVATION_CASES: DisallowedElevationCase[] = [
@@ -554,39 +525,13 @@ const DISALLOWED_ELEVATION_CASES: DisallowedElevationCase[] = [
     expectedOutputIncludes: "hi",
   }),
 ];
-const SHORT_LOG_EXPECTATION_CASES: ShortLogExpectationCase[] = [
-  withLabel("logs line-based slices and defaults to last lines", {
-    lines: ["one", "two", "three"],
-    options: { limit: 2 },
-    expectedText: "two\nthree",
-    expectedTotalLines: EXPECTED_TOTAL_LINES_THREE,
-  }),
-  withLabel("supports line offsets for log slices", {
-    lines: ["alpha", "beta", "gamma"],
-    options: { offset: 1, limit: 1 },
-    expectedText: "beta",
-    expectedTotalLines: EXPECTED_TOTAL_LINES_THREE,
-  }),
-];
-const LONG_LOG_EXPECTATION_CASES: LongLogExpectationCase[] = [
-  withLabel("applies default tail only when no explicit log window is provided", {
-    firstLine: "line-2",
-    mustContain: ["showing last 200 of 201 lines", "line-2", "line-201"],
-  }),
-  withLabel("keeps offset-only log requests unbounded by default tail mode", {
-    options: { offset: 30 },
-    firstLine: "line-31",
-    lastLine: "line-201",
-    mustNotContain: ["showing last 200"],
-  }),
-];
 const expectNotifyNoopEvents = (
   events: string[],
-  notifyOnExitEmptySuccess: boolean,
+  expectNotification: boolean,
   sessionId: string,
   label: string,
 ) => {
-  if (!notifyOnExitEmptySuccess) {
+  if (!expectNotification) {
     expect(events, label).toStrictEqual([]);
     return;
   }
@@ -615,40 +560,18 @@ const runDisallowedElevationCase = async ({
   }
   expect(readTextContent(result.content) ?? "").toContain(expectedOutputIncludes);
 };
-const runShortLogExpectationCase = async ({
-  lines,
-  options,
-  expectedText,
-  expectedTotalLines,
-}: ShortLogExpectationCase) => {
-  const snapshot = await readBackgroundLogSnapshot(lines, options);
-  expect(snapshot.normalizedText).toBe(expectedText);
-  expect(snapshot.totalLines).toBe(expectedTotalLines);
-};
-const readBackgroundLogSnapshot = async (
-  lines: string[],
-  options: ProcessLogWindow = {},
-): Promise<ProcessLogSnapshot> => {
-  const sessionId = seedFinishedLogSession(lines);
-  const log = await readProcessLog(sessionId, options);
-  return {
-    text: readTextContent(log.content) ?? "",
-    normalizedText: readNormalizedTextContent(log.content),
-    lines: readTrimmedLines(log.content),
-    totalLines: readTotalLines(log.details),
-  };
-};
 const seedFinishedLogSession = (lines: string[]) => {
   const session: ProcessSession = {
     id: `seeded-log-${nextCallId()}`,
     command: "seeded log",
+    cleanupMs: resolveProcessCleanupMs(),
     startedAt: Date.now(),
     maxOutputChars: 100_000,
     pendingMaxOutputChars: 100_000,
-    pendingStdout: [],
-    pendingStderr: [],
+    pendingOutput: [],
     pendingStdoutChars: 0,
     pendingStderrChars: 0,
+    pendingOutputDropped: false,
     totalOutputChars: 0,
     aggregated: "",
     tail: "",
@@ -663,65 +586,16 @@ const seedFinishedLogSession = (lines: string[]) => {
   markExited(session, 0, null, PROCESS_STATUS_COMPLETED);
   return session.id;
 };
-const runLongLogExpectationCase = async ({
-  options,
-  firstLine,
-  lastLine,
-  mustContain,
-  mustNotContain,
-}: LongLogExpectationCase) => {
-  const snapshot = await readBackgroundLogSnapshot(
-    Array.from({ length: LONG_LOG_LINE_COUNT }, (_value, index) => `line-${index + 1}`),
-    options,
-  );
-  expect(snapshot.lines[0]).toBe(firstLine);
-  if (lastLine) {
-    expect(snapshot.lines[snapshot.lines.length - 1]).toBe(lastLine);
-  }
-  expect(snapshot.totalLines).toBe(LONG_LOG_LINE_COUNT);
-  expectTextContainsValues(snapshot.text, mustContain, true);
-  expectTextContainsValues(snapshot.text, mustNotContain, false);
-};
-const runNotifyNoopCase = async ({ label, notifyOnExitEmptySuccess }: NotifyNoopCase) => {
-  const tool = createNotifyOnExitExecTool({ notifyOnExitEmptySuccess });
+const runNotifyNoopCase = async ({ label, defaults, expectNotification }: NotifyNoopCase) => {
+  const tool = createNotifyOnExitExecTool(defaults);
 
-  const { sessionId, status } = await runBackgroundCommandToCompletion(tool, COMMAND_NOOP);
-  expect(status).toBe(PROCESS_STATUS_COMPLETED);
+  const sessionId = await startBackgroundCommand(tool, COMMAND_NOOP);
+  await expect
+    .poll(() => getFinishedSession(sessionId)?.terminalStatus, BACKGROUND_POLL_OPTIONS)
+    .toBe(PROCESS_STATUS_COMPLETED);
   const events = peekSystemEvents(DEFAULT_NOTIFY_SESSION_KEY);
-  expectNotifyNoopEvents(events, notifyOnExitEmptySuccess, sessionId, label);
+  expectNotifyNoopEvents(events, expectNotification, sessionId, label);
 };
-
-describe("tool descriptions", () => {
-  it("adds cron-specific deferred follow-up guidance only when cron is available", () => {
-    const execWithCron = createTestExecTool({ hasCronTool: true });
-    const processWithCron = createProcessTool({ hasCronTool: true });
-
-    expect(execWithCron.description).toContain(
-      "rely on automatic completion wake when it is enabled and the command emits output or fails; otherwise use process to confirm completion. Use process whenever you need logs, status, input, or intervention.",
-    );
-    expect(processWithCron.description).toContain(
-      "completion confirmation when automatic completion wake is unavailable.",
-    );
-    expect(processWithCron.description).toContain(
-      "Use write/send-keys/submit/paste/kill for input or intervention.",
-    );
-    expect(execWithCron.description).toContain(
-      "Do not use exec sleep or delay loops for reminders or deferred follow-ups; use cron instead.",
-    );
-    expect(processWithCron.description).toContain(
-      "Do not use process polling to emulate timers or reminders; use cron for scheduled follow-ups.",
-    );
-    expect(execTool.description).not.toContain("use cron instead");
-    expect(processTool.description).not.toContain("scheduled follow-ups");
-    expect(execTool.description).toContain("otherwise use process to confirm completion");
-    expect(processTool.description).toContain(
-      "completion confirmation when automatic completion wake is unavailable",
-    );
-    expect(processTool.description).toContain(
-      "Use write/send-keys/submit/paste/kill for input or intervention.",
-    );
-  });
-});
 
 beforeEach(() => {
   callIdCounter = 0;
@@ -735,26 +609,23 @@ describe("exec tool backgrounding", () => {
   it(
     "backgrounds after yield and can be polled",
     async () => {
-      const result = await executeExecCommand(execTool, shellEcho(OUTPUT_DONE), { yieldMs: 0 });
-
-      // Timing can race here: command may already be complete before the first response.
-      if (result.details.status === PROCESS_STATUS_COMPLETED) {
-        expect(readTextContent(result.content) ?? "").toContain(OUTPUT_DONE);
-        return;
-      }
-
-      const sessionId = requireRunningSessionId(result);
-
-      let output = "";
-      await expect
-        .poll(async () => {
-          const pollResult = await pollProcessSession({ tool: processTool, sessionId });
-          output = pollResult.output ?? "";
-          return pollResult.status;
-        }, BACKGROUND_POLL_OPTIONS)
-        .toBe(PROCESS_STATUS_COMPLETED);
-
-      expect(output).toContain(OUTPUT_DONE);
+      const scopeKey = "test:background-yield";
+      const tool = createTestExecTool({ scopeKey });
+      const sessionId = await supervisorExit.withHeldSupervisorExit(
+        async (heldExit) => {
+          const execution = executeExecCommand(tool, shellEcho(OUTPUT_DONE), { yieldMs: 10 });
+          await Promise.race([heldExit.waitStarted, execution]);
+          await vi.advanceTimersByTimeAsync(10);
+          return requireRunningSessionId(await execution);
+        },
+        () => waitForExecScope(scopeKey),
+      );
+      const pollResult = await pollProcessSession({
+        tool: processTool,
+        sessionId,
+      });
+      expect(pollResult.status).toBe(PROCESS_STATUS_COMPLETED);
+      expect(pollResult.output).toContain(OUTPUT_DONE);
     },
     isWin ? 15_000 : 5_000,
   );
@@ -772,12 +643,49 @@ describe("exec tool backgrounding", () => {
     runDisallowedElevationCase,
   );
 
-  it.each<ShortLogExpectationCase>(SHORT_LOG_EXPECTATION_CASES)(
-    "$label",
-    runShortLogExpectationCase,
-  );
+  it.each([
+    {
+      name: "logs line-based slices and defaults to last lines",
+      lines: ["one", "two", "three"],
+      options: { limit: 2 },
+      expectedText: "two\nthree",
+    },
+    {
+      name: "supports line offsets for log slices",
+      lines: ["alpha", "beta", "gamma"],
+      options: { offset: 1, limit: 1 },
+      expectedText: "beta",
+    },
+  ])("$name", async ({ lines, options, expectedText }) => {
+    const log = await readProcessLog(seedFinishedLogSession(lines), options);
+    expect(readNormalizedTextContent(log.content)).toBe(expectedText);
+    expect(readTotalLines(log.details)).toBe(3);
+  });
 
-  it.each<LongLogExpectationCase>(LONG_LOG_EXPECTATION_CASES)("$label", runLongLogExpectationCase);
+  it("applies default tail only when no explicit log window is provided", async () => {
+    const sessionId = seedFinishedLogSession(
+      Array.from({ length: 201 }, (_value, index) => `line-${index + 1}`),
+    );
+    const log = await readProcessLog(sessionId);
+    expect(readTrimmedLines(log.content)[0]).toBe("line-2");
+    expect(readTotalLines(log.details)).toBe(201);
+    for (const expected of ["showing last 200 of 201 lines", "line-2", "line-201"]) {
+      expect(readTextContent(log.content)).toContain(expected);
+    }
+  });
+
+  it("keeps offset-only log requests unbounded by default tail mode", async () => {
+    const sessionId = seedFinishedLogSession(
+      Array.from({ length: 201 }, (_value, index) => `line-${index + 1}`),
+    );
+    const log = await readProcessLog(sessionId, { offset: 30 });
+    const lines = readTrimmedLines(log.content);
+    expect(lines[0]).toBe("line-31");
+    expect(lines.at(-1)).toBe("line-201");
+    expect(readTotalLines(log.details)).toBe(201);
+    expect(readTextContent(log.content)).not.toContain("showing last 200");
+  });
+
   it("scopes process sessions by scopeKey", async () => {
     const alphaTools = createScopedToolSet(SCOPE_KEY_ALPHA);
     const betaTools = createScopedToolSet(SCOPE_KEY_BETA);
@@ -816,13 +724,29 @@ describe("exec exit codes", () => {
 describe("exec notifyOnExit", () => {
   useCapturedEnv([...SHELL_ENV_KEYS], applyDefaultShellEnv);
 
-  beforeEach(() => {
-    resetHeartbeatWakeStateForTests();
-  });
+  async function drainPendingHeartbeatWakes(): Promise<void> {
+    const dispose = setHeartbeatWakeHandler(async () => ({ status: "ran", durationMs: 0 }));
+    try {
+      // An older session wake can call the handler before this cleanup barrier settles.
+      await expect(
+        requestHeartbeatAndWait(
+          {
+            source: "other",
+            intent: "immediate",
+            reason: "test-cleanup",
+            coalesceMs: 0,
+          },
+          { abortSignal: AbortSignal.timeout(NOTIFY_EVENT_TIMEOUT_MS) },
+        ),
+      ).resolves.toEqual({ status: "ran", durationMs: 0 });
+    } finally {
+      dispose();
+    }
+  }
 
-  afterEach(() => {
-    resetHeartbeatWakeStateForTests();
-  });
+  beforeEach(drainPendingHeartbeatWakes);
+
+  afterEach(drainPendingHeartbeatWakes);
 
   it("enqueues a system event when a backgrounded exec exits", async () => {
     const tool = createNotifyOnExitExecTool();
@@ -830,17 +754,33 @@ describe("exec notifyOnExit", () => {
     const sessionId = await startBackgroundCommand(tool, shellEcho("notify"));
 
     const { finished, hasEvent } = await waitForNotifyEvent(sessionId);
-    const queuedEvent = peekSystemEventEntries(DEFAULT_NOTIFY_SESSION_KEY).find((event) =>
-      event.text.includes(sessionId.slice(0, 8)),
+    const queuedEvent = peekSystemEventEntries(DEFAULT_NOTIFY_SESSION_KEY).find(
+      (event) => event.contextKey === `exec:${sessionId}`,
     );
     const formatted = await drainNotifyEvents();
 
     expect(finished?.id).toBe(sessionId);
-    expect(finished?.status).toBe(PROCESS_STATUS_COMPLETED);
+    expect(finished?.terminalStatus).toBe(PROCESS_STATUS_COMPLETED);
     expect(finished?.exitCode).toBe(0);
     expect(hasEvent).toBe(true);
     expect(queuedEvent).toBeDefined();
     expect(formatted).toBeUndefined();
+  });
+
+  it("consumes only the acknowledged poll's completion event", async () => {
+    const tool = createNotifyOnExitExecTool();
+    const unpolledSessionId = await startBackgroundCommand(tool, shellEcho("unpolled"));
+    await waitForNotifyEvent(unpolledSessionId);
+    const sessionId = await startBackgroundCommand(tool, shellEcho("polled"));
+    await waitForNotifyEvent(sessionId);
+    const queued = peekSystemEventEntries(DEFAULT_NOTIFY_SESSION_KEY);
+    const poll = await executeProcessTool(processTool, { action: "poll", sessionId });
+
+    expect(readProcessStatus(poll.details)).toBe(PROCESS_STATUS_COMPLETED);
+    expect(peekSystemEventEntries(DEFAULT_NOTIFY_SESSION_KEY)).toEqual(queued);
+    acknowledgeInternalToolResult(poll);
+    expect(hasNotifyEventForSession(sessionId)).toBe(false);
+    expect(hasNotifyEventForSession(unpolledSessionId)).toBe(true);
   });
 
   it("preserves the origin delivery context on background exec completion events", async () => {
@@ -855,8 +795,8 @@ describe("exec notifyOnExit", () => {
     const sessionId = await startBackgroundCommand(tool, shellEcho("notify"));
 
     await waitForNotifyEvent(sessionId, sessionKey);
-    const queuedEvent = peekSystemEventEntries(sessionKey).find((event) =>
-      event.text.includes(sessionId.slice(0, 8)),
+    const queuedEvent = peekSystemEventEntries(sessionKey).find(
+      (event) => event.contextKey === `exec:${sessionId}`,
     );
 
     expect(queuedEvent).toBeDefined();
@@ -871,14 +811,6 @@ describe("exec notifyOnExit", () => {
       intent: "event",
       reason: "exec-event",
       sessionKey: DEFAULT_NOTIFY_SESSION_KEY,
-    });
-  });
-
-  it("keeps notifyOnExit heartbeat wake unscoped for non-agent session keys", async () => {
-    await expectNotifyOnExitWake(createNotifyOnExitExecTool({ sessionKey: "global" }), {
-      source: "exec-event",
-      intent: "event",
-      reason: "exec-event",
     });
   });
 
@@ -903,7 +835,9 @@ describe("exec PATH handling", () => {
       expect(index).toBeGreaterThanOrEqual(0);
     }
     for (let i = 1; i < prependIndexes.length; i += 1) {
-      expect(prependIndexes[i]).toBeGreaterThan(prependIndexes[i - 1]);
+      expect(prependIndexes[i]).toBeGreaterThan(
+        expectDefined(prependIndexes[i - 1], "prependIndexes[i - 1] test invariant"),
+      );
     }
     const baseIndex = entries.indexOf(basePath);
     expect(baseIndex).toBeGreaterThanOrEqual(0);
@@ -931,56 +865,8 @@ describe("exec PATH handling", () => {
 });
 
 describe("findPathKey", () => {
-  it("returns PATH when key is uppercase", () => {
-    expect(findPathKey({ PATH: "/usr/bin" })).toBe("PATH");
-  });
-
-  it("returns Path when key is mixed-case (Windows style)", () => {
-    expect(findPathKey({ Path: "C:\\Windows\\System32" })).toBe("Path");
-  });
-
-  it("returns PATH as default when no PATH-like key exists", () => {
-    expect(findPathKey({ HOME: "/home/user" })).toBe("PATH");
-  });
-
   it("prefers uppercase PATH when both PATH and Path exist", () => {
     expect(findPathKey({ PATH: "/usr/bin", Path: "C:\\Windows" })).toBe("PATH");
-  });
-});
-
-describe("applyPathPrepend with case-insensitive PATH key", () => {
-  it("prepends to Path key on Windows-style env (no uppercase PATH)", () => {
-    const env: Record<string, string> = { Path: "C:\\Windows\\System32" };
-    applyPathPrepend(env, ["C:\\custom\\bin"]);
-    // Should write back to the same `Path` key, not create a new `PATH`
-    expect(env.Path).toContain("C:\\custom\\bin");
-    expect(env.Path).toContain("C:\\Windows\\System32");
-    expect("PATH" in env).toBe(false);
-  });
-
-  it("preserves all existing entries when prepending via Path key", () => {
-    // Use platform-appropriate paths and delimiters
-    const delim = path.delimiter;
-    const existing = isWin
-      ? ["C:\\Windows\\System32", "C:\\Windows", "C:\\Program Files\\nodejs"]
-      : ["/usr/bin", "/usr/local/bin", "/opt/node/bin"];
-    const prepend = isWin ? ["C:\\custom\\bin"] : ["/custom/bin"];
-    const existingPath = existing.join(delim);
-    const env: Record<string, string> = { Path: existingPath };
-    applyPathPrepend(env, prepend);
-    const parts = env.Path.split(delim);
-    expect(parts[0]).toBe(prepend[0]);
-    for (const entry of existing) {
-      expect(parts).toContain(entry);
-    }
-  });
-
-  it("respects requireExisting option with Path key", () => {
-    const env: Record<string, string> = { HOME: "/home/user" };
-    applyPathPrepend(env, ["C:\\custom\\bin"], { requireExisting: true });
-    // No Path/PATH key exists, so nothing should be written
-    expect("PATH" in env).toBe(false);
-    expect("Path" in env).toBe(false);
   });
 });
 
@@ -1068,23 +954,20 @@ describe("exec backgrounded onUpdate suppression", () => {
   it(
     "suppresses onUpdate after abort signal fires",
     async () => {
-      const onUpdateSpy = vi.fn();
       const abortController = new AbortController();
+      const onUpdateSpy = vi.fn(() => abortController.abort());
       // Run a command that produces output over time.
-      const command = joinCommands([
-        shellEcho("before-abort"),
-        shortDelayCmd,
-        shellEcho("after-abort"),
-      ]);
-      // Abort almost immediately so the signal fires while the command
-      // is still producing output.
-      setImmediate(() => abortController.abort());
-      await execTool.execute(nextCallId(), { command }, abortController.signal, onUpdateSpy);
-      const callsAtAbort = onUpdateSpy.mock.calls.length;
+      const beforeAbort = shellEcho("before-abort");
+      const afterAbort = shellEcho("after-abort");
+      const command = joinCommands([beforeAbort, shortDelayCmd, afterAbort]);
+      await expect(
+        execTool.execute(nextCallId(), { command }, abortController.signal, onUpdateSpy),
+      ).rejects.toMatchObject({ name: "AbortError" });
+      expect(onUpdateSpy).toHaveBeenCalledTimes(1);
       // Allow a tick for any straggling stdout data events.
       await waitOneTurn();
       // After abort, no new onUpdate calls should have been made.
-      expect(onUpdateSpy.mock.calls.length).toBe(callsAtAbort);
+      expect(onUpdateSpy).toHaveBeenCalledTimes(1);
     },
     isWin ? 10_000 : 5_000,
   );

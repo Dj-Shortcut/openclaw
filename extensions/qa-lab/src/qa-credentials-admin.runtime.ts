@@ -1,19 +1,18 @@
-// Qa Lab plugin module implements qa credentials admin behavior.
 import { randomUUID } from "node:crypto";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
+import { readResponseWithLimit } from "openclaw/plugin-sdk/response-limit-runtime";
 import { z } from "zod";
 import {
   joinQaCredentialEndpoint,
   normalizeQaCredentialConvexSiteUrl,
   normalizeQaCredentialEndpointPrefix,
   parseQaCredentialPositiveIntegerEnv,
-  QA_CREDENTIALS_DEFAULT_ENDPOINT_PREFIX,
 } from "./qa-credentials-common.runtime.js";
 import { fingerprintQaCredentialId } from "./qa-credentials-fingerprint.runtime.js";
 
-const DEFAULT_ENDPOINT_PREFIX = QA_CREDENTIALS_DEFAULT_ENDPOINT_PREFIX;
 const DEFAULT_HTTP_TIMEOUT_MS = 15_000;
+const QA_CREDENTIAL_ADMIN_MAX_RESPONSE_BYTES = 1024 * 1024;
 
 const actorRoleSchema = z.union([z.literal("ci"), z.literal("maintainer")]);
 const credentialStatusSchema = z.union([z.literal("active"), z.literal("disabled")]);
@@ -82,11 +81,9 @@ type AdminConfig = {
   actorId: string;
   authToken: string;
   addUrl: string;
-  endpointPrefix: string;
   httpTimeoutMs: number;
   listUrl: string;
   removeUrl: string;
-  siteUrl: string;
 };
 
 type AdminBaseOptions = {
@@ -131,7 +128,7 @@ function parsePositiveIntegerEnv(env: NodeJS.ProcessEnv, key: string, fallback: 
     env,
     key,
     fallback,
-    toError: (message) =>
+    createError: (message) =>
       new QaCredentialAdminError({
         code: "INVALID_ENV",
         message,
@@ -143,7 +140,7 @@ function normalizeConvexSiteUrl(raw: string, env: NodeJS.ProcessEnv): string {
   return normalizeQaCredentialConvexSiteUrl({
     raw,
     env,
-    toError: (message) =>
+    createError: (message) =>
       new QaCredentialAdminError({
         code: "INVALID_SITE_URL",
         message,
@@ -154,11 +151,10 @@ function normalizeConvexSiteUrl(raw: string, env: NodeJS.ProcessEnv): string {
 function normalizeEndpointPrefix(value: string | undefined): string {
   return normalizeQaCredentialEndpointPrefix({
     value,
-    fallback: DEFAULT_ENDPOINT_PREFIX,
     invalidAbsoluteMessage:
       '--endpoint-prefix must be an absolute path like "/qa-credentials/v1" (not //host).',
     invalidSegmentsMessage: '--endpoint-prefix must not contain backslashes or ".." path segments.',
-    toError: (message) =>
+    createError: (message) =>
       new QaCredentialAdminError({
         code: "INVALID_ARGUMENT",
         message,
@@ -175,13 +171,6 @@ function resolveAdminAuthToken(env: NodeJS.ProcessEnv): string {
     code: "MISSING_MAINTAINER_SECRET",
     message: "Missing OPENCLAW_QA_CONVEX_SECRET_MAINTAINER for qa credential admin commands.",
   });
-}
-
-function addQaCredentialDoctorCheck(
-  checks: QaCredentialDoctorCheck[],
-  check: QaCredentialDoctorCheck,
-) {
-  checks.push(check);
 }
 
 function summarizeQaCredentialDoctorStatus(checks: readonly QaCredentialDoctorCheck[]) {
@@ -203,7 +192,7 @@ export async function diagnoseQaCredentialBroker(options: AdminBaseOptions = {})
   let normalizedEndpointPrefix: string | null = null;
 
   if (!siteUrl) {
-    addQaCredentialDoctorCheck(checks, {
+    checks.push({
       name: "OPENCLAW_QA_CONVEX_SITE_URL",
       status: "fail",
       details: "missing Convex credential broker site URL",
@@ -211,13 +200,13 @@ export async function diagnoseQaCredentialBroker(options: AdminBaseOptions = {})
   } else {
     try {
       normalizedSiteUrl = normalizeConvexSiteUrl(siteUrl, env);
-      addQaCredentialDoctorCheck(checks, {
+      checks.push({
         name: "OPENCLAW_QA_CONVEX_SITE_URL",
         status: "pass",
         details: normalizedSiteUrl,
       });
     } catch (error) {
-      addQaCredentialDoctorCheck(checks, {
+      checks.push({
         name: "OPENCLAW_QA_CONVEX_SITE_URL",
         status: "fail",
         details: formatErrorMessage(error),
@@ -227,13 +216,13 @@ export async function diagnoseQaCredentialBroker(options: AdminBaseOptions = {})
 
   try {
     normalizedEndpointPrefix = normalizeEndpointPrefix(endpointPrefix);
-    addQaCredentialDoctorCheck(checks, {
+    checks.push({
       name: "OPENCLAW_QA_CONVEX_ENDPOINT_PREFIX",
       status: "pass",
       details: normalizedEndpointPrefix,
     });
   } catch (error) {
-    addQaCredentialDoctorCheck(checks, {
+    checks.push({
       name: "OPENCLAW_QA_CONVEX_ENDPOINT_PREFIX",
       status: "fail",
       details: formatErrorMessage(error),
@@ -245,7 +234,7 @@ export async function diagnoseQaCredentialBroker(options: AdminBaseOptions = {})
     ["OPENCLAW_QA_CONVEX_SECRET_MAINTAINER", "credential add/list/remove"],
   ] as const) {
     const present = Boolean(env[name]?.trim());
-    addQaCredentialDoctorCheck(checks, {
+    checks.push({
       name,
       status: present ? "pass" : "warn",
       details: present ? "set" : `missing; required for ${requiredFor}`,
@@ -258,13 +247,13 @@ export async function diagnoseQaCredentialBroker(options: AdminBaseOptions = {})
       "OPENCLAW_QA_CREDENTIAL_HTTP_TIMEOUT_MS",
       DEFAULT_HTTP_TIMEOUT_MS,
     );
-    addQaCredentialDoctorCheck(checks, {
+    checks.push({
       name: "OPENCLAW_QA_CREDENTIAL_HTTP_TIMEOUT_MS",
       status: "pass",
       details: `${timeoutMs}ms`,
     });
   } catch (error) {
-    addQaCredentialDoctorCheck(checks, {
+    checks.push({
       name: "OPENCLAW_QA_CREDENTIAL_HTTP_TIMEOUT_MS",
       status: "fail",
       details: formatErrorMessage(error),
@@ -282,20 +271,20 @@ export async function diagnoseQaCredentialBroker(options: AdminBaseOptions = {})
         siteUrl: normalizedSiteUrl,
         status: "active",
       });
-      addQaCredentialDoctorCheck(checks, {
+      checks.push({
         name: "broker admin/list",
         status: "pass",
         details: `reachable; sampled ${listed.credentials.length} active credential row${listed.credentials.length === 1 ? "" : "s"}`,
       });
     } catch (error) {
-      addQaCredentialDoctorCheck(checks, {
+      checks.push({
         name: "broker admin/list",
         status: "fail",
         details: formatErrorMessage(error),
       });
     }
   } else {
-    addQaCredentialDoctorCheck(checks, {
+    checks.push({
       name: "broker admin/list",
       status: "warn",
       details: "skipped; site URL and maintainer secret are required",
@@ -329,8 +318,6 @@ function resolveAdminConfig(options: AdminBaseOptions): AdminConfig {
   return {
     actorId,
     authToken: resolveAdminAuthToken(env),
-    siteUrl: normalizedSiteUrl,
-    endpointPrefix,
     httpTimeoutMs: parsePositiveIntegerEnv(
       env,
       "OPENCLAW_QA_CREDENTIAL_HTTP_TIMEOUT_MS",
@@ -375,6 +362,7 @@ async function postJson<T>(params: {
 }) {
   const httpTimeoutMs = resolveTimerTimeoutMs(params.httpTimeoutMs, DEFAULT_HTTP_TIMEOUT_MS);
   let response: Response;
+  let text: string;
   try {
     response = await params.fetchImpl(params.url, {
       method: "POST",
@@ -385,14 +373,21 @@ async function postJson<T>(params: {
       body: JSON.stringify(params.body),
       signal: AbortSignal.timeout(httpTimeoutMs),
     });
+    const responseBytes = await readResponseWithLimit(
+      response,
+      QA_CREDENTIAL_ADMIN_MAX_RESPONSE_BYTES,
+      {
+        onOverflow: ({ size, maxBytes }) =>
+          new Error(`Convex credential admin response exceeds ${maxBytes} bytes (${size} bytes)`),
+      },
+    );
+    text = new TextDecoder().decode(responseBytes);
   } catch (error) {
     throw new QaCredentialAdminError({
       code: "BROKER_REQUEST_FAILED",
       message: `Convex credential admin request failed: ${formatErrorMessage(error)}`,
     });
   }
-
-  const text = await response.text();
   const payload = parseJsonResponsePayload(text);
 
   const brokerError = toBrokerError(payload, response.status);
@@ -517,6 +512,6 @@ export async function listQaCredentialSets(options: ListQaCredentialSetsOptions)
   });
   return {
     ...result,
-    credentials: result.credentials.map((credential) => withQaCredentialFingerprint(credential)),
+    credentials: result.credentials.map(withQaCredentialFingerprint),
   };
 }

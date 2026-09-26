@@ -4,12 +4,12 @@
  * Uses docs paths instead of provider-specific instructions so guidance stays correct across OAuth/API-key providers.
  */
 import { join } from "node:path";
-import { getDocsPath } from "../config.js";
+import { getDocsPath } from "../package-metadata.js";
 
 const UNKNOWN_PROVIDER = "unknown";
 
 /** Returns the standard provider login help block. */
-export function getProviderLoginHelp(): string {
+function getProviderLoginHelp(): string {
   return [
     "Use /login to log into a provider via OAuth or API key. See:",
     `  ${join(getDocsPath(), "providers.md")}`,

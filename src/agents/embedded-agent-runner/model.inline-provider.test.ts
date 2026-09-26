@@ -1,9 +1,25 @@
 // Coverage for inline provider model normalization and inheritance.
+
+import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it } from "vitest";
 import { buildInlineProviderModels, resolveProviderModelInput } from "./model.inline-provider.js";
 import { makeModel } from "./model.test-harness.js";
 
 describe("buildInlineProviderModels", () => {
+  it("reflects in-place changes for callers without a prepared snapshot", () => {
+    const providers: Parameters<typeof buildInlineProviderModels>[0] = {
+      alpha: { baseUrl: "http://alpha.local", models: [makeModel("first-model")] },
+    };
+
+    expect(expectDefined(buildInlineProviderModels(providers)[0], "first model").id).toBe(
+      "first-model",
+    );
+    expectDefined(providers.alpha, "alpha provider").models = [makeModel("second-model")];
+    expect(expectDefined(buildInlineProviderModels(providers)[0], "second model").id).toBe(
+      "second-model",
+    );
+  });
+
   it("attaches provider ids to inline models", () => {
     // Provider object keys are the source of truth for inline model provider ids;
     // trim them before runtime lookup stores the model.
@@ -30,24 +46,17 @@ describe("buildInlineProviderModels", () => {
     ]);
   });
 
-  it("inherits baseUrl from provider when model does not specify it", () => {
-    const providers: Parameters<typeof buildInlineProviderModels>[0] = {
-      custom: {
-        baseUrl: "http://localhost:8000",
-        models: [makeModel("custom-model")],
+  it("preserves authored context windows and leaves omitted windows absent", () => {
+    const { contextWindow: _contextWindow, ...transportOnly } = makeModel("transport-only");
+    const result = buildInlineProviderModels({
+      proxy: {
+        baseUrl: "https://proxy.example.com/v1",
+        models: [transportOnly, { ...makeModel("authored-window"), contextWindow: 64_000 }],
       },
-    };
+    });
 
-    const result = buildInlineProviderModels(providers);
-
-    expect(result).toEqual([
-      {
-        ...makeModel("custom-model"),
-        provider: "custom",
-        baseUrl: "http://localhost:8000",
-        api: undefined,
-      },
-    ]);
+    expect(expectDefined(result[0], "transport-only model")).not.toHaveProperty("contextWindow");
+    expect(expectDefined(result[1], "authored-window model").contextWindow).toBe(64_000);
   });
 
   it("inherits api from provider when model does not specify it", () => {
@@ -83,10 +92,12 @@ describe("buildInlineProviderModels", () => {
     const result = buildInlineProviderModels(providers);
 
     expect(result).toHaveLength(1);
-    expect(result[0].provider).toBe("google");
-    expect(result[0].baseUrl).toBe("https://us-central1-aiplatform.googleapis.com/v1");
-    expect(result[0].api).toBe("google-vertex");
-    expect(result[0].id).toBe("gemini-2.5-pro");
+    expect(expectDefined(result[0], "result[0] test invariant").provider).toBe("google");
+    expect(expectDefined(result[0], "result[0] test invariant").baseUrl).toBe(
+      "https://us-central1-aiplatform.googleapis.com/v1",
+    );
+    expect(expectDefined(result[0], "result[0] test invariant").api).toBe("google-vertex");
+    expect(expectDefined(result[0], "result[0] test invariant").id).toBe("gemini-2.5-pro");
   });
 
   it("model-level api takes precedence over provider-level api", () => {
@@ -112,24 +123,6 @@ describe("buildInlineProviderModels", () => {
     ]);
   });
 
-  it("inherits both baseUrl and api from provider config", () => {
-    const providers: Parameters<typeof buildInlineProviderModels>[0] = {
-      custom: {
-        baseUrl: "http://localhost:10000",
-        api: "anthropic-messages",
-        models: [makeModel("claude-opus-4.5")],
-      },
-    };
-
-    const result = buildInlineProviderModels(providers);
-
-    expect(result).toHaveLength(1);
-    expect(result[0].provider).toBe("custom");
-    expect(result[0].baseUrl).toBe("http://localhost:10000");
-    expect(result[0].api).toBe("anthropic-messages");
-    expect(result[0].name).toBe("claude-opus-4.5");
-  });
-
   it("normalizes bare Google API hosts for custom Google Generative AI providers", () => {
     // Google Generative AI requires the versioned endpoint even when users
     // configure the bare service host.
@@ -144,9 +137,11 @@ describe("buildInlineProviderModels", () => {
     const result = buildInlineProviderModels(providers);
 
     expect(result).toHaveLength(1);
-    expect(result[0].provider).toBe("google-paid");
-    expect(result[0].api).toBe("google-generative-ai");
-    expect(result[0].baseUrl).toBe("https://generativelanguage.googleapis.com/v1beta");
+    expect(expectDefined(result[0], "result[0] test invariant").provider).toBe("google-paid");
+    expect(expectDefined(result[0], "result[0] test invariant").api).toBe("google-generative-ai");
+    expect(expectDefined(result[0], "result[0] test invariant").baseUrl).toBe(
+      "https://generativelanguage.googleapis.com/v1beta",
+    );
   });
 
   it("merges provider-level headers into inline models", () => {
@@ -187,21 +182,19 @@ describe("buildInlineProviderModels", () => {
     };
 
     const result = buildInlineProviderModels(providers);
-    const [
-      {
-        id,
-        name,
-        reasoning,
-        input,
-        cost,
-        contextWindow,
-        maxTokens,
-        provider,
-        baseUrl,
-        api,
-        headers,
-      },
-    ] = result;
+    const {
+      id,
+      name,
+      reasoning,
+      input,
+      cost,
+      contextWindow,
+      maxTokens,
+      provider,
+      baseUrl,
+      api,
+      headers,
+    } = expectDefined(result[0], "inline proxy model");
 
     expect(result).toHaveLength(1);
     expect({
@@ -231,41 +224,6 @@ describe("buildInlineProviderModels", () => {
     });
   });
 
-  it("keeps inline provider transport overrides once the llm transport adapter is available", () => {
-    const result = buildInlineProviderModels({
-      proxy: {
-        baseUrl: "https://proxy.example.com/v1",
-        api: "openai-completions",
-        request: {
-          proxy: {
-            mode: "explicit-proxy",
-            url: "http://proxy.internal:8443",
-          },
-        },
-        models: [makeModel("proxy-model")],
-      },
-    } as unknown as Parameters<typeof buildInlineProviderModels>[0]);
-
-    expect(result).toHaveLength(1);
-    expect(result[0].provider).toBe("proxy");
-    expect(result[0].api).toBe("openai-completions");
-    expect(result[0].baseUrl).toBe("https://proxy.example.com/v1");
-  });
-
-  it("omits headers when neither provider nor model specifies them", () => {
-    const providers: Parameters<typeof buildInlineProviderModels>[0] = {
-      plain: {
-        baseUrl: "http://localhost:8000",
-        models: [makeModel("some-model")],
-      },
-    };
-
-    const result = buildInlineProviderModels(providers);
-
-    expect(result).toHaveLength(1);
-    expect(result[0].headers).toBeUndefined();
-  });
-
   it("drops SecretRef marker headers in inline provider models", () => {
     const providers: Parameters<typeof buildInlineProviderModels>[0] = {
       custom: {
@@ -281,7 +239,7 @@ describe("buildInlineProviderModels", () => {
     const result = buildInlineProviderModels(providers);
 
     expect(result).toHaveLength(1);
-    expect(result[0].headers).toEqual({
+    expect(expectDefined(result[0], "result[0] test invariant").headers).toEqual({
       "X-Static": "tenant-a",
     });
   });

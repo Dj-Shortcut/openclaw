@@ -4,9 +4,7 @@
  * helper names to model/auth modules.
  */
 import {
-  listKnownProviderAuthEnvVarNames,
-  resolveProviderAuthEvidence,
-  resolveProviderAuthEnvVarCandidates,
+  listKnownProviderAuthEnvVarNamesCore,
   resolveProviderAuthLookupMaps,
 } from "../secrets/provider-env-vars.js";
 import type {
@@ -14,20 +12,6 @@ import type {
   ProviderAuthLookupMaps,
   ProviderEnvVarLookupParams,
 } from "../secrets/provider-env-vars.js";
-
-/** Returns provider-to-env-var candidates for API-key style auth lookup. */
-export function resolveProviderEnvApiKeyCandidates(
-  params?: ProviderEnvVarLookupParams,
-): Record<string, readonly string[]> {
-  return resolveProviderAuthEnvVarCandidates(params);
-}
-
-/** Returns provider auth evidence that may come from env vars, files, or plugin manifests. */
-export function resolveProviderEnvAuthEvidence(
-  params?: ProviderEnvVarLookupParams,
-): Record<string, readonly ProviderAuthEvidence[]> {
-  return resolveProviderAuthEvidence(params);
-}
 
 /** Resolves both env-var candidates and richer auth evidence from one manifest snapshot. */
 export function resolveProviderEnvAuthLookupMaps(
@@ -47,16 +31,7 @@ export function listProviderEnvAuthLookupKeys(params: {
   ).toSorted((a, b) => a.localeCompare(b));
 }
 
-/** Resolves provider auth lookup maps and returns their sorted provider keys. */
-export function resolveProviderEnvAuthLookupKeys(params?: ProviderEnvVarLookupParams): string[] {
-  const lookupMaps = resolveProviderEnvAuthLookupMaps(params);
-  return listProviderEnvAuthLookupKeys({
-    envCandidateMap: lookupMaps.envCandidateMap,
-    authEvidenceMap: lookupMaps.authEvidenceMap,
-  });
-}
-
 /** Lists known provider API-key env var names for redaction and marker matching. */
 export function listKnownProviderEnvApiKeyNames(): string[] {
-  return listKnownProviderAuthEnvVarNames();
+  return listKnownProviderAuthEnvVarNamesCore();
 }

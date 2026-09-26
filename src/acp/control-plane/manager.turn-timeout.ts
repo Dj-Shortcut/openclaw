@@ -10,6 +10,7 @@ import { resolveRuntimeOptionsFromMeta } from "./runtime-options.js";
 
 const ACP_TURN_TIMEOUT_CLEANUP_GRACE_MS = 2_000;
 const ACP_TURN_TIMEOUT_REASON = "turn-timeout";
+export const ACP_TURN_TIMEOUT_DETAIL_CODE = "TURN_TIMEOUT";
 
 /** Resolves the effective ACP turn timeout from session runtime options or agent defaults. */
 export function resolveTurnTimeoutMs(params: {
@@ -38,16 +39,7 @@ export async function awaitTurnWithTimeout<T>(params: {
   timeoutLabelMs: number;
   onTimeout: () => Promise<void>;
 }): Promise<T> {
-  const observedTurnPromise: Promise<
-    | {
-        kind: "value";
-        value: T;
-      }
-    | {
-        kind: "error";
-        error: unknown;
-      }
-  > = params.turnPromise.then(
+  const observedTurnPromise = params.turnPromise.then(
     (value) => ({
       kind: "value" as const,
       value,
@@ -58,15 +50,7 @@ export async function awaitTurnWithTimeout<T>(params: {
     }),
   );
 
-  if (params.timeoutMs <= 0) {
-    const outcome = await observedTurnPromise;
-    if (outcome.kind === "error") {
-      throw outcome.error;
-    }
-    return outcome.value;
-  }
-
-  const timeoutMs = clampTimerTimeoutMs(params.timeoutMs, 1);
+  const timeoutMs = params.timeoutMs <= 0 ? undefined : clampTimerTimeoutMs(params.timeoutMs, 1);
   if (timeoutMs === undefined) {
     const outcome = await observedTurnPromise;
     if (outcome.kind === "error") {
@@ -96,6 +80,7 @@ export async function awaitTurnWithTimeout<T>(params: {
       throw new AcpRuntimeError(
         "ACP_TURN_FAILED",
         `ACP turn timed out after ${Math.max(1, Math.round(params.timeoutLabelMs / 1_000))}s.`,
+        { detailCode: ACP_TURN_TIMEOUT_DETAIL_CODE },
       );
     }
     if (outcome.kind === "error") {
@@ -154,15 +139,7 @@ async function awaitCleanupWithGrace(params: {
   label: "cancel" | "close";
   promise: Promise<unknown>;
 }): Promise<boolean> {
-  const observedCleanupPromise: Promise<
-    | {
-        kind: "done";
-      }
-    | {
-        kind: "error";
-        error: unknown;
-      }
-  > = params.promise.then(
+  const observedCleanupPromise = params.promise.then(
     () => ({
       kind: "done" as const,
     }),

@@ -1,33 +1,17 @@
-// Msteams plugin module implements graph messages behavior.
 import type { OpenClawConfig } from "../runtime-api.js";
 import { createMSTeamsConversationStoreState } from "./conversation-store-state.js";
 import {
-  type GraphResponse,
+  stripHtmlFromTeamsMessage,
+  type GraphThreadMessage as GraphMessage,
+} from "./graph-thread.js";
+import {
   deleteGraphRequest,
-  escapeOData,
   fetchGraphAbsoluteUrl,
   fetchGraphJson,
-  postGraphBetaJson,
-  postGraphJson,
+  mutateGraphJson,
   resolveGraphToken,
 } from "./graph.js";
-
-type GraphMessageBody = {
-  content?: string;
-  contentType?: string;
-};
-
-type GraphMessageFrom = {
-  user?: { id?: string; displayName?: string };
-  application?: { id?: string; displayName?: string };
-};
-
-type GraphMessage = {
-  id?: string;
-  body?: GraphMessageBody;
-  from?: GraphMessageFrom;
-  createdDateTime?: string;
-};
+import { getMSTeamsReactionEmoji, resolveMSTeamsReactionEmoji } from "./reaction-types.js";
 
 type GraphPinnedMessage = {
   id?: string;
@@ -85,18 +69,12 @@ export async function resolveGraphConversationId(to: string): Promise<string> {
     );
   }
 
-  // Prefer the cached Graph-native chat ID (19:xxx format) over the Bot Framework
-  // conversation ID, which may be in a non-Graph format (a:xxx / 8:orgid:xxx) for
-  // personal DMs. send-context.ts resolves and caches this on first send.
-  if (found.reference.graphChatId) {
-    return found.reference.graphChatId;
-  }
   if (found.conversationId.startsWith("19:")) {
     return found.conversationId;
   }
   throw new Error(
     `Conversation for user:${cleaned} uses a Bot Framework ID (${found.conversationId}) ` +
-      "that Graph API does not accept. Send a message to this user first so the Graph chat ID is cached.",
+      "that Graph API does not accept. Use a Graph-native conversation:19:... target when available.",
   );
 }
 
@@ -108,8 +86,10 @@ export function resolveConversationPath(to: string): {
   channelId?: string;
 } {
   const cleaned = stripTargetPrefix(to);
-  if (cleaned.includes("/")) {
-    const [teamId, channelId] = cleaned.split("/", 2);
+  const separatorIndex = cleaned.indexOf("/");
+  if (separatorIndex !== -1) {
+    const teamId = cleaned.slice(0, separatorIndex);
+    const channelId = cleaned.slice(separatorIndex + 1).replace(/\/.*$/, "");
     return {
       kind: "channel",
       basePath: `/teams/${encodeURIComponent(teamId)}/channels/${encodeURIComponent(channelId)}`,
@@ -129,16 +109,16 @@ export function resolveConversationPath(to: string): {
   };
 }
 
-export type GetMessageMSTeamsParams = {
+type MSTeamsMessageTarget = {
   cfg: OpenClawConfig;
   to: string;
   messageId: string;
 };
 
-export type GetMessageMSTeamsResult = {
+type GetMessageMSTeamsResult = {
   id: string;
   text: string | undefined;
-  from: GraphMessageFrom | undefined;
+  from: GraphMessage["from"];
   createdAt: string | undefined;
 };
 
@@ -146,7 +126,7 @@ export type GetMessageMSTeamsResult = {
  * Retrieve a single message by ID from a chat or channel via Graph API.
  */
 export async function getMessageMSTeams(
-  params: GetMessageMSTeamsParams,
+  params: MSTeamsMessageTarget,
 ): Promise<GetMessageMSTeamsResult> {
   const token = await resolveGraphToken(params.cfg);
   const conversationId = await resolveGraphConversationId(params.to);
@@ -161,12 +141,6 @@ export async function getMessageMSTeams(
   };
 }
 
-export type PinMessageMSTeamsParams = {
-  cfg: OpenClawConfig;
-  to: string;
-  messageId: string;
-};
-
 /**
  * Pin a message in a chat conversation via Graph API.
  *
@@ -179,7 +153,7 @@ export type PinMessageMSTeamsParams = {
  * not be enabled for the target tenant.
  */
 export async function pinMessageMSTeams(
-  params: PinMessageMSTeamsParams,
+  params: MSTeamsMessageTarget,
 ): Promise<{ ok: true; pinnedMessageId?: string }> {
   const token = await resolveGraphToken(params.cfg);
   const conversationId = await resolveGraphConversationId(params.to);
@@ -198,15 +172,16 @@ export async function pinMessageMSTeams(
   const body = {
     "message@odata.bind": `https://graph.microsoft.com/v1.0/chats/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(params.messageId)}`,
   };
-  const result = await postGraphJson<{ id?: string }>({
+  const result = await mutateGraphJson<{ id?: string }>({
     token,
     path: `${conv.basePath}/pinnedMessages`,
+    method: "POST",
     body,
   });
   return { ok: true, pinnedMessageId: result.id };
 }
 
-export type UnpinMessageMSTeamsParams = {
+type UnpinMessageMSTeamsParams = {
   cfg: OpenClawConfig;
   to: string;
   /** The pinned-message resource ID returned by pin or list-pins (not the message ID). */
@@ -238,12 +213,12 @@ export async function unpinMessageMSTeams(
   return { ok: true };
 }
 
-export type ListPinsMSTeamsParams = {
+type ListPinsMSTeamsParams = {
   cfg: OpenClawConfig;
   to: string;
 };
 
-export type ListPinsMSTeamsResult = {
+type ListPinsMSTeamsResult = {
   pins: Array<{ id: string; pinnedMessageId: string; messageId?: string; text?: string }>;
 };
 
@@ -304,16 +279,6 @@ export async function listPinsMSTeams(
 // Reactions
 // ---------------------------------------------------------------------------
 
-export const TEAMS_REACTION_TYPES = [
-  "like",
-  "heart",
-  "laugh",
-  "surprised",
-  "sad",
-  "angry",
-] as const;
-export type TeamsReactionType = (typeof TEAMS_REACTION_TYPES)[number];
-
 type GraphReaction = {
   reactionType?: string;
   user?: { id?: string; displayName?: string };
@@ -324,30 +289,11 @@ type GraphMessageWithReactions = GraphMessage & {
   reactions?: GraphReaction[];
 };
 
-export type ReactMessageMSTeamsParams = {
-  cfg: OpenClawConfig;
-  to: string;
-  messageId: string;
+type ReactMessageMSTeamsParams = MSTeamsMessageTarget & {
   reactionType: string;
 };
 
-export type ListReactionsMSTeamsParams = {
-  cfg: OpenClawConfig;
-  to: string;
-  messageId: string;
-};
-
-/** Map well-known reaction type names to representative emoji for CLI display. */
-const REACTION_TYPE_EMOJI: Record<string, string> = {
-  like: "\u{1F44D}",
-  heart: "\u2764\uFE0F",
-  laugh: "\u{1F606}",
-  surprised: "\u{1F62E}",
-  sad: "\u{1F622}",
-  angry: "\u{1F621}",
-};
-
-export type ReactionSummary = {
+type ReactionSummary = {
   reactionType: string;
   /** Display name for the reaction (matches reactionType for known types). */
   name: string;
@@ -357,65 +303,36 @@ export type ReactionSummary = {
   users: Array<{ id: string; displayName?: string }>;
 };
 
-export type ListReactionsMSTeamsResult = {
+type ListReactionsMSTeamsResult = {
   reactions: ReactionSummary[];
 };
 
-/**
- * Normalize a reaction type string. Graph setReaction/unsetReaction accepts
- * the well-known legacy names (like, heart, laugh, surprised, sad, angry)
- * as well as Unicode emoji values — so we pass unknown types through rather
- * than rejecting them.
- */
-function normalizeReactionType(raw: string): string {
-  const normalized = raw.trim();
-  if (!normalized) {
-    throw new Error(`Reaction type is required. Common types: ${TEAMS_REACTION_TYPES.join(", ")}`);
-  }
-  // Lowercase only the well-known names; Unicode emoji should pass through as-is
-  const lowered = normalized.toLowerCase();
-  if (TEAMS_REACTION_TYPES.includes(lowered as TeamsReactionType)) {
-    return lowered;
-  }
-  return normalized;
-}
-
-/**
- * Add an emoji reaction to a message via Graph API (beta).
- *
- * Writes (setReaction) require a Delegated token, so we pass
- * `preferDelegated: true`. The resolver falls back to the app-only token when
- * delegated auth is not configured, preserving today's behavior while letting
- * delegated-auth-enabled deployments hit the user-scoped endpoint.
- */
-export async function reactMessageMSTeams(
+// Graph reaction writes use beta and prefer delegated auth, falling back to
+// app-only auth when delegated credentials are unavailable.
+async function mutateMessageReaction(
   params: ReactMessageMSTeamsParams,
+  operation: "setReaction" | "unsetReaction",
 ): Promise<{ ok: true }> {
-  const reactionType = normalizeReactionType(params.reactionType);
+  const reactionType = resolveMSTeamsReactionEmoji(params.reactionType);
   const token = await resolveGraphToken(params.cfg, { preferDelegated: true });
   const conversationId = await resolveGraphConversationId(params.to);
   const { basePath } = resolveConversationPath(conversationId);
-  const path = `${basePath}/messages/${encodeURIComponent(params.messageId)}/setReaction`;
-  await postGraphBetaJson<unknown>({ token, path, body: { reactionType } });
+  await mutateGraphJson<unknown>({
+    token,
+    path: `${basePath}/messages/${encodeURIComponent(params.messageId)}/${operation}`,
+    method: "POST",
+    body: { reactionType },
+    beta: true,
+  });
   return { ok: true };
 }
 
-/**
- * Remove an emoji reaction from a message via Graph API (beta).
- *
- * Writes (unsetReaction) require a Delegated token, so we pass
- * `preferDelegated: true`. See `reactMessageMSTeams` for fallback rules.
- */
-export async function unreactMessageMSTeams(
-  params: ReactMessageMSTeamsParams,
-): Promise<{ ok: true }> {
-  const reactionType = normalizeReactionType(params.reactionType);
-  const token = await resolveGraphToken(params.cfg, { preferDelegated: true });
-  const conversationId = await resolveGraphConversationId(params.to);
-  const { basePath } = resolveConversationPath(conversationId);
-  const path = `${basePath}/messages/${encodeURIComponent(params.messageId)}/unsetReaction`;
-  await postGraphBetaJson<unknown>({ token, path, body: { reactionType } });
-  return { ok: true };
+export function reactMessageMSTeams(params: ReactMessageMSTeamsParams): Promise<{ ok: true }> {
+  return mutateMessageReaction(params, "setReaction");
+}
+
+export function unreactMessageMSTeams(params: ReactMessageMSTeamsParams): Promise<{ ok: true }> {
+  return mutateMessageReaction(params, "unsetReaction");
 }
 
 /**
@@ -423,7 +340,7 @@ export async function unreactMessageMSTeams(
  * Uses Graph v1.0 (reactions are included in the message resource).
  */
 export async function listReactionsMSTeams(
-  params: ListReactionsMSTeamsParams,
+  params: MSTeamsMessageTarget,
 ): Promise<ListReactionsMSTeamsResult> {
   const token = await resolveGraphToken(params.cfg);
   const conversationId = await resolveGraphConversationId(params.to);
@@ -455,7 +372,7 @@ export async function listReactionsMSTeams(
   const reactions: ReactionSummary[] = Array.from(grouped.entries()).map(([type, group]) => ({
     reactionType: type,
     name: type,
-    emoji: REACTION_TYPE_EMOJI[type],
+    emoji: getMSTeamsReactionEmoji(type),
     count: group.count,
     users: group.users,
   }));
@@ -467,7 +384,7 @@ export async function listReactionsMSTeams(
 // Search
 // ---------------------------------------------------------------------------
 
-export type SearchMessagesMSTeamsParams = {
+type SearchMessagesMSTeamsParams = {
   cfg: OpenClawConfig;
   to: string;
   query: string;
@@ -475,21 +392,43 @@ export type SearchMessagesMSTeamsParams = {
   limit?: number;
 };
 
-export type SearchMessagesMSTeamsResult = {
-  messages: Array<{
-    id: string;
-    text: string | undefined;
-    from: GraphMessageFrom | undefined;
-    createdAt: string | undefined;
-  }>;
+type SearchMessagesMSTeamsResult = {
+  messages: GetMessageMSTeamsResult[];
+  truncated: boolean;
 };
 
 const SEARCH_DEFAULT_LIMIT = 25;
 const SEARCH_MAX_LIMIT = 50;
+const SEARCH_PAGE_SIZE = 50;
+const SEARCH_MAX_PAGES = 10;
+
+type GraphMessagesPage = {
+  value?: GraphMessage[];
+  "@odata.nextLink"?: string;
+};
+
+function normalizeSearchText(message: GraphMessage): string {
+  const content = message.body?.content ?? "";
+  return message.body?.contentType?.toLowerCase() === "html"
+    ? stripHtmlFromTeamsMessage(content)
+    : content.trim();
+}
+
+function matchesSearchSender(message: GraphMessage, from: string | undefined): boolean {
+  const normalized = from?.trim().toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+  const sender = message.from?.user ?? message.from?.application;
+  return [sender?.id, sender?.displayName].some(
+    (value) => value?.trim().toLowerCase() === normalized,
+  );
+}
 
 /**
- * Search messages in a chat or channel by content via Graph API.
- * Uses `$search` for full-text body search and optional `$filter` for sender.
+ * Search messages within one already-authorized chat or channel.
+ * Graph does not support collection `$search` here, so filter bounded pages
+ * locally without widening the read to the account's global message index.
  */
 export async function searchMessagesMSTeams(
   params: SearchMessagesMSTeamsParams,
@@ -502,34 +441,43 @@ export async function searchMessagesMSTeams(
   const top = Number.isFinite(rawLimit)
     ? Math.min(Math.max(Math.floor(rawLimit), 1), SEARCH_MAX_LIMIT)
     : SEARCH_DEFAULT_LIMIT;
+  const query = params.query.trim().toLowerCase();
+  const messages: SearchMessagesMSTeamsResult["messages"] = [];
+  let nextUrl: string | undefined;
+  let truncated = false;
 
-  // Strip double quotes from the query to prevent OData $search injection
-  const sanitizedQuery = params.query.replace(/"/g, "");
+  for (let page = 0; page < SEARCH_MAX_PAGES; page++) {
+    const response: GraphMessagesPage = nextUrl
+      ? await fetchGraphAbsoluteUrl<GraphMessagesPage>({ token, url: nextUrl })
+      : await fetchGraphJson<GraphMessagesPage>({
+          token,
+          path: `${basePath}/messages?$top=${SEARCH_PAGE_SIZE}`,
+        });
 
-  // Build query string manually (not URLSearchParams) to preserve literal $
-  // in OData parameter names, consistent with other Graph calls in this module.
-  const parts = [`$search=${encodeURIComponent(`"${sanitizedQuery}"`)}`];
-  parts.push(`$top=${top}`);
-  if (params.from) {
-    parts.push(
-      `$filter=${encodeURIComponent(`from/user/displayName eq '${escapeOData(params.from)}'`)}`,
-    );
+    for (const message of response.value ?? []) {
+      const searchText = normalizeSearchText(message);
+      if (searchText.toLowerCase().includes(query) && matchesSearchSender(message, params.from)) {
+        if (messages.length >= top) {
+          return { messages, truncated: true };
+        }
+        messages.push({
+          id: message.id ?? "",
+          text: message.body?.content,
+          from: message.from,
+          createdAt: message.createdDateTime,
+        });
+      }
+    }
+
+    nextUrl = response["@odata.nextLink"];
+    if (messages.length >= top) {
+      return { messages, truncated: Boolean(nextUrl) };
+    }
+    if (!nextUrl) {
+      return { messages, truncated: false };
+    }
+    truncated = page === SEARCH_MAX_PAGES - 1;
   }
 
-  const path = `${basePath}/messages?${parts.join("&")}`;
-  // ConsistencyLevel: eventual is required by Graph API for $search queries
-  const res = await fetchGraphJson<GraphResponse<GraphMessage>>({
-    token,
-    path,
-    headers: { ConsistencyLevel: "eventual" },
-  });
-
-  const messages = (res.value ?? []).map((msg) => ({
-    id: msg.id ?? "",
-    text: msg.body?.content,
-    from: msg.from,
-    createdAt: msg.createdDateTime,
-  }));
-
-  return { messages };
+  return { messages, truncated };
 }

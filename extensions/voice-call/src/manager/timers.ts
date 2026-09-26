@@ -1,7 +1,6 @@
-// Voice Call plugin module implements timers behavior.
+import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { TerminalStates, type CallId } from "../types.js";
-import type { CallManagerContext } from "./context.js";
-import { persistCallRecord } from "./store.js";
+import type { CallEndResult, CallManagerContext } from "./context.js";
 import {
   resolveVoiceCallSecondsTimerDelayMs,
   resolveVoiceCallTimerDelayMs,
@@ -11,11 +10,16 @@ import {
 
 type TimerContext = Pick<
   CallManagerContext,
-  "activeCalls" | "maxDurationTimers" | "config" | "storePath" | "transcriptWaiters"
+  | "activeCalls"
+  | "maxDurationTimers"
+  | "config"
+  | "transcriptWaiters"
+  | "trackCallWork"
+  | "isStopping"
 >;
 type MaxDurationTimerContext = Pick<
   TimerContext,
-  "activeCalls" | "maxDurationTimers" | "config" | "storePath"
+  "activeCalls" | "maxDurationTimers" | "config" | "trackCallWork" | "isStopping"
 >;
 type TranscriptWaiterContext = Pick<TimerContext, "transcriptWaiters">;
 
@@ -35,7 +39,7 @@ export function clearMaxDurationTimer(
 export function startMaxDurationTimer(params: {
   ctx: MaxDurationTimerContext;
   callId: CallId;
-  onTimeout: (callId: CallId) => Promise<void>;
+  onTimeout: (callId: CallId) => Promise<CallEndResult>;
   timeoutMs?: number;
 }): void {
   clearMaxDurationTimer(params.ctx, params.callId);
@@ -49,19 +53,28 @@ export function startMaxDurationTimer(params: {
   );
 
   const timer = setTimeout(() => {
-    void (async () => {
+    const work = (async () => {
       params.ctx.maxDurationTimers.delete(params.callId);
       const call = params.ctx.activeCalls.get(params.callId);
-      if (call && !TerminalStates.has(call.state)) {
+      if (!params.ctx.isStopping() && call && !TerminalStates.has(call.state)) {
         console.log(
           `[voice-call] Max duration reached (${Math.ceil(maxDurationMs / 1000)}s), ending call ${params.callId}`,
         );
-        call.endReason = "timeout";
-        persistCallRecord(params.ctx.storePath, call);
-        // Provider-specific timeout handling owns the actual hangup after state persistence.
-        await params.onTimeout(params.callId);
+        try {
+          const result = await params.onTimeout(params.callId);
+          if (!result.success) {
+            console.warn(
+              `[voice-call] Failed to end max-duration call ${params.callId}: ${result.error ?? "unknown error"}`,
+            );
+          }
+        } catch (error) {
+          console.warn(
+            `[voice-call] Failed to end max-duration call ${params.callId}: ${formatErrorMessage(error)}`,
+          );
+        }
       }
     })();
+    params.ctx.trackCallWork(work);
   }, maxDurationMs);
 
   params.ctx.maxDurationTimers.set(params.callId, timer);

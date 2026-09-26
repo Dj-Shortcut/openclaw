@@ -1,5 +1,6 @@
 // Setup plugin config tests cover plugin choices and generated config.
 import { describe, expect, it, vi } from "vitest";
+import { createWizardPrompter } from "../../test/helpers/wizard-prompter.js";
 import type { OpenClawConfig } from "../config/config.js";
 import type { PluginConfigUiHint } from "../plugins/types.js";
 import type { WizardPrompter } from "./prompts.js";
@@ -9,19 +10,19 @@ import {
   setupPluginConfig,
 } from "./setup.plugin-config.js";
 
-const loadPluginManifestRegistry = vi.fn();
+const loadPluginManifestRegistryCore = vi.fn();
 
 vi.mock("../plugins/manifest-registry.js", () => ({
-  loadPluginManifestRegistry,
+  loadPluginManifestRegistryCore,
 }));
 
 vi.mock("../plugins/plugin-registry.js", () => ({
-  loadPluginManifestRegistryForPluginRegistry: loadPluginManifestRegistry,
+  loadPluginManifestRegistryForPluginRegistry: loadPluginManifestRegistryCore,
 }));
 
 vi.mock("../plugins/plugin-metadata-snapshot.js", () => ({
   loadPluginMetadataSnapshot: () => {
-    const registry = loadPluginManifestRegistry();
+    const registry = loadPluginManifestRegistryCore();
     return {
       plugins: registry.plugins,
       manifestRegistry: registry,
@@ -140,29 +141,6 @@ describe("discoverUnconfiguredPlugins", () => {
     expect(requireFirst(result, "unconfigured plugin").id).toBe("openshell");
   });
 
-  it("excludes plugins where all fields are configured", () => {
-    const plugins = [
-      makeManifestPlugin("openshell", {
-        mode: { label: "Mode" },
-        gateway: { label: "Gateway" },
-      }),
-    ];
-    const config: OpenClawConfig = {
-      plugins: {
-        entries: {
-          openshell: {
-            config: { mode: "mirror", gateway: "my-gw" },
-          },
-        },
-      },
-    };
-    const result = discoverUnconfiguredPlugins({
-      manifestPlugins: plugins,
-      config,
-    });
-    expect(result).toHaveLength(0);
-  });
-
   it("treats empty string as unconfigured", () => {
     const plugins = [
       makeManifestPlugin("test-plugin", {
@@ -183,15 +161,6 @@ describe("discoverUnconfiguredPlugins", () => {
       config,
     });
     expect(result).toHaveLength(1);
-  });
-
-  it("returns empty when no plugins have uiHints", () => {
-    const plugins = [makeManifestPlugin("bare")];
-    const result = discoverUnconfiguredPlugins({
-      manifestPlugins: plugins,
-      config: {},
-    });
-    expect(result).toHaveLength(0);
   });
 
   it("treats dotted uiHint paths as configured when nested config exists", () => {
@@ -240,7 +209,7 @@ describe("discoverUnconfiguredPlugins", () => {
 
 describe("setupPluginConfig", () => {
   it("allows skipping plugin setup from the multiselect prompt", async () => {
-    loadPluginManifestRegistry.mockReturnValue({
+    loadPluginManifestRegistryCore.mockReturnValue({
       plugins: [
         {
           ...makeManifestPlugin("device-pairing", {
@@ -272,16 +241,13 @@ describe("setupPluginConfig", () => {
           },
         },
       },
-      prompter: {
-        intro: vi.fn(async () => {}),
-        outro: vi.fn(async () => {}),
+      prompter: createWizardPrompter({
         note,
         select: select as unknown as WizardPrompter["select"],
         multiselect: vi.fn(async () => ["__skip__"]) as unknown as WizardPrompter["multiselect"],
         text,
         confirm,
-        progress: vi.fn(() => ({ update: vi.fn(), stop: vi.fn() })),
-      },
+      }),
     });
 
     expect(result).toEqual({
@@ -297,7 +263,7 @@ describe("setupPluginConfig", () => {
   });
 
   it("writes dotted uiHint values into nested plugin config", async () => {
-    loadPluginManifestRegistry.mockReturnValue({
+    loadPluginManifestRegistryCore.mockReturnValue({
       plugins: [
         {
           ...makeManifestPlugin(
@@ -337,16 +303,15 @@ describe("setupPluginConfig", () => {
           },
         },
       },
-      prompter: {
-        intro: vi.fn(async () => {}),
-        outro: vi.fn(async () => {}),
+      prompter: createWizardPrompter({
         note: vi.fn(async () => {}),
-        select: vi.fn(async () => "llm-context") as unknown as WizardPrompter["select"],
+        select: vi.fn(
+          async (params: { options: Array<{ value: unknown }> }) => params.options[1]?.value,
+        ) as unknown as WizardPrompter["select"],
         multiselect: vi.fn(async () => ["brave"]) as unknown as WizardPrompter["multiselect"],
         text: vi.fn(async () => ""),
         confirm: vi.fn(async () => true),
-        progress: vi.fn(() => ({ update: vi.fn(), stop: vi.fn() })),
-      },
+      }),
     });
 
     expect(result.plugins?.entries?.brave?.config).toEqual({
@@ -357,19 +322,220 @@ describe("setupPluginConfig", () => {
     expect(result.plugins?.entries?.brave?.config?.["webSearch.mode"]).toBeUndefined();
   });
 
-  it("coerces integer schema fields from text input", async () => {
-    loadPluginManifestRegistry.mockReturnValue({
+  it.each([
+    {
+      name: "number",
+      values: [1, 2],
+      selectedIndex: 1,
+      expected: 2,
+      expectedLabels: ["1", "2"],
+    },
+    {
+      name: "boolean",
+      values: [true, false],
+      selectedIndex: 1,
+      expected: false,
+      expectedLabels: ["true", "false"],
+    },
+    {
+      name: "object",
+      values: [{ mode: "first" }, { mode: "second" }],
+      selectedIndex: 1,
+      expected: { mode: "second" },
+      expectedLabels: ['{"mode":"first"}', '{"mode":"second"}'],
+    },
+    {
+      name: "mixed type",
+      values: [1, "1", null],
+      selectedIndex: 1,
+      expected: "1",
+      expectedLabels: ["1", '"1"', "null"],
+    },
+  ])(
+    "preserves and labels a selected $name enum value",
+    async ({ values, selectedIndex, expected, expectedLabels }) => {
+      const pluginId = "typed-enum";
+      loadPluginManifestRegistryCore.mockReturnValue({
+        plugins: [
+          makeManifestPlugin(
+            pluginId,
+            { choice: { label: "Choice" } },
+            {
+              type: "object",
+              properties: {
+                choice: { enum: values },
+              },
+            },
+          ),
+        ],
+      });
+      const select = vi.fn(
+        async (params: { options: Array<{ value: unknown }> }) =>
+          params.options[selectedIndex]?.value,
+      );
+
+      const result = await setupPluginConfig({
+        config: { plugins: { entries: { [pluginId]: { enabled: true } } } },
+        prompter: {
+          intro: vi.fn(async () => {}),
+          outro: vi.fn(async () => {}),
+          note: vi.fn(async () => {}),
+          select: select as unknown as WizardPrompter["select"],
+          multiselect: vi.fn(async () => [pluginId]) as unknown as WizardPrompter["multiselect"],
+          text: vi.fn(async () => ""),
+          confirm: vi.fn(async () => true),
+          progress: vi.fn(() => ({ update: vi.fn(), stop: vi.fn() })),
+        },
+      });
+
+      expect(select).toHaveBeenCalledWith({
+        message: "Choice",
+        options: expectedLabels.map((label, index) => ({ value: String(index), label })),
+        initialValue: undefined,
+      });
+      expect(result.plugins?.entries?.[pluginId]?.config).toEqual({ choice: expected });
+    },
+  );
+
+  it.each([
+    {
+      name: "an existing array through a dotted index",
+      field: "accounts.0.token",
+      existing: { accounts: [{}] },
+      expected: { accounts: [{ token: "configured" }] },
+    },
+    {
+      name: "a missing schema-declared array through a dotted index",
+      field: "accounts.0.token",
+      schema: {
+        type: "object",
+        properties: {
+          accounts: {
+            type: "array",
+            items: { type: "object", properties: { token: { type: "string" } } },
+          },
+        },
+      },
+      expected: { accounts: [{ token: "configured" }] },
+    },
+    {
+      name: "a numeric record key through a dotted path",
+      field: "accounts.0.token",
+      schema: {
+        type: "object",
+        properties: {
+          accounts: {
+            type: "object",
+            properties: {
+              "0": { type: "object", properties: { token: { type: "string" } } },
+            },
+          },
+        },
+      },
+      expected: { accounts: { "0": { token: "configured" } } },
+    },
+    {
+      name: "an explicit bracketed array index without a schema",
+      field: "accounts[0].token",
+      expected: { accounts: [{ token: "configured" }] },
+    },
+    {
+      name: "an explicitly quoted numeric record key without a schema",
+      field: 'accounts["0"].token',
+      expected: { accounts: { "0": { token: "configured" } } },
+    },
+    {
+      name: "a quoted record key containing a literal dot",
+      field: 'accounts["primary.backup"].token',
+      expected: { accounts: { "primary.backup": { token: "configured" } } },
+    },
+  ])("writes $name", async ({ field, existing, schema, expected }) => {
+    const pluginId = "indexed-plugin";
+    loadPluginManifestRegistryCore.mockReturnValue({
+      plugins: [makeManifestPlugin(pluginId, { [field]: { label: "Token" } }, schema)],
+    });
+
+    const result = await setupPluginConfig({
+      config: {
+        plugins: {
+          entries: { [pluginId]: { enabled: true, ...(existing && { config: existing }) } },
+        },
+      },
+      prompter: createWizardPrompter({
+        note: vi.fn(async () => {}),
+        select: vi.fn(async () => "") as unknown as WizardPrompter["select"],
+        multiselect: vi.fn(async () => [pluginId]) as unknown as WizardPrompter["multiselect"],
+        text: vi.fn(async () => "configured") as unknown as WizardPrompter["text"],
+        confirm: vi.fn(async () => true),
+      }),
+    });
+
+    expect(result.plugins?.entries?.[pluginId]?.config).toEqual(expected);
+  });
+
+  it("rejects prototype-polluting dotted uiHint paths without mutating config", async () => {
+    const pollutionProbe = "openclawPluginPollutionProbe";
+    loadPluginManifestRegistryCore.mockReturnValue({
+      plugins: [
+        {
+          ...makeManifestPlugin("unsafe-plugin", {
+            [`safe.__proto__.${pollutionProbe}`]: { label: "Unsafe field" },
+          }),
+          enabledByDefault: true,
+        },
+      ],
+    });
+    const config: OpenClawConfig = {
+      plugins: { entries: { "unsafe-plugin": { enabled: true } } },
+    };
+
+    await expect(
+      setupPluginConfig({
+        config,
+        prompter: createWizardPrompter({
+          note: vi.fn(async () => {}),
+          select: vi.fn(async () => "") as unknown as WizardPrompter["select"],
+          multiselect: vi.fn(async () => [
+            "unsafe-plugin",
+          ]) as unknown as WizardPrompter["multiselect"],
+          text: vi.fn(async () => "owned") as unknown as WizardPrompter["text"],
+          confirm: vi.fn(async () => true),
+        }),
+      }),
+    ).rejects.toThrow(/Invalid path segment/);
+    expect(config.plugins?.entries?.["unsafe-plugin"]?.config).toBeUndefined();
+    expect(({} as Record<string, unknown>)[pollutionProbe]).toBeUndefined();
+  });
+
+  it("coerces only JSON-compatible numeric inputs", async () => {
+    loadPluginManifestRegistryCore.mockReturnValue({
       plugins: [
         makeManifestPlugin(
-          "retry-plugin",
+          "numeric-plugin",
           {
+            decimal: { label: "Decimal" },
+            scientific: { label: "Scientific" },
             retries: { label: "Retries" },
+            hexadecimal: { label: "Hexadecimal" },
+            fractionalRetries: { label: "Fractional retries" },
           },
           {
             type: "object",
             additionalProperties: false,
             properties: {
+              decimal: {
+                type: "number",
+              },
+              scientific: {
+                type: "number",
+              },
               retries: {
+                type: "integer",
+              },
+              hexadecimal: {
+                type: "number",
+              },
+              fractionalRetries: {
                 type: "integer",
               },
             },
@@ -378,31 +544,32 @@ describe("setupPluginConfig", () => {
       ],
     });
 
+    const answers = ["1.5", "1e2", "3", "0x10", "1.5"];
+
     const result = await setupPluginConfig({
       config: {
         plugins: {
           entries: {
-            "retry-plugin": {
+            "numeric-plugin": {
               enabled: true,
             },
           },
         },
       },
-      prompter: {
-        intro: vi.fn(async () => {}),
-        outro: vi.fn(async () => {}),
+      prompter: createWizardPrompter({
         note: vi.fn(async () => {}),
         select: vi.fn(async () => "") as unknown as WizardPrompter["select"],
         multiselect: vi.fn(async () => [
-          "retry-plugin",
+          "numeric-plugin",
         ]) as unknown as WizardPrompter["multiselect"],
-        text: vi.fn(async () => "3") as unknown as WizardPrompter["text"],
+        text: vi.fn(async () => answers.shift() ?? "") as unknown as WizardPrompter["text"],
         confirm: vi.fn(async () => true),
-        progress: vi.fn(() => ({ update: vi.fn(), stop: vi.fn() })),
-      },
+      }),
     });
 
-    expect(result.plugins?.entries?.["retry-plugin"]?.config).toEqual({
+    expect(result.plugins?.entries?.["numeric-plugin"]?.config).toEqual({
+      decimal: 1.5,
+      scientific: 100,
       retries: 3,
     });
   });

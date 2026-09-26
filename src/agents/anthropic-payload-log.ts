@@ -6,12 +6,12 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import { resolveStateDir } from "../config/paths.js";
-import type { Model } from "../llm/types.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { isIncognitoSessionKey } from "../shared/incognito-session-key.js";
 import { resolveUserPath } from "../utils.js";
 import { parseBooleanValue } from "../utils/boolean.js";
 import { safeJsonStringify } from "../utils/safe-json.js";
-import { sanitizeDiagnosticPayload } from "./payload-redaction.js";
+import { redactAgentDiagnosticPayload } from "./diagnostic-redaction.js";
 import { getQueuedFileWriter, type QueuedFileWriter } from "./queued-file-writer.js";
 import type { AgentMessage, StreamFn } from "./runtime/index.js";
 
@@ -28,7 +28,7 @@ type PayloadLogEvent = {
   modelApi?: string | null;
   workspaceDir?: string;
   payload?: unknown;
-  usage?: Record<string, unknown>;
+  usage?: unknown;
   error?: string;
   payloadDigest?: string;
 };
@@ -38,9 +38,7 @@ type PayloadLogConfig = {
   filePath: string;
 };
 
-type PayloadLogWriter = QueuedFileWriter;
-
-const writers = new Map<string, PayloadLogWriter>();
+const writers = new Map<string, QueuedFileWriter>();
 const log = createSubsystemLogger("agent/anthropic-payload");
 
 function resolvePayloadLogConfig(env: NodeJS.ProcessEnv): PayloadLogConfig {
@@ -52,24 +50,18 @@ function resolvePayloadLogConfig(env: NodeJS.ProcessEnv): PayloadLogConfig {
   return { enabled, filePath };
 }
 
-function getWriter(filePath: string): PayloadLogWriter {
-  return getQueuedFileWriter(writers, filePath);
-}
-
 function formatError(error: unknown): string | undefined {
-  if (error instanceof Error) {
-    const redacted = sanitizeDiagnosticPayload(error.message);
-    return typeof redacted === "string" ? redacted : error.message;
-  }
-  if (typeof error === "string") {
-    const redacted = sanitizeDiagnosticPayload(error);
-    return typeof redacted === "string" ? redacted : error;
+  const message =
+    error instanceof Error ? error.message : typeof error === "string" ? error : undefined;
+  if (message !== undefined) {
+    const redacted = redactAgentDiagnosticPayload(message);
+    return typeof redacted === "string" ? redacted : message;
   }
   if (typeof error === "number" || typeof error === "boolean" || typeof error === "bigint") {
     return String(error);
   }
   if (error && typeof error === "object") {
-    return safeJsonStringify(sanitizeDiagnosticPayload(error)) ?? "unknown error";
+    return safeJsonStringify(redactAgentDiagnosticPayload(error)) ?? "unknown error";
   }
   return undefined;
 }
@@ -82,10 +74,6 @@ function digest(value: unknown): string | undefined {
     return undefined;
   }
   return crypto.createHash("sha256").update(serialized).digest("hex");
-}
-
-function isAnthropicModel(model: Model | undefined | null): boolean {
-  return (model as { api?: unknown })?.api === "anthropic-messages";
 }
 
 function findLastAssistantUsage(messages: AgentMessage[]): Record<string, unknown> | null {
@@ -116,15 +104,15 @@ export function createAnthropicPayloadLogger(params: {
   modelId?: string;
   modelApi?: string | null;
   workspaceDir?: string;
-  writer?: PayloadLogWriter;
+  writer?: QueuedFileWriter;
 }): AnthropicPayloadLogger | null {
   const env = params.env ?? process.env;
   const cfg = resolvePayloadLogConfig(env);
-  if (!cfg.enabled) {
+  if (!cfg.enabled || isIncognitoSessionKey(params.sessionKey)) {
     return null;
   }
 
-  const writer = params.writer ?? getWriter(cfg.filePath);
+  const writer = params.writer ?? getQueuedFileWriter(writers, cfg.filePath);
   const base: Omit<PayloadLogEvent, "ts" | "stage"> = {
     runId: params.runId,
     sessionId: params.sessionId,
@@ -145,13 +133,13 @@ export function createAnthropicPayloadLogger(params: {
 
   const wrapStreamFn: AnthropicPayloadLogger["wrapStreamFn"] = (streamFn) => {
     const wrapped: StreamFn = (model, context, options) => {
-      if (!isAnthropicModel(model)) {
+      if (model?.api !== "anthropic-messages") {
         return streamFn(model, context, options);
       }
       const nextOnPayload = (payload: unknown) => {
         // Forward the original payload to the provider hook, but persist only
         // the redacted diagnostic copy.
-        const redactedPayload = sanitizeDiagnosticPayload(payload);
+        const redactedPayload = redactAgentDiagnosticPayload(payload);
         record({
           ...base,
           ts: new Date().toISOString(),
@@ -172,29 +160,23 @@ export function createAnthropicPayloadLogger(params: {
   const recordUsage: AnthropicPayloadLogger["recordUsage"] = (messages, error) => {
     const usage = findLastAssistantUsage(messages);
     const errorMessage = formatError(error);
-    if (!usage) {
-      if (errorMessage) {
-        record({
-          ...base,
-          ts: new Date().toISOString(),
-          stage: "usage",
-          error: errorMessage,
-        });
-      }
+    if (!usage && !errorMessage) {
       return;
     }
     record({
       ...base,
       ts: new Date().toISOString(),
       stage: "usage",
-      usage: sanitizeDiagnosticPayload(usage) as Record<string, unknown>,
+      ...(usage ? { usage: redactAgentDiagnosticPayload(usage) } : {}),
       error: errorMessage,
     });
-    log.info("anthropic usage", {
-      runId: params.runId,
-      sessionId: params.sessionId,
-      usage,
-    });
+    if (usage) {
+      log.info("anthropic usage", {
+        runId: params.runId,
+        sessionId: params.sessionId,
+        usage,
+      });
+    }
   };
 
   log.info("anthropic payload logger enabled", { filePath: writer.filePath });

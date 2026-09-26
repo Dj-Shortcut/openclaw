@@ -1,18 +1,32 @@
 // Artifact method tests cover collection from transcript messages, run/task
 // session lookup, list/get/download responses, and validation errors.
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { expectRecordFields } from "../test-helpers.assertions.js";
-import { artifactsHandlers, collectArtifactsFromMessages } from "./artifacts.js";
+import { AgentSelectionRequiredError } from "../../agents/agent-scope-config.js";
+import { artifactsHandlers } from "./artifacts.js";
+import {
+  assistantFileMessage,
+  assistantImageMessage,
+  expectArtifactList,
+  expectErrorDetails,
+  expectFields,
+  expectFirstArtifact,
+  expectOkPayload,
+  requireNonEmptyString,
+  resultImageMessage,
+  runtimeContext,
+} from "./artifacts.test-support.js";
 
 const hoisted = vi.hoisted(() => ({
-  getTaskSessionLookupByIdForStatus: vi.fn(),
+  getTaskById: vi.fn(),
   loadSessionEntry: vi.fn(),
+  resolveManagedArtifactDownload: vi.fn(),
+  resolveManagedUrlDownload: vi.fn(),
   visitSessionMessagesAsync: vi.fn(),
   resolveSessionKeyForRun: vi.fn(),
 }));
 
-vi.mock("../../tasks/task-status-access.js", () => ({
-  getTaskSessionLookupByIdForStatus: hoisted.getTaskSessionLookupByIdForStatus,
+vi.mock("../../tasks/task-registry-read.js", () => ({
+  prepareTaskRegistryRead: async () => ({ getTaskById: hoisted.getTaskById }),
 }));
 
 vi.mock("../session-utils.js", async () => {
@@ -20,8 +34,16 @@ vi.mock("../session-utils.js", async () => {
   return {
     ...actual,
     loadSessionEntry: hoisted.loadSessionEntry,
-    visitSessionMessagesAsync: hoisted.visitSessionMessagesAsync,
+    loadGatewaySessionEntryReadOnly: hoisted.loadSessionEntry,
   };
+});
+
+vi.mock("../session-transcript-readers.js", async () => {
+  const actual = await vi.importActual<typeof import("../session-transcript-readers.js")>(
+    "../session-transcript-readers.js",
+  );
+  const { withArtifactFixtureReader } = await import("./artifacts.test-support.js");
+  return withArtifactFixtureReader(actual, hoisted.visitSessionMessagesAsync);
 });
 
 vi.mock("../server-session-key.js", async () => {
@@ -31,6 +53,17 @@ vi.mock("../server-session-key.js", async () => {
   return {
     ...actual,
     resolveSessionKeyForRun: hoisted.resolveSessionKeyForRun,
+  };
+});
+
+vi.mock("../managed-image-attachments.js", async () => {
+  const actual = await vi.importActual<typeof import("../managed-image-attachments.js")>(
+    "../managed-image-attachments.js",
+  );
+  return {
+    ...actual,
+    resolveManagedOutgoingMediaArtifactDownload: hoisted.resolveManagedArtifactDownload,
+    resolveManagedOutgoingMediaUrlDownload: hoisted.resolveManagedUrlDownload,
   };
 });
 
@@ -45,8 +78,7 @@ function createResponder() {
 }
 
 type ArtifactMethod = "artifacts.list" | "artifacts.get" | "artifacts.download";
-type ResponderCalls = ReturnType<typeof createResponder>["calls"];
-type ArtifactListPayload = { artifacts?: Array<Record<string, unknown>> };
+type ArtifactResponderCalls = ReturnType<typeof createResponder>["calls"];
 
 async function invokeArtifactHandler(
   method: ArtifactMethod,
@@ -54,13 +86,16 @@ async function invokeArtifactHandler(
   options: { id?: string; context?: unknown } = {},
 ) {
   const responder = createResponder();
+  const defaultContext = {
+    getRuntimeConfig: () => ({ agents: { entries: { main: { default: true } } } }),
+  };
   await artifactsHandlers[method]?.({
     req: { type: "req", id: options.id ?? method, method, params: {} },
     params,
     client: null,
     isWebchatConnect: () => false,
     respond: responder.respond,
-    context: (options.context ?? {}) as never,
+    context: (options.context ?? defaultContext) as never,
   });
   return responder;
 }
@@ -86,106 +121,12 @@ async function downloadArtifact(
   return await invokeArtifactHandler("artifacts.download", params, options);
 }
 
-function runtimeContext(config: Record<string, unknown>) {
-  return { getRuntimeConfig: () => config };
-}
-
-function expectOkPayload(calls: ResponderCalls): unknown {
-  expect(calls[0]?.ok).toBe(true);
-  return calls[0]?.payload;
-}
-
-function expectArtifactList(calls: ResponderCalls): ArtifactListPayload {
-  return expectOkPayload(calls) as ArtifactListPayload;
-}
-
-function expectFirstArtifact(calls: ResponderCalls): Record<string, unknown> | undefined {
-  const payload = expectArtifactList(calls);
-  return payload.artifacts?.[0];
-}
-
-function expectErrorDetails(calls: ResponderCalls): Record<string, unknown> | undefined {
-  expect(calls[0]?.ok).toBe(false);
-  const error = calls[0]?.error as { details?: Record<string, unknown> };
-  return error.details;
-}
-
-function assistantImageMessage(params: {
-  data?: string;
-  alt: string;
-  seq?: number;
-  runId?: string;
-  taskId?: string;
-}) {
-  return {
-    role: "assistant",
-    content: [{ type: "image", data: params.data ?? "aGVsbG8=", alt: params.alt }],
-    __openclaw: {
-      seq: params.seq ?? 2,
-      ...(params.runId ? { runId: params.runId } : {}),
-      ...(params.taskId ? { messageTaskId: params.taskId } : {}),
-    },
-  };
-}
-
-function assistantFileMessage(params: {
-  data?: string;
-  title: string;
-  seq?: number;
-  runId?: string;
-  taskId?: string;
-}) {
-  return {
-    role: "assistant",
-    content: [
-      {
-        type: "file",
-        data: params.data ?? "aGVsbG8=",
-        mimeType: "text/plain",
-        title: params.title,
-      },
-    ],
-    __openclaw: {
-      seq: params.seq ?? 2,
-      ...(params.runId ? { runId: params.runId } : {}),
-      ...(params.taskId ? { taskId: params.taskId } : {}),
-    },
-  };
-}
-
-function resultImageMessage() {
-  return {
-    role: "assistant",
-    content: [
-      { type: "text", text: "see attached" },
-      {
-        type: "image",
-        data: "aGVsbG8=",
-        mimeType: "image/png",
-        alt: "result.png",
-      },
-    ],
-    __openclaw: { seq: 2 },
-  };
-}
-
-function requireNonEmptyString(value: unknown, message: string): string {
-  if (typeof value !== "string" || value.length === 0) {
-    throw new Error(message);
-  }
-  return value;
-}
-
-function expectFields(value: unknown, expected: Record<string, unknown>): void {
-  expectRecordFields(value, "fields", expected);
-}
-
 function expectArtifactScopeNotFound(
-  calls: ResponderCalls,
+  calls: ArtifactResponderCalls,
   params: { message?: string } = {},
 ): void {
   expect(calls[0]?.ok).toBe(false);
-  expect(hoisted.getTaskSessionLookupByIdForStatus).toHaveBeenCalledWith("task-1");
+  expect(hoisted.getTaskById).toHaveBeenCalledWith("task-1");
   expect(hoisted.loadSessionEntry).not.toHaveBeenCalled();
   expect(hoisted.resolveSessionKeyForRun).not.toHaveBeenCalled();
   if (params.message) {
@@ -198,7 +139,9 @@ describe("artifacts RPC handlers", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     hoisted.resolveSessionKeyForRun.mockReset();
-    hoisted.getTaskSessionLookupByIdForStatus.mockReturnValue(undefined);
+    hoisted.resolveManagedArtifactDownload.mockResolvedValue(null);
+    hoisted.resolveManagedUrlDownload.mockResolvedValue(null);
+    hoisted.getTaskById.mockReturnValue(undefined);
     hoisted.loadSessionEntry.mockReturnValue({
       storePath: "/tmp/sessions.json",
       entry: { sessionId: "sess-main", sessionFile: "/tmp/sess-main.jsonl" },
@@ -207,12 +150,14 @@ describe("artifacts RPC handlers", () => {
   });
 
   function mockedMessages(messages: unknown[]) {
-    hoisted.visitSessionMessagesAsync.mockImplementation(
-      async (_sessionId, _storePath, _sessionFile, visit) => {
-        messages.forEach((message, index) => visit(message, index + 1));
-        return messages.length;
-      },
-    );
+    hoisted.visitSessionMessagesAsync.mockImplementation(async (_scope, visit) => {
+      messages.forEach((message, index) => visit(message, index + 1));
+      return messages.length;
+    });
+  }
+
+  function mockArtifactBlock(seq: number, block: Record<string, unknown>, role = "assistant") {
+    mockedMessages([{ role, content: [block], __openclaw: { seq } }]);
   }
 
   it("lists stable transcript artifact summaries by sessionKey", async () => {
@@ -235,22 +180,18 @@ describe("artifacts RPC handlers", () => {
     expect(artifact?.id).toMatch(/^artifact_/);
     expect(artifact).not.toHaveProperty("data");
     expect(hoisted.visitSessionMessagesAsync).toHaveBeenCalledWith(
-      "sess-main",
-      "/tmp/sessions.json",
-      "/tmp/sess-main.jsonl",
+      {
+        agentId: "main",
+        sessionEntry: {
+          sessionFile: "/tmp/sess-main.jsonl",
+          sessionId: "sess-main",
+        },
+        sessionId: "sess-main",
+        sessionKey: "agent:main:main",
+        storePath: "/tmp/sessions.json",
+      },
       expect.any(Function),
-      expect.objectContaining({ cache: "skip" }),
     );
-  });
-
-  it("applies agentId to direct sessionKey aliases", async () => {
-    const { calls } = await listArtifacts(
-      { sessionKey: "main", agentId: "work" },
-      { id: "session-alias-agent-scope" },
-    );
-
-    expect(hoisted.loadSessionEntry).toHaveBeenCalledWith("agent:work:main");
-    expectFields(expectFirstArtifact(calls), { sessionKey: "agent:work:main" });
   });
 
   it("canonicalizes scoped sessionKey aliases with runtime config", async () => {
@@ -267,6 +208,26 @@ describe("artifacts RPC handlers", () => {
 
     expect(hoisted.loadSessionEntry).toHaveBeenCalledWith("agent:work:primary");
     expectFields(expectFirstArtifact(calls), { sessionKey: "agent:work:primary" });
+  });
+
+  it("loads a bare artifact session through the persisted fixed-store owner", async () => {
+    const { calls } = await listArtifacts(
+      { sessionKey: "global" },
+      {
+        id: "session-persisted-owner",
+        context: runtimeContext({
+          session: { store: "/tmp/shared-sessions.sqlite", scope: "global" },
+          agents: {
+            ownership: "explicit",
+            list: [{ id: "ops" }, { id: "research" }],
+            defaults: { sessionStore: { agentId: "ops" } },
+          },
+        }),
+      },
+    );
+
+    expect(hoisted.loadSessionEntry).toHaveBeenCalledWith("global", { agentId: "ops" });
+    expectFields(expectFirstArtifact(calls), { sessionKey: "global" });
   });
 
   it("preserves agent scope when loading global-scope run artifacts", async () => {
@@ -291,10 +252,58 @@ describe("artifacts RPC handlers", () => {
     expectFields(expectFirstArtifact(calls), { sessionKey: "global", runId: "run-global" });
   });
 
-  it("preserves inferred task agent scope when loading global-scope task artifacts", async () => {
-    hoisted.getTaskSessionLookupByIdForStatus.mockReturnValue({
+  it("uses the run row owner before default selection", async () => {
+    hoisted.resolveSessionKeyForRun.mockReturnValue("agent:research:main");
+    mockedMessages([assistantFileMessage({ title: "out.txt", runId: "run-owned" })]);
+
+    const { calls } = await listArtifacts(
+      { runId: "run-owned" },
+      {
+        context: runtimeContext({
+          agents: {
+            ownership: "explicit",
+            list: [{ id: "ops" }, { id: "research" }],
+          },
+        }),
+      },
+    );
+
+    expect(hoisted.resolveSessionKeyForRun).toHaveBeenCalledWith("run-owned", {});
+    expect(hoisted.loadSessionEntry).toHaveBeenCalledWith("agent:research:main");
+    expect(calls[0]?.ok).toBe(true);
+  });
+
+  it("translates run lookup selection-required into INVALID_REQUEST", async () => {
+    hoisted.resolveSessionKeyForRun.mockImplementation(() => {
+      throw new AgentSelectionRequiredError(["ops", "research"], {
+        surface: "artifact run",
+        hint: "Pass agentId to select a configured agent.",
+      });
+    });
+
+    const { calls } = await listArtifacts(
+      { runId: "run-ambiguous" },
+      {
+        context: runtimeContext({
+          agents: {
+            ownership: "explicit",
+            list: [{ id: "ops" }, { id: "research" }],
+          },
+        }),
+      },
+    );
+
+    expect(calls[0]).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_REQUEST", message: expect.stringContaining("agent") },
+    });
+  });
+
+  it("uses the compatibility owner instead of the executor for a global task requester", async () => {
+    hoisted.getTaskById.mockReturnValue({
       agentId: "work",
       requesterSessionKey: "global",
+      ownerKey: "global",
     });
     mockedMessages([assistantFileMessage({ title: "task.txt", taskId: "task-global" })]);
 
@@ -309,135 +318,197 @@ describe("artifacts RPC handlers", () => {
       },
     );
 
-    expect(hoisted.loadSessionEntry).toHaveBeenCalledWith("global", { agentId: "work" });
+    expect(hoisted.loadSessionEntry).toHaveBeenCalledWith("global", { agentId: "main" });
     expectFields(expectFirstArtifact(calls), { sessionKey: "global", taskId: "task-global" });
   });
 
-  it("gets and downloads an inline artifact", async () => {
-    const listed = collectArtifactsFromMessages({
-      sessionKey: "agent:main:main",
-      messages: [resultImageMessage()],
+  it("returns typed selection-required instead of adopting the task executor", async () => {
+    hoisted.getTaskById.mockReturnValue({
+      agentId: "work",
+      requesterSessionKey: "global",
+      ownerKey: "global",
     });
-    const artifactId = listed[0]?.id;
-    const artifactIdString = requireNonEmptyString(artifactId, "expected listed artifact id");
-
-    const get = await getArtifact(
-      { sessionKey: "agent:main:main", artifactId: artifactIdString },
-      { id: "2" },
+    const { calls } = await listArtifacts(
+      { taskId: "task-global" },
+      {
+        context: runtimeContext({
+          session: { scope: "global" },
+          agents: {
+            ownership: "explicit",
+            list: [{ id: "ops" }, { id: "work" }],
+          },
+        }),
+      },
     );
+
+    expect(calls[0]).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_REQUEST", message: expect.stringContaining("agent") },
+    });
+    expect(hoisted.loadSessionEntry).not.toHaveBeenCalled();
+  });
+
+  it("translates a keyless task selection failure into INVALID_REQUEST", async () => {
+    hoisted.getTaskById.mockReturnValue({ runId: "run-keyless" });
+
+    const { calls } = await listArtifacts(
+      { taskId: "task-keyless" },
+      {
+        context: runtimeContext({
+          agents: {
+            ownership: "explicit",
+            list: [{ id: "ops" }, { id: "research" }],
+          },
+        }),
+      },
+    );
+
+    expect(calls[0]).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_REQUEST", message: expect.stringContaining("agent") },
+    });
+  });
+
+  it.each([
+    { type: "file", data: "", sizeBytes: 0, title: "direct.bin" },
+    {
+      type: "file",
+      source: { data: "", media_type: "application/octet-stream", sizeBytes: 0 },
+      title: "source.bin",
+    },
+    {
+      type: "file",
+      data: " data:application/octet-stream;base64, ",
+      sizeBytes: 0,
+      title: "data-url.bin",
+    },
+    { data: "", sizeBytes: 0, title: "untyped.bin" },
+  ])("lists, gets, and downloads the zero-byte $title artifact", async (block) => {
+    mockedMessages([{ role: "assistant", content: [block], __openclaw: { seq: 2 } }]);
+    const artifact = expectFirstArtifact(
+      (await listArtifacts({ sessionKey: "agent:main:main" })).calls,
+    );
+    const artifactId = requireNonEmptyString(artifact?.id, "expected zero-byte artifact id");
+    const expected = { id: artifactId, sizeBytes: 0, download: { mode: "bytes" } };
+    expect(artifact).toMatchObject(expected);
+    expect(artifact).not.toHaveProperty("data");
+    const get = await getArtifact({ sessionKey: "agent:main:main", artifactId });
     const getPayload = expectOkPayload(get.calls) as { artifact?: Record<string, unknown> };
-    expectFields(getPayload.artifact, { id: artifactId });
-    expectFields(getPayload.artifact?.download, { mode: "bytes" });
-
-    const download = await downloadArtifact(
-      { sessionKey: "agent:main:main", artifactId },
-      { id: "3" },
-    );
-    const downloadPayload = expectOkPayload(download.calls) as {
-      artifact?: Record<string, unknown>;
-    };
-    expectFields(downloadPayload, {
-      encoding: "base64",
-      data: "aGVsbG8=",
-    });
-    expectFields(downloadPayload.artifact, { id: artifactId });
+    expect(getPayload.artifact).toMatchObject(expected);
+    expect(getPayload.artifact).not.toHaveProperty("data");
+    const download = await downloadArtifact({ sessionKey: "agent:main:main", artifactId });
+    const payload = expectOkPayload(download.calls) as { artifact?: Record<string, unknown> };
+    expectFields(payload, { encoding: "base64", data: "" });
+    expect(payload.artifact).toMatchObject(expected);
+  });
+  it("does not discover untyped non-string data as an artifact", async () => {
+    mockArtifactBlock(2, { data: {} });
+    const listed = await listArtifacts({ sessionKey: "agent:main:main" });
+    expect(expectArtifactList(listed.calls)).toEqual({ artifacts: [] });
   });
 
-  it("can scan artifact summaries without retaining inline data", () => {
-    const artifacts = collectArtifactsFromMessages({
-      sessionKey: "agent:main:main",
-      includeDownloadData: false,
-      messages: [
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "image",
-              data: "aGVsbG8=",
-              mimeType: "image/png",
-              alt: "result.png",
-            },
-          ],
-          __openclaw: { seq: 2 },
-        },
-      ],
-    });
-
-    expect(artifacts).toHaveLength(1);
-    expectFields(artifacts[0], {
-      title: "result.png",
+  it("preserves managed artifact identity and returns a ticketed download URL", async () => {
+    const artifactId = "artifact_managed_image_11111111-1111-4111-8111-111111111111";
+    mockArtifactBlock(2, {
+      type: "image",
+      artifactId,
+      url: "/api/chat/media/outgoing/agent%3Amain%3Amain/11111111-1111-4111-8111-111111111111/full",
+      alt: "chart.png",
       mimeType: "image/png",
-      sizeBytes: 5,
+      sizeBytes: 14,
     });
-    expectFields(artifacts[0]?.download, { mode: "bytes" });
-    expect(artifacts[0]).not.toHaveProperty("data");
+    hoisted.resolveManagedArtifactDownload.mockResolvedValue({
+      artifactId,
+      sessionKey: "agent:main:main",
+      type: "image",
+      title: "chart.png",
+      mimeType: "image/png",
+      sizeBytes: 14,
+      url: "/api/chat/media/outgoing/agent%3Amain%3Amain/id/full?mediaTicket=ticket",
+      expiresAt: "2026-07-28T05:00:00.000Z",
+    });
+
+    const listed = await listArtifacts({ sessionKey: "agent:main:main" });
+    expectFields(expectFirstArtifact(listed.calls), { id: artifactId, sizeBytes: 14 });
+
+    const downloaded = await downloadArtifact({ sessionKey: "agent:main:main", artifactId });
+    expectFields(expectOkPayload(downloaded.calls), {
+      url: "/api/chat/media/outgoing/agent%3Amain%3Amain/id/full?mediaTicket=ticket",
+      expiresAt: "2026-07-28T05:00:00.000Z",
+    });
+    expect(hoisted.resolveManagedArtifactDownload).toHaveBeenCalledWith({
+      sessionKey: "agent:main:main",
+      agentId: "main",
+      defaultAgentId: "main",
+      artifactId,
+    });
   });
 
-  it("hydrates inline data only for the requested download artifact", () => {
-    const messages = [
+  it("downloads inline audio artifacts as bytes", async () => {
+    const { type, mimeType, data } = { type: "audio", mimeType: "audio/mpeg", data: "YXVkaW8=" };
+    mockedMessages([
       {
         role: "assistant",
-        content: [
-          {
-            type: "image",
-            data: "Zmlyc3Q=",
-            mimeType: "image/png",
-            alt: "first.png",
-          },
-          {
-            type: "image",
-            data: "c2Vjb25k",
-            mimeType: "image/png",
-            alt: "second.png",
-          },
-        ],
+        content: [{ type, data, mimeType, fileName: `result.${type}` }],
         __openclaw: { seq: 2 },
       },
-    ];
-    const summaries = collectArtifactsFromMessages({
-      sessionKey: "agent:main:main",
-      includeDownloadData: false,
-      messages,
-    });
-    const secondArtifactId = requireNonEmptyString(summaries[1]?.id, "expected second artifact id");
+    ]);
+    const listed = await listArtifacts({ sessionKey: "agent:main:main" });
+    const artifact = expectFirstArtifact(listed.calls);
+    const artifactId = requireNonEmptyString(artifact?.id, "expected media artifact id");
 
-    const hydrated = collectArtifactsFromMessages({
+    const downloaded = await downloadArtifact({
       sessionKey: "agent:main:main",
-      downloadArtifactId: secondArtifactId,
-      messages,
+      artifactId,
     });
 
-    expect(hydrated).toHaveLength(2);
-    expectFields(hydrated[0], { title: "first.png" });
-    expect(hydrated[0]).not.toHaveProperty("data");
-    expectFields(hydrated[1], { title: "second.png", data: "c2Vjb25k" });
+    expectFields(artifact, { type, mimeType });
+    expectFields(artifact?.download, { mode: "bytes" });
+    expectFields(expectOkPayload(downloaded.calls), {
+      encoding: "base64",
+      data,
+    });
   });
 
-  it("resolves runId queries through the gateway run-to-session lookup", async () => {
-    hoisted.resolveSessionKeyForRun.mockReturnValue("agent:main:main");
-    mockedMessages([assistantImageMessage({ alt: "run-result.png", runId: "run-1" })]);
-    const { calls } = await listArtifacts({ runId: "run-1" }, { id: "4" });
-
-    expect(hoisted.resolveSessionKeyForRun).toHaveBeenCalledWith("run-1", {
-      agentId: "main",
+  it("returns ticketed URLs for managed video artifacts", async () => {
+    const { type, mimeType, fileName } = {
+      type: "video",
+      mimeType: "video/mp4",
+      fileName: "clip.mp4",
+    };
+    const attachmentId = "22222222-2222-4222-8222-222222222222";
+    const artifactId = `artifact_managed_media_${attachmentId}`;
+    const url = `/api/chat/media/outgoing/agent%3Amain%3Amain/${attachmentId}/full`;
+    mockedMessages([
+      {
+        role: "assistant",
+        openclawDisplayContent: [{ type, artifactId, url, openUrl: url, fileName, mimeType }],
+        __openclaw: { seq: 2 },
+      },
+    ]);
+    hoisted.resolveManagedArtifactDownload.mockResolvedValue({
+      artifactId,
+      sessionKey: "agent:main:main",
+      type,
+      title: fileName,
+      mimeType,
+      sizeBytes: 10,
+      url: `${url}?mediaTicket=ticket`,
+      expiresAt: "2026-07-28T05:00:00.000Z",
     });
-    expectFields(expectFirstArtifact(calls), { runId: "run-1" });
-  });
 
-  it("passes agentId to runId artifact queries", async () => {
-    hoisted.resolveSessionKeyForRun.mockReturnValue("main");
-    mockedMessages([assistantImageMessage({ alt: "run-result.png", runId: "run-1" })]);
+    const listed = await listArtifacts({ sessionKey: "agent:main:main" });
+    const downloaded = await downloadArtifact({ sessionKey: "agent:main:main", artifactId });
 
-    await listArtifacts({ runId: "run-1", agentId: "work" }, { id: "agent-run-scope" });
-
-    expect(hoisted.resolveSessionKeyForRun).toHaveBeenCalledWith("run-1", {
-      agentId: "work",
+    expectFields(expectFirstArtifact(listed.calls), { id: artifactId, type, mimeType });
+    expectFields(expectOkPayload(downloaded.calls), {
+      url: `${url}?mediaTicket=ticket`,
+      expiresAt: "2026-07-28T05:00:00.000Z",
     });
-    expect(hoisted.loadSessionEntry).toHaveBeenCalledWith("agent:work:main");
   });
 
   it("preserves task agent scope when taskId resolves through runId", async () => {
-    hoisted.getTaskSessionLookupByIdForStatus.mockReturnValue({
+    hoisted.getTaskById.mockReturnValue({
       runId: "run-for-task-1",
       agentId: "work",
     });
@@ -454,8 +525,8 @@ describe("artifacts RPC handlers", () => {
     expect(hoisted.loadSessionEntry).toHaveBeenCalledWith("agent:work:acp:run-for-task-1");
   });
 
-  it("resolves taskId queries through task status access and filters artifacts by messageTaskId", async () => {
-    hoisted.getTaskSessionLookupByIdForStatus.mockReturnValue({
+  it("resolves taskId queries through prepared task reads and filters artifacts by messageTaskId", async () => {
+    hoisted.getTaskById.mockReturnValue({
       requesterSessionKey: "agent:main:main",
       runId: "run-for-task-1",
       agentId: "main",
@@ -489,7 +560,7 @@ describe("artifacts RPC handlers", () => {
     });
 
     expect(list.calls[0]?.ok).toBe(true);
-    expect(hoisted.getTaskSessionLookupByIdForStatus).toHaveBeenCalledWith("task-1");
+    expect(hoisted.getTaskById).toHaveBeenCalledWith("task-1");
     expect(hoisted.resolveSessionKeyForRun).not.toHaveBeenCalled();
     expect(hoisted.loadSessionEntry).toHaveBeenCalledWith("agent:main:main");
     const listPayload = list.calls[0]?.payload as { artifacts?: Array<Record<string, unknown>> };
@@ -532,7 +603,7 @@ describe("artifacts RPC handlers", () => {
   });
 
   it("does not resolve taskId artifact queries when agentId does not match the task", async () => {
-    hoisted.getTaskSessionLookupByIdForStatus.mockReturnValue({
+    hoisted.getTaskById.mockReturnValue({
       requesterSessionKey: "agent:work:main",
       runId: "run-for-task-1",
       agentId: "work",
@@ -547,8 +618,63 @@ describe("artifacts RPC handlers", () => {
     });
   });
 
+  it("keeps cross-agent task artifacts scoped to the requester transcript", async () => {
+    hoisted.getTaskById.mockReturnValue({
+      requesterSessionKey: "agent:main:main",
+      ownerKey: "agent:main:main",
+      runId: "run-for-task-1",
+      agentId: "worker",
+      requesterAgentId: "main",
+    });
+    mockedMessages([
+      assistantImageMessage({ alt: "task-result.png", data: "dGFyZ2V0", taskId: "task-1" }),
+    ]);
+
+    const { calls } = await listArtifacts(
+      { taskId: "task-1", agentId: "worker" },
+      { id: "task-cross-agent-requester-session" },
+    );
+
+    expect(hoisted.resolveSessionKeyForRun).not.toHaveBeenCalled();
+    expect(hoisted.loadSessionEntry).toHaveBeenCalledWith("agent:main:main");
+    expectFields(expectFirstArtifact(calls), {
+      taskId: "task-1",
+      sessionKey: "agent:main:main",
+    });
+  });
+
+  it("uses the requester agent store for cross-agent global task artifacts", async () => {
+    hoisted.getTaskById.mockReturnValue({
+      requesterSessionKey: "global",
+      ownerKey: "global",
+      runId: "run-for-task-1",
+      agentId: "worker",
+      requesterAgentId: "main",
+    });
+    mockedMessages([
+      assistantImageMessage({ alt: "task-result.png", data: "dGFyZ2V0", taskId: "task-1" }),
+    ]);
+
+    const { calls } = await listArtifacts(
+      { taskId: "task-1", agentId: "worker" },
+      {
+        id: "task-cross-agent-global-requester",
+        context: runtimeContext({
+          session: { scope: "global" },
+          agents: { list: [{ id: "main", default: true }, { id: "worker" }] },
+        }),
+      },
+    );
+
+    expect(hoisted.loadSessionEntry).toHaveBeenCalledWith("global", { agentId: "main" });
+    expectFields(expectFirstArtifact(calls), {
+      taskId: "task-1",
+      sessionKey: "global",
+    });
+  });
+
   it("derives taskId artifact scope from requesterSessionKey when task agentId is absent", async () => {
-    hoisted.getTaskSessionLookupByIdForStatus.mockReturnValue({
+    hoisted.getTaskById.mockReturnValue({
       requesterSessionKey: "agent:work:main",
       runId: "run-for-task-1",
     });
@@ -561,7 +687,7 @@ describe("artifacts RPC handlers", () => {
   });
 
   it("treats legacy task requester session keys as the main agent for artifact scope", async () => {
-    hoisted.getTaskSessionLookupByIdForStatus.mockReturnValue({
+    hoisted.getTaskById.mockReturnValue({
       requesterSessionKey: "main",
       runId: "run-for-task-1",
     });
@@ -574,7 +700,7 @@ describe("artifacts RPC handlers", () => {
   });
 
   it("uses the configured default agent for legacy task requester session keys", async () => {
-    hoisted.getTaskSessionLookupByIdForStatus.mockReturnValue({
+    hoisted.getTaskById.mockReturnValue({
       requesterSessionKey: "main",
       runId: "run-for-task-1",
     });
@@ -607,19 +733,15 @@ describe("artifacts RPC handlers", () => {
   });
 
   it("discovers transcript image_url data blocks", async () => {
-    mockedMessages([
+    mockArtifactBlock(
+      3,
       {
-        role: "user",
-        content: [
-          {
-            type: "input_image",
-            image_url: "data:image/png;base64,aGVsbG8=",
-            alt: "uploaded.png",
-          },
-        ],
-        __openclaw: { seq: 3 },
+        type: "input_image",
+        image_url: "data:image/png;base64,aGVsbG8=",
+        alt: "uploaded.png",
       },
-    ]);
+      "user",
+    );
     const { calls } = await listArtifacts({ sessionKey: "agent:main:main" }, { id: "image-url" });
 
     const payload = expectArtifactList(calls);
@@ -634,76 +756,156 @@ describe("artifacts RPC handlers", () => {
     expectFields(artifact?.download, { mode: "bytes" });
   });
 
-  it("treats transcript non-base64 data URLs as unsupported downloads", () => {
-    const artifacts = collectArtifactsFromMessages({
-      sessionKey: "agent:main:main",
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_image",
-              image_url: "data:text/plain,hello",
-              alt: "uploaded.txt",
-            },
-          ],
-          __openclaw: { seq: 4 },
-        },
-      ],
-    });
+  it("treats transcript non-base64 data URLs as unsupported downloads", async () => {
+    mockArtifactBlock(
+      4,
+      {
+        type: "input_image",
+        image_url: "data:text/plain,hello",
+        alt: "uploaded.txt",
+      },
+      "user",
+    );
 
+    const { calls } = await listArtifacts({ sessionKey: "agent:main:main" });
+    const artifacts = expectArtifactList(calls).artifacts;
     expect(artifacts).toHaveLength(1);
-    expectFields(artifacts[0], {
+    expectFields(artifacts?.[0], {
       type: "image",
       title: "uploaded.txt",
     });
-    expectFields(artifacts[0]?.download, { mode: "unsupported" });
-    expect(artifacts[0]?.download).not.toHaveProperty("encoding", "base64");
+    expectFields(artifacts?.[0]?.download, { mode: "unsupported" });
+    expect(artifacts?.[0]?.download).not.toHaveProperty("encoding", "base64");
   });
 
-  it("treats non-base64 data URLs in the content field as unsupported downloads", () => {
-    const artifacts = collectArtifactsFromMessages({
-      sessionKey: "agent:main:main",
-      messages: [
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "file",
-              content: "data:text/plain,hello",
-              title: "plain.txt",
-            },
-          ],
-          __openclaw: { seq: 5 },
-        },
-      ],
-    });
-
-    expect(artifacts).toHaveLength(1);
-    expectFields(artifacts[0], {
+  it("treats non-base64 data URLs in the content field as unsupported downloads", async () => {
+    mockArtifactBlock(5, {
+      type: "file",
+      content: "data:text/plain,hello",
       title: "plain.txt",
     });
-    expectFields(artifacts[0]?.download, { mode: "unsupported" });
-    expect(artifacts[0]).not.toHaveProperty("data");
+
+    const { calls } = await listArtifacts({ sessionKey: "agent:main:main" });
+    const artifacts = expectArtifactList(calls).artifacts;
+    expect(artifacts).toHaveLength(1);
+    expectFields(artifacts?.[0], {
+      title: "plain.txt",
+    });
+    expectFields(artifacts?.[0]?.download, { mode: "unsupported" });
+    expect(artifacts?.[0]).not.toHaveProperty("data");
   });
 
-  it("treats unsafe artifact URLs as unsupported downloads", () => {
-    const artifacts = collectArtifactsFromMessages({
+  it.each([
+    { type: "file", data: "not-base64!", title: "bad.txt" },
+    { type: "file", data: "AA=A", title: "bad.txt" },
+    { type: "file", data: "A===", title: "bad.txt" },
+    { type: "file", data: "A", title: "bad.txt" },
+    { type: "file", data: "AA\vAA", title: "bad.txt" },
+    { type: "file", data: "AA\u2028AA", title: "bad.txt" },
+    { type: "image", image_url: "data:image/png;base64,not-base64!", alt: "bad.txt" },
+  ])("treats malformed artifact data as unsupported downloads: %j", async (block) => {
+    mockedMessages([
+      {
+        role: "assistant",
+        content: [block],
+        __openclaw: { seq: 6 },
+      },
+    ]);
+
+    const { calls } = await listArtifacts({ sessionKey: "agent:main:main" });
+    const artifacts = expectArtifactList(calls).artifacts;
+    expect(artifacts).toHaveLength(1);
+    expectFields(artifacts?.[0], {
+      title: "bad.txt",
+    });
+    expectFields(artifacts?.[0]?.download, { mode: "unsupported" });
+    expect(artifacts?.[0]).not.toHaveProperty("data");
+  });
+
+  it.each([
+    { data: "JVBERi0", expected: "JVBERi0=", sizeBytes: 5 },
+    { data: "-_8", expected: "+/8=", sizeBytes: 2 },
+    { data: " \t-_\r\n8=\n", expected: "+/8=", sizeBytes: 2 },
+    { data: "Zh", expected: "Zh==", sizeBytes: 1 },
+  ])("normalizes downloadable artifact base64: %j", async ({ data, expected, sizeBytes }) => {
+    mockedMessages([
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "file",
+            data,
+            title: "report.pdf",
+          },
+        ],
+        __openclaw: { seq: 7 },
+      },
+    ]);
+
+    const listed = await listArtifacts({ sessionKey: "agent:main:main" });
+    const artifact = expectArtifactList(listed.calls).artifacts?.[0];
+    const artifactId = requireNonEmptyString(artifact?.id, "expected listed artifact id");
+    expectFields(artifact, {
+      title: "report.pdf",
+      sizeBytes,
+    });
+    expectFields(artifact?.download, { mode: "bytes" });
+
+    const download = await downloadArtifact({
       sessionKey: "agent:main:main",
-      messages: [
-        {
-          role: "assistant",
-          content: [{ type: "file", title: "secret.txt", url: "file:///etc/passwd" }],
-          __openclaw: { seq: 4 },
-        },
-      ],
+      artifactId,
+    });
+    const downloadPayload = expectOkPayload(download.calls) as Record<string, unknown>;
+    expectFields(downloadPayload, {
+      encoding: "base64",
+      data: expected,
+    });
+  });
+
+  it("keeps unpadded base64 data URLs downloadable", async () => {
+    mockArtifactBlock(8, {
+      type: "image",
+      image_url: "data:image/gif;base64,R0lGOD",
+      alt: "tiny.gif",
     });
 
-    expectFields(artifacts[0], {
+    const listed = await listArtifacts({ sessionKey: "agent:main:main" });
+    const artifact = expectArtifactList(listed.calls).artifacts?.[0];
+    const artifactId = requireNonEmptyString(artifact?.id, "expected listed artifact id");
+    expectFields(artifact, {
+      title: "tiny.gif",
+      mimeType: "image/gif",
+      sizeBytes: 4,
+    });
+    expectFields(artifact?.download, { mode: "bytes" });
+
+    const download = await downloadArtifact({
+      sessionKey: "agent:main:main",
+      artifactId,
+    });
+    const downloadPayload = expectOkPayload(download.calls) as Record<string, unknown>;
+    expectFields(downloadPayload, {
+      encoding: "base64",
+      data: "R0lGOD==",
+    });
+  });
+
+  it("treats unsafe artifact URLs as unsupported downloads", async () => {
+    mockedMessages([
+      {
+        role: "assistant",
+        content: [{ type: "file", title: "secret.txt", url: "file:///etc/passwd" }],
+        __openclaw: { seq: 4 },
+      },
+    ]);
+
+    const { calls } = await listArtifacts({ sessionKey: "agent:main:main" });
+    const artifacts = expectArtifactList(calls).artifacts;
+    expectFields(artifacts?.[0], {
       title: "secret.txt",
     });
-    expectFields(artifacts[0]?.download, { mode: "unsupported" });
-    expect(artifacts[0]).not.toHaveProperty("url");
+    expectFields(artifacts?.[0]?.download, { mode: "unsupported" });
+    expect(artifacts?.[0]).not.toHaveProperty("url");
   });
 
   it("returns typed errors for missing query scope and missing artifacts", async () => {

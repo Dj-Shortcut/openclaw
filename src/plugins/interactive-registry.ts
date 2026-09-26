@@ -1,59 +1,75 @@
-// Maintains interactive plugin registry entries discovered from manifests.
 import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import {
-  normalizePluginInteractiveNamespace,
   resolvePluginInteractiveMatch,
   toPluginInteractiveRegistryKey,
   validatePluginInteractiveNamespace,
 } from "./interactive-shared.js";
+import { clearPluginInteractiveHandlersState } from "./interactive-state.js";
+import { wrapCurrentPluginInstance } from "./plugin-instance-scope.js";
+import type { PluginRegistry } from "./registry-types.js";
 import {
-  clearPluginInteractiveHandlerRegistrationsState,
-  clearPluginInteractiveHandlersState,
-  getPluginInteractiveHandlersState,
-  type RegisteredInteractiveHandler,
-} from "./interactive-state.js";
+  getPluginRegistrationContext,
+  requireActivePluginChannelRegistry,
+  resolveDirectPluginRegistrationOwner,
+} from "./runtime.js";
 import type { PluginInteractiveHandlerRegistration } from "./types.js";
 
+/** Registered interactive handler with owning plugin metadata. */
+export type RegisteredInteractiveHandler = PluginInteractiveHandlerRegistration & {
+  pluginId: string;
+  pluginName?: string;
+  pluginRoot?: string;
+};
+
 /** Registration result for plugin interactive namespace handlers. */
-export type InteractiveRegistrationResult = {
+type InteractiveRegistrationResult = {
   ok: boolean;
   error?: string;
 };
 
-/** Resolves a channel payload to a registered plugin interactive namespace handler. */
-export function resolvePluginInteractiveNamespaceMatch(
+/** Resolves a handler from registry-owned registrations without changing global state. */
+export function resolvePluginInteractiveRegistrationsMatch(
+  registrations: readonly RegisteredInteractiveHandler[],
   channel: string,
   data: string,
 ): { registration: RegisteredInteractiveHandler; namespace: string; payload: string } | null {
   return resolvePluginInteractiveMatch({
-    interactiveHandlers: getPluginInteractiveHandlersState(),
+    interactiveHandlers: {
+      get: (key) =>
+        registrations.find(
+          (entry) => toPluginInteractiveRegistryKey(entry.channel, entry.namespace) === key,
+        ),
+    },
     channel,
     data,
   });
 }
 
-/** Registers one plugin interactive namespace for a channel. */
-export function registerPluginInteractiveHandler(
+/** Registers one handler whose lifetime follows its owning plugin registry. */
+export function registerPluginInteractiveHandlerInRegistry(
+  registry: PluginRegistry,
   pluginId: string,
   registration: PluginInteractiveHandlerRegistration,
   opts?: { pluginName?: string; pluginRoot?: string },
 ): InteractiveRegistrationResult {
-  const interactiveHandlers = getPluginInteractiveHandlersState();
-  const namespace = normalizePluginInteractiveNamespace(registration.namespace);
+  const registrations = registry.interactiveHandlers;
+  const namespace = registration.namespace.trim();
   const validationError = validatePluginInteractiveNamespace(namespace);
   if (validationError) {
     return { ok: false, error: validationError };
   }
   const key = toPluginInteractiveRegistryKey(registration.channel, namespace);
-  const existing = interactiveHandlers.get(key);
+  const existing = registrations.find(
+    (entry) => toPluginInteractiveRegistryKey(entry.channel, entry.namespace) === key,
+  );
   if (existing) {
     return {
       ok: false,
       error: `Interactive handler namespace "${namespace}" already registered by plugin "${existing.pluginId}"`,
     };
   }
-  interactiveHandlers.set(key, {
-    ...registration,
+  registrations.push({
+    ...wrapCurrentPluginInstance(registration),
     namespace,
     channel: normalizeOptionalLowercaseString(registration.channel) ?? "",
     pluginId,
@@ -63,46 +79,22 @@ export function registerPluginInteractiveHandler(
   return { ok: true };
 }
 
+/** Registers one process-global interactive handler. */
+export function registerPluginInteractiveHandler(
+  pluginId: string,
+  registration: PluginInteractiveHandlerRegistration,
+  opts?: { pluginName?: string; pluginRoot?: string },
+): InteractiveRegistrationResult {
+  return registerPluginInteractiveHandlerInRegistry(
+    getPluginRegistrationContext()?.registry ?? requireActivePluginChannelRegistry(),
+    resolveDirectPluginRegistrationOwner(pluginId) ?? pluginId,
+    registration,
+    opts,
+  );
+}
+
 /** Clears all active plugin interactive handlers. */
 export function clearPluginInteractiveHandlers(): void {
+  requireActivePluginChannelRegistry().interactiveHandlers.length = 0;
   clearPluginInteractiveHandlersState();
-}
-
-/** Clears stored plugin interactive handler registrations. */
-export function clearPluginInteractiveHandlerRegistrations(): void {
-  clearPluginInteractiveHandlerRegistrationsState();
-}
-
-/** Clears active interactive handlers owned by one plugin. */
-export function clearPluginInteractiveHandlersForPlugin(pluginId: string): void {
-  const interactiveHandlers = getPluginInteractiveHandlersState();
-  for (const [key, value] of interactiveHandlers.entries()) {
-    if (value.pluginId === pluginId) {
-      interactiveHandlers.delete(key);
-    }
-  }
-}
-
-/** Lists active plugin interactive handlers. */
-export function listPluginInteractiveHandlers(): RegisteredInteractiveHandler[] {
-  return Array.from(getPluginInteractiveHandlersState().values());
-}
-
-/** Restores active plugin interactive handlers from a saved registry snapshot. */
-export function restorePluginInteractiveHandlers(
-  registrations: readonly RegisteredInteractiveHandler[],
-): void {
-  clearPluginInteractiveHandlerRegistrations();
-  const interactiveHandlers = getPluginInteractiveHandlersState();
-  for (const registration of registrations) {
-    const namespace = normalizePluginInteractiveNamespace(registration.namespace);
-    if (!namespace) {
-      continue;
-    }
-    interactiveHandlers.set(toPluginInteractiveRegistryKey(registration.channel, namespace), {
-      ...registration,
-      namespace,
-      channel: normalizeOptionalLowercaseString(registration.channel) ?? "",
-    });
-  }
 }

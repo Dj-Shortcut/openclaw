@@ -2,9 +2,10 @@
  * Formats Codex command responses for safe chat display, including status,
  * lists, account summaries, and user-facing help text.
  */
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { CodexComputerUseStatus } from "./app-server/computer-use.js";
 import type { CodexAppServerModelListResult } from "./app-server/models.js";
-import { isJsonObject, type JsonObject, type JsonValue } from "./app-server/protocol.js";
+import { isJsonObject, type JsonValue } from "./app-server/protocol.js";
 import {
   hasCodexRateLimitSnapshots,
   summarizeCodexAccountRateLimits,
@@ -96,13 +97,18 @@ export function formatThreads(response: JsonValue | undefined): string {
     "Codex threads:",
     ...threads.slice(0, 10).map((thread) => {
       const record = isJsonObject(thread) ? thread : {};
-      const id = readString(record, "threadId") ?? readString(record, "id") ?? "<unknown>";
+      const id =
+        normalizeOptionalString(record.threadId) ??
+        normalizeOptionalString(record.id) ??
+        "<unknown>";
       const title =
-        readString(record, "title") ?? readString(record, "name") ?? readString(record, "summary");
+        normalizeOptionalString(record.title) ??
+        normalizeOptionalString(record.name) ??
+        normalizeOptionalString(record.summary);
       const details = [
-        readString(record, "model"),
-        readString(record, "cwd"),
-        readString(record, "updatedAt") ?? readString(record, "lastUpdatedAt"),
+        normalizeOptionalString(record.model),
+        normalizeOptionalString(record.cwd),
+        normalizeOptionalString(record.updatedAt) ?? normalizeOptionalString(record.lastUpdatedAt),
       ].filter((value): value is string => Boolean(value));
       return `- ${formatCodexDisplayText(id)}${title ? ` - ${formatCodexDisplayText(title)}` : ""}${
         details.length > 0 ? ` (${details.map(formatCodexDisplayText).join(", ")})` : ""
@@ -117,7 +123,7 @@ export function formatAccount(
   limits: SafeValue<JsonValue | undefined>,
   authOverview?: CodexAccountAuthOverview,
 ): string {
-  if (authOverview) {
+  if (authOverview?.rows.some((row) => row.active)) {
     return formatAccountAuthOverview(authOverview);
   }
   const formattedLimits = limits.ok
@@ -131,6 +137,7 @@ export function formatAccount(
   return [
     `Account: ${account.ok ? formatCodexAccountSummary(account.value) : formatCodexDisplayText(account.error)}`,
     rateLimitBlock,
+    ...(authOverview ? [formatAccountAuthOverview(authOverview)] : []),
   ].join("\n\n");
 }
 
@@ -171,15 +178,34 @@ export function formatComputerUseStatus(status: CodexComputerUseStatus): string 
     `Plugin: ${formatCodexDisplayText(status.pluginName)} (${computerUsePluginState(status)})`,
   );
   lines.push(
+    `Installation: ${formatCodexDisplayText(status.installation.status)} (${status.installation.ok ? "ok" : "not ok"})`,
+  );
+  lines.push(
     `MCP server: ${formatCodexDisplayText(status.mcpServerName)}${
       status.mcpServerAvailable ? ` (${status.tools.length} tools)` : " (unavailable)"
     }`,
   );
+  lines.push(
+    `Exposure: ${formatCodexDisplayText(status.exposure.status)} (${status.exposure.ok ? "ok" : "not ok"})`,
+  );
+  lines.push(
+    `Live test: ${formatCodexDisplayText(status.liveTest.status)} (${status.liveTest.attempted ? `${status.liveTest.attempts} attempt${status.liveTest.attempts === 1 ? "" : "s"}, ${status.liveTest.timeoutMs}ms` : "not run"})`,
+  );
+  if (status.liveTest.retried || status.liveTest.repaired) {
+    lines.push(
+      `Live test recovery: retried=${status.liveTest.retried ? "yes" : "no"}, repaired=${
+        status.liveTest.repaired ? "yes" : "no"
+      }`,
+    );
+  }
   if (status.marketplaceName) {
     lines.push(`Marketplace: ${formatCodexDisplayText(status.marketplaceName)}`);
   }
   if (status.tools.length > 0) {
     lines.push(`Tools: ${status.tools.slice(0, 8).map(formatCodexDisplayText).join(", ")}`);
+  }
+  for (const warning of status.warnings) {
+    lines.push(`Warning: ${formatCodexDisplayText(warning)}`);
   }
   lines.push(formatCodexDisplayText(status.message));
   return lines.join("\n");
@@ -203,7 +229,9 @@ export function formatList(response: JsonValue | undefined, label: string): stri
     ...entries.slice(0, 25).map((entry) => {
       const record = isJsonObject(entry) ? entry : {};
       return `- ${formatCodexDisplayText(
-        readString(record, "name") ?? readString(record, "id") ?? JSON.stringify(entry),
+        normalizeOptionalString(record.name) ??
+          normalizeOptionalString(record.id) ??
+          JSON.stringify(entry),
       )}`;
     }),
   ].join("\n");
@@ -211,48 +239,19 @@ export function formatList(response: JsonValue | undefined, label: string): stri
 
 /** Formats Codex skills grouped by scope, omitting disabled entries. */
 export function formatSkills(response: JsonValue | undefined): string {
-  const groups = isJsonObject(response) && Array.isArray(response.data) ? response.data : [];
-  if (groups.length === 0) {
-    return "Codex skills: none returned.";
-  }
-  const lines = ["Codex skills:"];
-  let renderedSkills = 0;
-  let loadErrors = 0;
-  for (const group of groups) {
-    const record = isJsonObject(group) ? group : {};
-    if (Array.isArray(record.errors)) {
-      loadErrors += record.errors.length;
-    }
-    const skills = Array.isArray(record.skills) ? record.skills : [];
-    if (skills.length === 0) {
-      continue;
-    }
-    for (const skill of skills) {
-      if (isJsonObject(skill) && skill.enabled === false) {
-        continue;
-      }
-      lines.push(`- ${formatCodexSkillEntry(skill)}`);
-      renderedSkills += 1;
-    }
-  }
-  if (renderedSkills === 0) {
-    if (loadErrors > 0) {
-      return `Codex skills: none returned (${loadErrors} load ${
-        loadErrors === 1 ? "error" : "errors"
-      }).`;
-    }
-    return "Codex skills: none returned.";
-  }
-  return lines.join("\n");
+  const { skills, emptySummary } = readEnabledCodexSkills(response);
+  return skills.length > 0
+    ? ["Codex skills:", ...skills.map((skill) => `- ${formatCodexSkillEntry(skill)}`)].join("\n")
+    : `Codex skills: ${emptySummary}.`;
 }
 
 function formatCodexSkillEntry(entry: JsonValue): string {
   const record = isJsonObject(entry) ? entry : {};
-  const name = readString(record, "name") ?? "<unknown>";
+  const name = normalizeOptionalString(record.name) ?? "<unknown>";
   return `\`${formatCodexDisplayText(name)}\``;
 }
 
-const CODEX_RESUME_SAFE_THREAD_ID_PATTERN = /^[A-Za-z0-9._:-]+$/;
+export const CODEX_RESUME_SAFE_THREAD_ID_PATTERN = /^[A-Za-z0-9._:-]+$/;
 
 function formatCodexResumeHint(threadId: string): string {
   const safe = formatCodexTextForDisplay(threadId);
@@ -274,7 +273,7 @@ function formatCodexAccountSummary(value: JsonValue | undefined): string {
     : escapeCodexChatText(safe);
 }
 
-function formatCodexTextForDisplay(value: string): string {
+export function formatCodexTextForDisplay(value: string): string {
   const safe = sanitizeCodexTextForDisplay(value).trim();
   return safe || "<unknown>";
 }
@@ -288,7 +287,7 @@ function sanitizeCodexTextForDisplay(value: string): string {
   return safe;
 }
 
-function escapeCodexChatText(value: string): string {
+export function escapeCodexChatText(value: string): string {
   // Command output is public chat text. Escape markdown/control triggers and
   // mention characters so Codex data cannot ping users or inject formatting.
   return value
@@ -311,7 +310,7 @@ function escapeCodexChatTextPreservingAt(value: string): string {
   return escapeCodexChatText(value).replaceAll("\uff20", "@");
 }
 
-function formatCodexAccountLine(value: string): string {
+export function formatCodexAccountLine(value: string): string {
   if (value === "") {
     return "";
   }
@@ -359,6 +358,7 @@ export function buildHelp(): string {
     "- /codex status",
     "- /codex models",
     "- /codex threads [filter]",
+    "- /codex goal [status|set <objective>|pause|resume|block|complete|clear]",
     "- /codex sessions --host <node> [filter]",
     "- /codex resume <thread-id>",
     "- /codex resume <session-id> --host <node> --bind here",
@@ -375,6 +375,7 @@ export function buildHelp(): string {
     "- /codex diagnostics [note]",
     "- /codex computer-use [status|install]",
     "- /codex account",
+    "- /codex plugins refresh                   refresh hosted inventory for the current Codex account/runtime",
     "- /codex mcp",
     "- /codex skills",
     "- /codex plugins [list|enable|disable]",
@@ -386,15 +387,15 @@ function summarizeAccount(value: JsonValue | undefined): string {
     return "unavailable";
   }
   const account = isJsonObject(value.account) ? value.account : value;
-  const accountType = readString(account, "type");
+  const accountType = normalizeOptionalString(account.type);
   if (accountType === "amazonBedrock") {
     return "Amazon Bedrock";
   }
   return (
-    readString(account, "email") ??
-    readString(account, "accountEmail") ??
-    readString(account, "planType") ??
-    readString(account, "id") ??
+    normalizeOptionalString(account.email) ??
+    normalizeOptionalString(account.accountEmail) ??
+    normalizeOptionalString(account.planType) ??
+    normalizeOptionalString(account.id) ??
     "available"
   );
 }
@@ -407,12 +408,12 @@ function summarizeArrayLike(value: JsonValue | undefined): string {
   return `${entries.length}`;
 }
 
-function summarizeCodexSkills(value: JsonValue | undefined): string {
+function readEnabledCodexSkills(value: JsonValue | undefined): {
+  skills: JsonValue[];
+  emptySummary: string;
+} {
   const groups = isJsonObject(value) && Array.isArray(value.data) ? value.data : [];
-  if (groups.length === 0) {
-    return "none returned";
-  }
-  let enabledSkills = 0;
+  const skills: JsonValue[] = [];
   let loadErrors = 0;
   for (const group of groups) {
     if (!isJsonObject(group)) {
@@ -421,20 +422,24 @@ function summarizeCodexSkills(value: JsonValue | undefined): string {
     if (Array.isArray(group.errors)) {
       loadErrors += group.errors.length;
     }
-    if (!Array.isArray(group.skills)) {
-      continue;
+    for (const skill of Array.isArray(group.skills) ? group.skills : []) {
+      if (!isJsonObject(skill) || skill.enabled !== false) {
+        skills.push(skill);
+      }
     }
-    enabledSkills += group.skills.filter(
-      (skill) => !isJsonObject(skill) || skill.enabled !== false,
-    ).length;
   }
-  if (enabledSkills > 0) {
-    return `${enabledSkills}`;
-  }
-  if (loadErrors > 0) {
-    return `none returned (${loadErrors} load ${loadErrors === 1 ? "error" : "errors"})`;
-  }
-  return "none returned";
+  return {
+    skills,
+    emptySummary:
+      loadErrors > 0
+        ? `none returned (${loadErrors} load ${loadErrors === 1 ? "error" : "errors"})`
+        : "none returned",
+  };
+}
+
+function summarizeCodexSkills(value: JsonValue | undefined): string {
+  const { skills, emptySummary } = readEnabledCodexSkills(value);
+  return skills.length > 0 ? `${skills.length}` : emptySummary;
 }
 
 function formatCodexRateLimitSummary(value: JsonValue | undefined): string {
@@ -481,7 +486,8 @@ function isMeaningfulRateLimitSnapshot(value: JsonValue | undefined): boolean {
     return false;
   }
   const reachedType =
-    readString(value, "rateLimitReachedType") ?? readString(value, "rate_limit_reached_type");
+    normalizeOptionalString(value.rateLimitReachedType) ??
+    normalizeOptionalString(value.rate_limit_reached_type);
   if (reachedType) {
     return true;
   }
@@ -505,10 +511,4 @@ function extractArray(value: JsonValue | undefined): JsonValue[] {
     }
   }
   return [];
-}
-
-/** Reads and trims a non-empty string field from a JSON object. */
-export function readString(record: JsonObject, key: string): string | undefined {
-  const value = record[key];
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }

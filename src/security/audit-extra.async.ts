@@ -3,7 +3,6 @@
  *
  * These functions perform I/O (filesystem, config reads) to detect security issues.
  */
-import fs from "node:fs/promises";
 import path from "node:path";
 import { clearTimeout as clearNodeTimeout, setTimeout as setNodeTimeout } from "node:timers";
 import {
@@ -12,35 +11,18 @@ import {
 } from "@openclaw/normalization-core/string-coerce";
 import {
   normalizeStringEntries,
-  normalizeTrimmedStringList,
   uniqueStrings,
 } from "@openclaw/normalization-core/string-normalization";
 import { resolveAuthProfileDatabaseFilePaths } from "../agents/auth-profiles/sqlite.js";
 import { formatCliCommand } from "../cli/command-format.js";
-import { MANIFEST_KEY } from "../compat/legacy-names.js";
 import type { OpenClawConfig, ConfigFileSnapshot } from "../config/config.js";
 import { collectIncludePathsRecursive } from "../config/includes-scan.js";
 import { resolveOAuthDir } from "../config/paths.js";
-import { normalizeAgentId } from "../routing/session-key.js";
-import type { SkillScanFinding } from "../skills/security/scanner.js";
-import { shouldIgnoreInstalledPluginDirName } from "./installed-plugin-dirs.js";
-import { extensionUsesSkippedScannerPath, isPathInside } from "./scan-paths.js";
+import { LEGACY_IMPLICIT_AGENT_ID, normalizeAgentId } from "../routing/session-key.js";
+import { createLazyRuntimeModule, createLazyRuntimeNamedExport } from "../shared/lazy-runtime.js";
+import type { SecurityAuditFinding } from "./audit.types.js";
 import type { ExecFn } from "./windows-acl.js";
 
-export type SecurityAuditFinding = {
-  checkId: string;
-  severity: "info" | "warn" | "critical";
-  title: string;
-  detail: string;
-  remediation?: string;
-};
-
-type CollectPluginsTrustFindingsParams = Parameters<
-  typeof import("./audit-plugins-trust.js").collectPluginsTrustFindings
->[0];
-type SkillScanSummary = Awaited<
-  ReturnType<typeof import("../skills/security/scanner.js").scanDirectoryWithSummary>
->;
 type ExecDockerRawFn = (
   args: string[],
   opts?: { allowFailure?: boolean; input?: Buffer | string; signal?: AbortSignal },
@@ -48,112 +30,25 @@ type ExecDockerRawFn = (
 
 const DEFAULT_SANDBOX_BROWSER_DOCKER_PROBE_TIMEOUT_MS = 5000;
 
-type CodeSafetySummaryCache = Map<string, Promise<unknown>>;
-let skillsModulePromise: Promise<typeof import("../skills/loading/workspace.js")> | undefined;
-let configModulePromise: Promise<typeof import("../config/config.js")> | undefined;
-let agentScopeModulePromise: Promise<typeof import("../agents/agent-scope.js")> | undefined;
-let agentWorkspaceDirsModulePromise:
-  | Promise<typeof import("../agents/workspace-dirs.js")>
-  | undefined;
-let skillSourceModulePromise: Promise<typeof import("../skills/loading/source.js")> | undefined;
-let sandboxDockerModulePromise: Promise<typeof import("../agents/sandbox/docker.js")> | undefined;
-let sandboxConstantsModulePromise:
-  | Promise<typeof import("../agents/sandbox/constants.js")>
-  | undefined;
-let auditPluginsTrustModulePromise: Promise<typeof import("./audit-plugins-trust.js")> | undefined;
-let auditFsModulePromise: Promise<typeof import("./audit-fs.js")> | undefined;
-let skillScannerModulePromise: Promise<typeof import("../skills/security/scanner.js")> | undefined;
+const loadConfigModule = createLazyRuntimeModule(() => import("../config/config.js"));
 
-function loadSkillsModule() {
-  skillsModulePromise ??= import("../skills/loading/workspace.js");
-  return skillsModulePromise;
-}
+const loadAuditFsModule = createLazyRuntimeModule(() => import("./audit-fs.js"));
 
-function loadConfigModule() {
-  configModulePromise ??= import("../config/config.js");
-  return configModulePromise;
-}
+const loadAgentScopeModule = createLazyRuntimeModule(() => import("../agents/agent-scope.js"));
 
-function loadAuditFsModule() {
-  auditFsModulePromise ??= import("./audit-fs.js");
-  return auditFsModulePromise;
-}
+const loadExecDockerRaw = createLazyRuntimeNamedExport(
+  () => import("../agents/sandbox/docker.js"),
+  "execDockerRaw",
+) satisfies () => Promise<ExecDockerRawFn>;
 
-function loadAgentScopeModule() {
-  agentScopeModulePromise ??= import("../agents/agent-scope.js");
-  return agentScopeModulePromise;
-}
-
-function loadAgentWorkspaceDirsModule() {
-  agentWorkspaceDirsModulePromise ??= import("../agents/workspace-dirs.js");
-  return agentWorkspaceDirsModulePromise;
-}
-
-function loadSkillSourceModule() {
-  skillSourceModulePromise ??= import("../skills/loading/source.js");
-  return skillSourceModulePromise;
-}
-
-function loadSkillScannerModule() {
-  skillScannerModulePromise ??= import("../skills/security/scanner.js");
-  return skillScannerModulePromise;
-}
-
-async function loadExecDockerRaw(): Promise<ExecDockerRawFn> {
-  sandboxDockerModulePromise ??= import("../agents/sandbox/docker.js");
-  const { execDockerRaw } = await sandboxDockerModulePromise;
-  return execDockerRaw;
-}
-
-async function loadSandboxBrowserSecurityHashEpoch(): Promise<string> {
-  sandboxConstantsModulePromise ??= import("../agents/sandbox/constants.js");
-  const { SANDBOX_BROWSER_SECURITY_HASH_EPOCH } = await sandboxConstantsModulePromise;
-  return SANDBOX_BROWSER_SECURITY_HASH_EPOCH;
-}
-
-export async function collectPluginsTrustFindings(
-  params: CollectPluginsTrustFindingsParams,
-): Promise<SecurityAuditFinding[]> {
-  auditPluginsTrustModulePromise ??= import("./audit-plugins-trust.js");
-  const { collectPluginsTrustFindings: collect } = await auditPluginsTrustModulePromise;
-  return await collect(params);
-}
+const loadSandboxBrowserSecurityHashEpoch = createLazyRuntimeNamedExport(
+  () => import("../agents/sandbox/constants.js"),
+  "SANDBOX_BROWSER_SECURITY_HASH_EPOCH",
+);
 
 // --------------------------------------------------------------------------
 // Helpers
 // --------------------------------------------------------------------------
-
-async function safeStat(targetPath: string): Promise<{
-  ok: boolean;
-  isSymlink: boolean;
-  isDir: boolean;
-  mode: number | null;
-  uid: number | null;
-  gid: number | null;
-  error?: string;
-}> {
-  try {
-    const lst = await fs.lstat(targetPath);
-    return {
-      ok: true,
-      isSymlink: lst.isSymbolicLink(),
-      isDir: lst.isDirectory(),
-      mode: typeof lst.mode === "number" ? lst.mode : null,
-      uid: typeof lst.uid === "number" ? lst.uid : null,
-      gid: typeof lst.gid === "number" ? lst.gid : null,
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      isSymlink: false,
-      isDir: false,
-      mode: null,
-      uid: null,
-      gid: null,
-      error: String(err),
-    };
-  }
-}
 
 function expandTilde(p: string, env: NodeJS.ProcessEnv): string | null {
   if (!p.startsWith("~")) {
@@ -170,105 +65,6 @@ function expandTilde(p: string, env: NodeJS.ProcessEnv): string | null {
     return path.join(home, p.slice(2));
   }
   return null;
-}
-
-async function readPluginManifestExtensions(pluginPath: string): Promise<string[]> {
-  const manifestPath = path.join(pluginPath, "package.json");
-  const raw = await fs.readFile(manifestPath, "utf-8").catch(() => "");
-  if (!raw.trim()) {
-    return [];
-  }
-
-  let parsed: Partial<Record<typeof MANIFEST_KEY, { extensions?: unknown }>> | null;
-  try {
-    parsed = JSON.parse(raw) as Partial<
-      Record<typeof MANIFEST_KEY, { extensions?: unknown }>
-    > | null;
-  } catch (err) {
-    // Re-throw so callers can surface a security finding for malformed manifests.
-    // A malicious plugin could use a malformed package.json to hide declared
-    // extension entrypoints from deep scan — callers must not silently drop them.
-    throw new Error(`Failed to parse plugin manifest at ${manifestPath}: ${String(err)}`, {
-      cause: err,
-    });
-  }
-  const extensions = parsed?.[MANIFEST_KEY]?.extensions;
-  if (!Array.isArray(extensions)) {
-    return [];
-  }
-  return normalizeTrimmedStringList(extensions);
-}
-
-function formatCodeSafetyDetails(findings: SkillScanFinding[], rootDir: string): string {
-  return findings
-    .map((finding) => {
-      const relPath = path.relative(rootDir, finding.file);
-      const filePath =
-        relPath && relPath !== "." && !relPath.startsWith("..")
-          ? relPath
-          : path.basename(finding.file);
-      const normalizedPath = filePath.replaceAll("\\", "/");
-      return `  - [${finding.ruleId}] ${finding.message} (${normalizedPath}:${finding.line})`;
-    })
-    .join("\n");
-}
-
-async function listInstalledPluginDirs(params: {
-  stateDir: string;
-  onReadError?: (error: unknown) => void;
-}): Promise<{ extensionsDir: string; pluginDirs: string[] }> {
-  const extensionsDir = path.join(params.stateDir, "extensions");
-  const st = await safeStat(extensionsDir);
-  if (!st.ok || !st.isDir) {
-    return { extensionsDir, pluginDirs: [] };
-  }
-  const entries = await fs.readdir(extensionsDir, { withFileTypes: true }).catch((err: unknown) => {
-    params.onReadError?.(err);
-    return [];
-  });
-  const pluginDirs = entries
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-    .filter((name) => !shouldIgnoreInstalledPluginDirName(name))
-    .filter(Boolean);
-  return { extensionsDir, pluginDirs };
-}
-
-function buildCodeSafetySummaryCacheKey(params: {
-  dirPath: string;
-  includeFiles?: string[];
-}): string {
-  const includeFiles = normalizeStringEntries(params.includeFiles);
-  const includeKey = includeFiles.length > 0 ? includeFiles.toSorted().join("\u0000") : "";
-  return `${params.dirPath}\u0000${includeKey}`;
-}
-
-async function getCodeSafetySummary(params: {
-  dirPath: string;
-  includeFiles?: string[];
-  summaryCache?: CodeSafetySummaryCache;
-}): Promise<SkillScanSummary> {
-  const cacheKey = buildCodeSafetySummaryCacheKey({
-    dirPath: params.dirPath,
-    includeFiles: params.includeFiles,
-  });
-  const cache = params.summaryCache;
-  if (cache) {
-    const hit = cache.get(cacheKey);
-    if (hit) {
-      return (await hit) as SkillScanSummary;
-    }
-    const skillScanner = await loadSkillScannerModule();
-    const pending = skillScanner.scanDirectoryWithSummary(params.dirPath, {
-      includeFiles: params.includeFiles,
-    });
-    cache.set(cacheKey, pending);
-    return await pending;
-  }
-  const skillScanner = await loadSkillScannerModule();
-  return await skillScanner.scanDirectoryWithSummary(params.dirPath, {
-    includeFiles: params.includeFiles,
-  });
 }
 
 // --------------------------------------------------------------------------
@@ -579,6 +375,7 @@ export async function collectIncludeFilePermFindings(params: {
   const includePaths = await collectIncludePathsRecursive({
     configPath,
     parsed: params.configSnapshot.parsed,
+    env: params.env,
   });
   if (includePaths.length === 0) {
     return findings;
@@ -693,19 +490,22 @@ export async function collectStateDeepFilesystemFindings(params: {
     }
   }
 
-  const agentIds = Array.isArray(params.cfg.agents?.list)
-    ? params.cfg.agents?.list
-        .map(
-          (a) =>
-            normalizeOptionalString(
-              a && typeof a === "object" ? (a as { id?: unknown }).id : undefined,
-            ) ?? "",
-        )
-        .filter(Boolean)
-    : [];
-  const { resolveDefaultAgentId } = await loadAgentScopeModule();
-  const defaultAgentId = resolveDefaultAgentId(params.cfg);
-  const ids = uniqueStrings([defaultAgentId, ...agentIds]).map((id) => normalizeAgentId(id));
+  const agentScope = await loadAgentScopeModule();
+  const agentIds = agentScope.listAgentEntries(params.cfg).map((agent) => agent.id);
+  let defaultAgentId: string | undefined;
+  if (agentIds.length > 0) {
+    try {
+      defaultAgentId = agentScope.resolveDefaultAgentId(params.cfg);
+    } catch {
+      // Security audits must still inspect known agent stores when a malformed
+      // roster prevents normal default selection; config findings report that defect.
+    }
+  }
+  const ids = uniqueStrings([
+    LEGACY_IMPLICIT_AGENT_ID,
+    ...(defaultAgentId ? [defaultAgentId] : []),
+    ...agentIds,
+  ]).map((id) => normalizeAgentId(id));
 
   for (const agentId of ids) {
     const agentDir = path.join(params.stateDir, "agents", agentId, "agent");
@@ -822,204 +622,4 @@ export async function readConfigSnapshotForAudit(params: {
     env: params.env,
     configPath: params.configPath,
   }).readConfigFileSnapshot();
-}
-
-export async function collectPluginsCodeSafetyFindings(params: {
-  stateDir: string;
-  summaryCache?: CodeSafetySummaryCache;
-}): Promise<SecurityAuditFinding[]> {
-  const findings: SecurityAuditFinding[] = [];
-  const { extensionsDir, pluginDirs } = await listInstalledPluginDirs({
-    stateDir: params.stateDir,
-    onReadError: (err) => {
-      findings.push({
-        checkId: "plugins.code_safety.scan_failed",
-        severity: "warn",
-        title: "Plugin extensions directory scan failed",
-        detail: `Static code scan could not list extensions directory: ${String(err)}`,
-        remediation:
-          "Check file permissions and plugin layout, then rerun `openclaw security audit --deep`.",
-      });
-    },
-  });
-
-  for (const pluginName of pluginDirs) {
-    const pluginPath = path.join(extensionsDir, pluginName);
-    let extensionEntries: string[] = [];
-    try {
-      extensionEntries = await readPluginManifestExtensions(pluginPath);
-    } catch (manifestErr) {
-      // Malformed package.json — surface a warning so the user investigates.
-      // A plugin could deliberately corrupt its manifest to hide declared
-      // extension entrypoints from the deep code scanner.
-      findings.push({
-        checkId: "plugins.code_safety.manifest_parse_error",
-        severity: "warn",
-        title: `Plugin "${pluginName}" has a malformed package.json`,
-        detail:
-          `Could not parse plugin manifest: ${String(manifestErr)}.\n` +
-          "The extension entrypoint list is unavailable. Deep scan will cover the plugin directory but may miss entries declared via `openclaw.extensions`.",
-        remediation:
-          "Inspect the plugin package.json for syntax errors. If the plugin is untrusted, remove it from your OpenClaw extensions state directory.",
-      });
-      // Continue — getCodeSafetySummary below still scans the plugin directory
-    }
-    const forcedScanEntries: string[] = [];
-    const escapedEntries: string[] = [];
-
-    for (const entry of extensionEntries) {
-      const resolvedEntry = path.resolve(pluginPath, entry);
-      if (!isPathInside(pluginPath, resolvedEntry)) {
-        escapedEntries.push(entry);
-        continue;
-      }
-      if (extensionUsesSkippedScannerPath(entry)) {
-        findings.push({
-          checkId: "plugins.code_safety.entry_path",
-          severity: "warn",
-          title: `Plugin "${pluginName}" entry path is hidden or node_modules`,
-          detail: `Extension entry "${entry}" points to a hidden or node_modules path. Deep code scan will cover this entry explicitly, but review this path choice carefully.`,
-          remediation: "Prefer extension entrypoints under normal source paths like dist/ or src/.",
-        });
-      }
-      forcedScanEntries.push(resolvedEntry);
-    }
-
-    if (escapedEntries.length > 0) {
-      findings.push({
-        checkId: "plugins.code_safety.entry_escape",
-        severity: "critical",
-        title: `Plugin "${pluginName}" has extension entry path traversal`,
-        detail: `Found extension entries that escape the plugin directory:\n${escapedEntries.map((entry) => `  - ${entry}`).join("\n")}`,
-        remediation:
-          "Update the plugin manifest so all openclaw.extensions entries stay inside the plugin directory.",
-      });
-    }
-
-    const summary = await getCodeSafetySummary({
-      dirPath: pluginPath,
-      includeFiles: forcedScanEntries,
-      summaryCache: params.summaryCache,
-    }).catch((err: unknown) => {
-      findings.push({
-        checkId: "plugins.code_safety.scan_failed",
-        severity: "warn",
-        title: `Plugin "${pluginName}" code scan failed`,
-        detail: `Static code scan could not complete: ${String(err)}`,
-        remediation:
-          "Check file permissions and plugin layout, then rerun `openclaw security audit --deep`.",
-      });
-      return null;
-    });
-    if (!summary) {
-      continue;
-    }
-
-    if (summary.critical > 0) {
-      const criticalFindings = summary.findings.filter((f) => f.severity === "critical");
-      const details = formatCodeSafetyDetails(criticalFindings, pluginPath);
-
-      findings.push({
-        checkId: "plugins.code_safety",
-        severity: "critical",
-        title: `Plugin "${pluginName}" contains dangerous code patterns`,
-        detail: `Found ${summary.critical} critical issue(s) in ${summary.scannedFiles} scanned file(s):\n${details}`,
-        remediation:
-          "Review the plugin source code carefully before use. If untrusted, remove the plugin from your OpenClaw extensions state directory.",
-      });
-    } else if (summary.warn > 0) {
-      const warnFindings = summary.findings.filter((f) => f.severity === "warn");
-      const details = formatCodeSafetyDetails(warnFindings, pluginPath);
-
-      findings.push({
-        checkId: "plugins.code_safety",
-        severity: "warn",
-        title: `Plugin "${pluginName}" contains suspicious code patterns`,
-        detail: `Found ${summary.warn} warning(s) in ${summary.scannedFiles} scanned file(s):\n${details}`,
-        remediation: `Review the flagged code to ensure it is intentional and safe.`,
-      });
-    }
-  }
-
-  return findings;
-}
-
-export async function collectInstalledSkillsCodeSafetyFindings(params: {
-  cfg: OpenClawConfig;
-  stateDir: string;
-  summaryCache?: CodeSafetySummaryCache;
-}): Promise<SecurityAuditFinding[]> {
-  const findings: SecurityAuditFinding[] = [];
-  const pluginExtensionsDir = path.join(params.stateDir, "extensions");
-  const scannedSkillDirs = new Set<string>();
-  const [{ listAgentWorkspaceDirs }, { resolveSkillSource }] = await Promise.all([
-    loadAgentWorkspaceDirsModule(),
-    loadSkillSourceModule(),
-  ]);
-  const workspaceDirs = listAgentWorkspaceDirs(params.cfg);
-  const { loadWorkspaceSkillEntries } = await loadSkillsModule();
-
-  for (const workspaceDir of workspaceDirs) {
-    const entries = loadWorkspaceSkillEntries(workspaceDir, { config: params.cfg });
-    for (const entry of entries) {
-      if (resolveSkillSource(entry.skill) === "openclaw-bundled") {
-        continue;
-      }
-
-      const skillDir = path.resolve(entry.skill.baseDir);
-      if (isPathInside(pluginExtensionsDir, skillDir)) {
-        // Plugin code is already covered by plugins.code_safety checks.
-        continue;
-      }
-      if (scannedSkillDirs.has(skillDir)) {
-        continue;
-      }
-      scannedSkillDirs.add(skillDir);
-
-      const skillName = entry.skill.name;
-      const summary = await getCodeSafetySummary({
-        dirPath: skillDir,
-        summaryCache: params.summaryCache,
-      }).catch((err: unknown) => {
-        findings.push({
-          checkId: "skills.code_safety.scan_failed",
-          severity: "warn",
-          title: `Skill "${skillName}" code scan failed`,
-          detail: `Static code scan could not complete for ${skillDir}: ${String(err)}`,
-          remediation:
-            "Check file permissions and skill layout, then rerun `openclaw security audit --deep`.",
-        });
-        return null;
-      });
-      if (!summary) {
-        continue;
-      }
-
-      if (summary.critical > 0) {
-        const criticalFindings = summary.findings.filter(
-          (finding) => finding.severity === "critical",
-        );
-        const details = formatCodeSafetyDetails(criticalFindings, skillDir);
-        findings.push({
-          checkId: "skills.code_safety",
-          severity: "critical",
-          title: `Skill "${skillName}" contains dangerous code patterns`,
-          detail: `Found ${summary.critical} critical issue(s) in ${summary.scannedFiles} scanned file(s) under ${skillDir}:\n${details}`,
-          remediation: `Review the skill source code before use. If untrusted, remove "${skillDir}".`,
-        });
-      } else if (summary.warn > 0) {
-        const warnFindings = summary.findings.filter((finding) => finding.severity === "warn");
-        const details = formatCodeSafetyDetails(warnFindings, skillDir);
-        findings.push({
-          checkId: "skills.code_safety",
-          severity: "warn",
-          title: `Skill "${skillName}" contains suspicious code patterns`,
-          detail: `Found ${summary.warn} warning(s) in ${summary.scannedFiles} scanned file(s) under ${skillDir}:\n${details}`,
-          remediation: "Review flagged lines to ensure the behavior is intentional and safe.",
-        });
-      }
-    }
-  }
-
-  return findings;
 }

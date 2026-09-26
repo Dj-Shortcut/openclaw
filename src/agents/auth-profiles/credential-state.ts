@@ -5,15 +5,18 @@
  */
 import { MAX_DATE_TIMESTAMP_MS } from "@openclaw/normalization-core/number-coercion";
 import { coerceSecretRef, normalizeSecretInputString } from "../../config/types.secrets.js";
+import { isOAuthRefreshFence } from "./oauth-refresh-marker.js";
 import type { AuthProfileCredential, OAuthCredential } from "./types.js";
 
 /** Reason code for why a stored auth credential can or cannot be used. */
 export type AuthCredentialReasonCode =
   | "ok"
+  | "setup_inactive"
   | "missing_credential"
   | "invalid_expires"
   | "expired"
-  | "unresolved_ref";
+  | "unresolved_ref"
+  | "malformed_api_key";
 
 /** Default OAuth access-token refresh margin before expiry. */
 export const DEFAULT_OAUTH_REFRESH_MARGIN_MS = 5 * 60 * 1000;
@@ -57,7 +60,7 @@ export function hasUsableOAuthCredential(
     refreshMarginMs?: number;
   },
 ): boolean {
-  if (!credential || credential.type !== "oauth") {
+  if (!credential || credential.type !== "oauth" || isOAuthRefreshFence(credential)) {
     return false;
   }
   if (typeof credential.access !== "string" || credential.access.trim().length === 0) {
@@ -72,14 +75,12 @@ export function hasUsableOAuthCredential(
   );
 }
 
-// SecretRef and literal secret strings are both valid configured credentials;
-// unresolved refs are classified separately so callers can surface useful copy.
-function hasConfiguredSecretRef(value: unknown): boolean {
-  return coerceSecretRef(value) !== null;
-}
-
-function hasConfiguredSecretString(value: unknown): boolean {
-  return normalizeSecretInputString(value) !== undefined;
+export function isMalformedApiKeyInput(value: unknown): boolean {
+  const normalized = normalizeSecretInputString(value);
+  return (
+    normalized !== undefined &&
+    /^openclaw\s+onboard(?:\s+.*)?\s+--auth-choice(?:\s|=|$)/i.test(normalized)
+  );
 }
 
 /** Classifies whether a stored credential is eligible for auth selection. */
@@ -90,9 +91,14 @@ export function evaluateStoredCredentialEligibility(params: {
   const now = params.now ?? Date.now();
   const credential = params.credential;
 
+  // SecretRef and literal secret strings are both configured credentials;
+  // unresolved refs are classified separately for callers to surface useful copy.
   if (credential.type === "api_key") {
-    const hasKey = hasConfiguredSecretString(credential.key);
-    const hasKeyRef = hasConfiguredSecretRef(credential.keyRef);
+    const hasKey = normalizeSecretInputString(credential.key) !== undefined;
+    const hasKeyRef = coerceSecretRef(credential.keyRef) !== null;
+    if (isMalformedApiKeyInput(credential.key)) {
+      return { eligible: false, reasonCode: "malformed_api_key" };
+    }
     if (!hasKey && !hasKeyRef) {
       return { eligible: false, reasonCode: "missing_credential" };
     }
@@ -100,8 +106,8 @@ export function evaluateStoredCredentialEligibility(params: {
   }
 
   if (credential.type === "token") {
-    const hasToken = hasConfiguredSecretString(credential.token);
-    const hasTokenRef = hasConfiguredSecretRef(credential.tokenRef);
+    const hasToken = normalizeSecretInputString(credential.token) !== undefined;
+    const hasTokenRef = coerceSecretRef(credential.tokenRef) !== null;
     if (!hasToken && !hasTokenRef) {
       return { eligible: false, reasonCode: "missing_credential" };
     }
@@ -116,6 +122,9 @@ export function evaluateStoredCredentialEligibility(params: {
     return { eligible: true, reasonCode: "ok" };
   }
 
+  if (isOAuthRefreshFence(credential)) {
+    return { eligible: false, reasonCode: "expired" };
+  }
   if (
     normalizeSecretInputString(credential.access) === undefined &&
     normalizeSecretInputString(credential.refresh) === undefined

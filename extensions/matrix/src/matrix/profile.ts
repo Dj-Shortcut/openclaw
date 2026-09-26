@@ -1,11 +1,10 @@
-// Matrix plugin module implements profile behavior.
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { MatrixClient } from "./sdk.js";
 
-export const MATRIX_PROFILE_AVATAR_MAX_BYTES = 10 * 1024 * 1024;
+const MATRIX_PROFILE_AVATAR_MAX_BYTES = 10 * 1024 * 1024;
 
 type MatrixProfileClient = Pick<
   MatrixClient,
@@ -27,12 +26,12 @@ export type MatrixProfileSyncResult = {
   convertedAvatarFromHttp: boolean;
 };
 
-export function isMatrixMxcUri(value: string): boolean {
-  return normalizeLowercaseStringOrEmpty(normalizeOptionalString(value)).startsWith("mxc://");
+function isMatrixMxcUri(value: string): boolean {
+  return normalizeLowercaseStringOrEmpty(value).startsWith("mxc://");
 }
 
-export function isMatrixHttpAvatarUri(value: string): boolean {
-  const normalized = normalizeLowercaseStringOrEmpty(normalizeOptionalString(value));
+function isMatrixHttpAvatarUri(value: string): boolean {
+  const normalized = normalizeLowercaseStringOrEmpty(value);
   return normalized.startsWith("https://") || normalized.startsWith("http://");
 }
 
@@ -84,15 +83,7 @@ async function resolveAvatarUrl(params: {
   }
 
   const avatarUrl = normalizeOptionalString(params.avatarUrl) ?? null;
-  if (!avatarUrl) {
-    return {
-      resolvedAvatarUrl: null,
-      uploadedAvatarSource: null,
-      convertedAvatarFromHttp: false,
-    };
-  }
-
-  if (isMatrixMxcUri(avatarUrl)) {
+  if (!avatarUrl || isMatrixMxcUri(avatarUrl)) {
     return {
       resolvedAvatarUrl: avatarUrl,
       uploadedAvatarSource: null,
@@ -146,9 +137,8 @@ export async function syncMatrixOwnProfile(params: {
       skipped: true,
       displayNameUpdated: false,
       avatarUpdated: false,
+      ...avatar,
       resolvedAvatarUrl: null,
-      uploadedAvatarSource: avatar.uploadedAvatarSource,
-      convertedAvatarFromHttp: avatar.convertedAvatarFromHttp,
     };
   }
 
@@ -178,8 +168,6 @@ export async function syncMatrixOwnProfile(params: {
     skipped: false,
     displayNameUpdated,
     avatarUpdated,
-    resolvedAvatarUrl: desiredAvatarUrl,
-    uploadedAvatarSource: avatar.uploadedAvatarSource,
-    convertedAvatarFromHttp: avatar.convertedAvatarFromHttp,
+    ...avatar,
   };
 }

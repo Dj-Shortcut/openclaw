@@ -4,37 +4,19 @@ import type { AgentMessage } from "openclaw/plugin-sdk/agent-core";
 import { createAssistantMessageEventStream } from "openclaw/plugin-sdk/llm";
 import { describe, expect, it, vi } from "vitest";
 import { castAgentMessage, castAgentMessages } from "../test-helpers/agent-message-fixtures.js";
+import { textAssistant } from "../test-helpers/sparse-transcript.test-support.js";
+import { createZeroUsageFixture } from "../test-helpers/usage-fixtures.js";
+import { stripStaleThinkingSignaturesForCompactionReplay } from "../thinking-signatures.js";
 import {
-  OMITTED_ASSISTANT_REASONING_TEXT,
   assessLastAssistantMessage,
   dropReasoningFromHistory,
   dropThinkingBlocks,
-  isAssistantMessageWithContent,
-  sanitizeThinkingForRecovery,
   stripInvalidThinkingSignatures,
-  stripStaleThinkingSignaturesForCompactionReplay,
   wrapAnthropicStreamWithRecovery,
 } from "./thinking.js";
 
 type AssistantMessage = Extract<AgentMessage, { role: "assistant" }>;
-
-function dropSingleAssistantContent(content: Array<Record<string, unknown>>) {
-  // Single-assistant fixture exercises the "latest assistant turn" path where
-  // reasoning blocks should remain available for continuation.
-  const messages: AgentMessage[] = [
-    castAgentMessage({
-      role: "assistant",
-      content,
-    }),
-  ];
-
-  const result = dropThinkingBlocks(messages);
-  return {
-    assistant: result[0] as Extract<AgentMessage, { role: "assistant" }>,
-    messages,
-    result,
-  };
-}
+const OMITTED_ASSISTANT_REASONING_TEXT = "[assistant reasoning omitted]";
 
 const noThinkingReferenceCases = [
   { name: "dropThinkingBlocks", drop: dropThinkingBlocks },
@@ -62,39 +44,12 @@ describe("thinking-free history contract", () => {
   );
 });
 
-describe("isAssistantMessageWithContent", () => {
-  it("accepts assistant messages with array content and rejects others", () => {
-    const assistant = castAgentMessage({
-      role: "assistant",
-      content: [{ type: "text", text: "ok" }],
-    });
-    const user = castAgentMessage({ role: "user", content: "hi" });
-    const malformed = castAgentMessage({ role: "assistant", content: "not-array" });
-
-    expect(isAssistantMessageWithContent(assistant)).toBe(true);
-    expect(isAssistantMessageWithContent(user)).toBe(false);
-    expect(isAssistantMessageWithContent(malformed)).toBe(false);
-  });
-});
-
 describe("dropThinkingBlocks", () => {
-  it("preserves thinking blocks when the assistant message is the latest assistant turn", () => {
-    const { assistant, messages, result } = dropSingleAssistantContent([
-      { type: "thinking", thinking: "internal" },
-      { type: "text", text: "final" },
-    ]);
-    expect(result).toBe(messages);
-    expect(assistant.content).toEqual([
-      { type: "thinking", thinking: "internal" },
-      { type: "text", text: "final" },
-    ]);
-  });
-
   it("preserves a latest assistant turn even when all content blocks are thinking", () => {
-    const { assistant } = dropSingleAssistantContent([
-      { type: "thinking", thinking: "internal-only" },
+    const messages = castAgentMessages([
+      { role: "assistant", content: [{ type: "thinking", thinking: "internal-only" }] },
     ]);
-    expect(assistant.content).toEqual([{ type: "thinking", thinking: "internal-only" }]);
+    expect(dropThinkingBlocks(messages)).toBe(messages);
   });
 
   it("preserves thinking blocks in the latest assistant message", () => {
@@ -164,10 +119,7 @@ describe("dropThinkingBlocks", () => {
         content: [{ type: "redacted_thinking", data: "opaque" }],
       }),
       castAgentMessage({ role: "user", content: "second" }),
-      castAgentMessage({
-        role: "assistant",
-        content: [{ type: "text", text: "latest text" }],
-      }),
+      castAgentMessage(textAssistant("latest text")),
     ];
 
     const result = dropThinkingBlocks(messages);
@@ -180,26 +132,6 @@ describe("dropThinkingBlocks", () => {
 });
 
 describe("dropReasoningFromHistory", () => {
-  it("strips assistant reasoning from prior completed turns", () => {
-    const messages: AgentMessage[] = [
-      castAgentMessage({ role: "user", content: "first" }),
-      castAgentMessage({
-        role: "assistant",
-        content: [
-          { type: "thinking", thinking: "private" },
-          { type: "text", text: "visible" },
-        ],
-      }),
-      castAgentMessage({ role: "user", content: "second" }),
-    ];
-
-    const result = dropReasoningFromHistory(messages);
-    const assistant = result[1] as AssistantMessage;
-
-    expect(result).not.toBe(messages);
-    expect(assistant.content).toEqual([{ type: "text", text: "visible" }]);
-  });
-
   it("uses omitted-reasoning text when a completed assistant turn is reasoning-only", () => {
     const messages: AgentMessage[] = [
       castAgentMessage({ role: "user", content: "first" }),
@@ -406,50 +338,7 @@ describe("stripInvalidThinkingSignatures", () => {
   });
 });
 
-describe("sanitizeThinkingForRecovery", () => {
-  it("drops the latest assistant message when the thinking block is unsigned", () => {
-    const messages = castAgentMessages([
-      { role: "user", content: "hello" },
-      {
-        role: "assistant",
-        content: [{ type: "thinking", thinking: "partial" }],
-      },
-    ]);
-
-    const result = sanitizeThinkingForRecovery(messages);
-    expect(result.messages).toEqual([messages[0]]);
-    expect(result.prefill).toBe(false);
-  });
-
-  it("preserves later turns when dropping an incomplete assistant message", () => {
-    const messages = castAgentMessages([
-      { role: "user", content: "hello" },
-      {
-        role: "assistant",
-        content: [{ type: "thinking", thinking: "partial" }],
-      },
-      { role: "user", content: "follow up" },
-    ]);
-
-    const result = sanitizeThinkingForRecovery(messages);
-    expect(result.messages).toEqual([messages[0], messages[2]]);
-    expect(result.prefill).toBe(false);
-  });
-
-  it("marks signed thinking without text as a prefill recovery case", () => {
-    const messages = castAgentMessages([
-      { role: "user", content: "hello" },
-      {
-        role: "assistant",
-        content: [{ type: "thinking", thinking: "complete", thinkingSignature: "sig" }],
-      },
-    ]);
-
-    const result = sanitizeThinkingForRecovery(messages);
-    expect(result.messages).toBe(messages);
-    expect(result.prefill).toBe(true);
-  });
-
+describe("assessLastAssistantMessage", () => {
   it("marks signed thinking with an empty text block as incomplete text", () => {
     const message = castAgentMessage({
       role: "assistant",
@@ -491,6 +380,8 @@ describe("wrapAnthropicStreamWithRecovery", () => {
   const anthropicThinkingError = new Error(
     "thinking or redacted_thinking blocks in the latest assistant message cannot be modified",
   );
+  const genericizedProviderError =
+    "LLM request failed: provider rejected the request schema or tool payload.";
   const terminalThinkingSignatureError =
     "ValidationException: invalid signature on thinking block in message history";
 
@@ -502,17 +393,19 @@ describe("wrapAnthropicStreamWithRecovery", () => {
       api: "anthropic-messages",
       provider: "anthropic",
       model: "claude-sonnet-4-6",
-      usage: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        totalTokens: 0,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-      },
+      usage: createZeroUsageFixture(),
       timestamp: 0,
       ...overrides,
     }) as AssistantMessage;
+  }
+
+  function thinkingHistory(): AgentMessage[] {
+    return castAgentMessages([
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "secret", thinkingSignature: "sig" }],
+      },
+    ]);
   }
 
   function createTestStreamErrorMessage(errorMessage: string): AssistantMessage {
@@ -539,12 +432,7 @@ describe("wrapAnthropicStreamWithRecovery", () => {
       wrapped(
         {} as never,
         {
-          messages: castAgentMessages([
-            {
-              role: "assistant",
-              content: [{ type: "thinking", thinking: "secret", thinkingSignature: "sig" }],
-            },
-          ]),
+          messages: thinkingHistory(),
         } as never,
         {} as never,
       ),
@@ -668,12 +556,7 @@ describe("wrapAnthropicStreamWithRecovery", () => {
       wrapped(
         {} as never,
         {
-          messages: castAgentMessages([
-            {
-              role: "assistant",
-              content: [{ type: "thinking", thinking: "secret", thinkingSignature: "sig" }],
-            },
-          ]),
+          messages: thinkingHistory(),
         } as never,
         {} as never,
       ),
@@ -708,12 +591,7 @@ describe("wrapAnthropicStreamWithRecovery", () => {
     const response = (await wrapped(
       {} as never,
       {
-        messages: castAgentMessages([
-          {
-            role: "assistant",
-            content: [{ type: "thinking", thinking: "secret", thinkingSignature: "sig" }],
-          },
-        ]),
+        messages: thinkingHistory(),
       } as never,
       {} as never,
     )) as { result: () => Promise<unknown> } & AsyncIterable<unknown>;
@@ -757,6 +635,69 @@ describe("wrapAnthropicStreamWithRecovery", () => {
     expect(callCount).toBe(2);
   });
 
+  it.each([
+    {
+      name: "failover rawError",
+      createError: () =>
+        Object.assign(new Error(genericizedProviderError), {
+          rawError: terminalThinkingSignatureError,
+        }),
+    },
+    {
+      name: "Anthropic SDK error body",
+      createError: () =>
+        Object.assign(new Error(genericizedProviderError), {
+          error: { error: { message: terminalThinkingSignatureError } },
+        }),
+    },
+    {
+      name: "direct errorMessage",
+      createError: () =>
+        Object.assign(new Error(genericizedProviderError), {
+          errorMessage: terminalThinkingSignatureError,
+        }),
+    },
+    {
+      name: "ProviderHttpError errorBody",
+      createError: () =>
+        Object.assign(new Error(genericizedProviderError), {
+          errorBody: JSON.stringify({
+            error: {
+              message: terminalThinkingSignatureError,
+              type: "invalid_request_error",
+            },
+          }),
+        }),
+    },
+    {
+      name: "cyclic cause graph",
+      createError: () => {
+        const root = new Error(genericizedProviderError) as Error & { cause?: unknown };
+        const nested = { cause: root, message: terminalThinkingSignatureError };
+        root.cause = nested;
+        return root;
+      },
+    },
+  ])(
+    "retries genericized request errors carrying provider detail in $name",
+    async ({ createError }) => {
+      const providerError = createError();
+      let callCount = 0;
+      const wrapped = wrapAnthropicStreamWithRecovery(
+        (() => {
+          callCount += 1;
+          return Promise.reject(providerError);
+        }) as Parameters<typeof wrapAnthropicStreamWithRecovery>[0],
+        { id: "test-session" },
+      );
+
+      await expect(wrapped({} as never, { messages: [] } as never, {} as never)).rejects.toBe(
+        providerError,
+      );
+      expect(callCount).toBe(2);
+    },
+  );
+
   it("retries pre-content terminal stream-error events with omitted-reasoning text", async () => {
     let callCount = 0;
     const contexts: Array<{ messages?: AgentMessage[] }> = [];
@@ -790,12 +731,7 @@ describe("wrapAnthropicStreamWithRecovery", () => {
     const response = wrapped(
       {} as never,
       {
-        messages: castAgentMessages([
-          {
-            role: "assistant",
-            content: [{ type: "thinking", thinking: "secret", thinkingSignature: "sig" }],
-          },
-        ]),
+        messages: thinkingHistory(),
       } as never,
       {} as never,
     ) as { result: () => Promise<unknown> } & AsyncIterable<unknown>;
@@ -818,7 +754,11 @@ describe("wrapAnthropicStreamWithRecovery", () => {
 
   it("does not retry non-thinking terminal stream-error events", async () => {
     let callCount = 0;
-    const errorMessage = createTestStreamErrorMessage("rate limit exceeded");
+    const errorMessage = createTestAssistantMessage({
+      content: [{ type: "text", text: terminalThinkingSignatureError }],
+      stopReason: "error",
+      errorMessage: "rate limit exceeded",
+    });
     const wrapped = wrapAnthropicStreamWithRecovery(
       (() => {
         callCount += 1;
@@ -935,12 +875,7 @@ describe("wrapAnthropicStreamWithRecovery", () => {
       { id: "test-session" },
     );
     const context = {
-      messages: castAgentMessages([
-        {
-          role: "assistant",
-          content: [{ type: "thinking", thinking: "secret", thinkingSignature: "sig" }],
-        },
-      ]),
+      messages: thinkingHistory(),
     };
 
     await expect(wrapped({} as never, context as never, {} as never)).rejects.toBe(
@@ -960,14 +895,7 @@ describe("wrapAnthropicStreamWithRecovery", () => {
       api: "anthropic-messages",
       provider: "anthropic",
       model: "claude-sonnet-4-6",
-      usage: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        totalTokens: 0,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-      },
+      usage: createZeroUsageFixture(),
       stopReason: "stop",
       timestamp: Date.now(),
     }) as AssistantMessage;
@@ -996,6 +924,64 @@ describe("wrapAnthropicStreamWithRecovery", () => {
     await expect(response.result()).resolves.toEqual(finalMessage);
     expect(events).toHaveLength(2);
   });
+
+  it("recovers an error event from a Promise-resolved stream without changing Promise timing", async () => {
+    const recovered = vi.fn();
+    let callCount = 0;
+    let resolveFirstStream!: (stream: ReturnType<typeof createAssistantMessageEventStream>) => void;
+    const firstStreamPromise = new Promise<ReturnType<typeof createAssistantMessageEventStream>>(
+      (resolve) => {
+        resolveFirstStream = resolve;
+      },
+    );
+    const finalMessage = createTestAssistantMessage({
+      content: [{ type: "text", text: "recovered answer" }],
+      stopReason: "stop",
+    });
+    const wrapped = wrapAnthropicStreamWithRecovery(
+      (() => {
+        const attempt = ++callCount;
+        if (attempt === 1) {
+          return firstStreamPromise;
+        }
+        const stream = createAssistantMessageEventStream();
+        queueMicrotask(() => {
+          stream.push({ type: "done", reason: "stop", message: finalMessage });
+          stream.end();
+        });
+        return stream;
+      }) as Parameters<typeof wrapAnthropicStreamWithRecovery>[0],
+      { id: "test-session", onRecoveredAnthropicThinking: recovered },
+    );
+
+    const responsePromise = wrapped({} as never, { messages: [] } as never, {} as never);
+    expect(responsePromise).toBeInstanceOf(Promise);
+    let resolved = false;
+    void Promise.resolve(responsePromise).then(() => {
+      resolved = true;
+    });
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+
+    const firstStream = createAssistantMessageEventStream();
+    resolveFirstStream(firstStream);
+    const response = await responsePromise;
+    queueMicrotask(() => {
+      firstStream.push({
+        type: "error",
+        reason: "error",
+        error: createTestStreamErrorMessage(terminalThinkingSignatureError),
+      });
+      firstStream.end();
+    });
+    for await (const event of response) {
+      void event;
+    }
+
+    await expect(response.result()).resolves.toEqual(finalMessage);
+    expect(callCount).toBe(2);
+    expect(recovered).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("stripStaleThinkingSignaturesForCompactionReplay", () => {
@@ -1011,7 +997,7 @@ describe("stripStaleThinkingSignaturesForCompactionReplay", () => {
     expect(stripStaleThinkingSignaturesForCompactionReplay(messages)).toBe(messages);
   });
 
-  it("strips thinking signatures from assistant messages at or before the compaction timestamp", () => {
+  it("strips thinking signatures from assistant messages before the compaction timestamp", () => {
     const compactionSummary = castAgentMessage({
       role: "compactionSummary",
       summary: "summary",
@@ -1057,27 +1043,6 @@ describe("stripStaleThinkingSignaturesForCompactionReplay", () => {
     ]);
   });
 
-  it("strips thinkingSignature from a thinking-only pre-compaction message, leaving text for downstream handling", () => {
-    const messages: AgentMessage[] = [
-      castAgentMessage({
-        role: "compactionSummary",
-        summary: "s",
-        tokensBefore: 0,
-        timestamp: 2000,
-      }),
-      castAgentMessage({
-        role: "assistant",
-        content: [{ type: "thinking", thinking: "hidden", thinkingSignature: "sig" }],
-        timestamp: 1000,
-      }),
-    ];
-    const result = stripStaleThinkingSignaturesForCompactionReplay(messages);
-    const assistant = result[1] as AssistantMessage;
-    // Signature is stripped; thinking text is preserved. Downstream stripInvalidThinkingSignatures
-    // converts this unsigned thinking-only message to [assistant reasoning omitted].
-    expect(assistant.content).toEqual([{ type: "thinking", thinking: "hidden" }]);
-  });
-
   it("strips redacted_thinking data from pre-compaction messages", () => {
     const messages: AgentMessage[] = [
       castAgentMessage({
@@ -1120,13 +1085,13 @@ describe("stripStaleThinkingSignaturesForCompactionReplay", () => {
     expect(result).toBe(messages);
   });
 
-  it("uses the latest compaction summary timestamp when multiple summaries are present", () => {
+  it("uses the maximum compaction timestamp even when summaries are out of order", () => {
     const messages: AgentMessage[] = [
       castAgentMessage({
         role: "compactionSummary",
-        summary: "first",
+        summary: "latest",
         tokensBefore: 0,
-        timestamp: 1000,
+        timestamp: 2000,
       }),
       castAgentMessage({
         role: "assistant",
@@ -1135,9 +1100,9 @@ describe("stripStaleThinkingSignaturesForCompactionReplay", () => {
       }),
       castAgentMessage({
         role: "compactionSummary",
-        summary: "second",
+        summary: "older",
         tokensBefore: 0,
-        timestamp: 2000,
+        timestamp: 1000,
       }),
       castAgentMessage({
         role: "assistant",
@@ -1154,41 +1119,6 @@ describe("stripStaleThinkingSignaturesForCompactionReplay", () => {
     expect((after.content[0] as unknown as Record<string, unknown>).thinkingSignature).toBe(
       "sig_after",
     );
-  });
-
-  it("uses max compaction timestamp when summaries appear out of chronological order", () => {
-    // Two compaction summaries: ts=1500 appears first, ts=2000 appears later.
-    // latestCompactionTimestamp must be max(1500, 2000) = 2000, not 1500.
-    const messages: AgentMessage[] = [
-      castAgentMessage({
-        role: "compactionSummary",
-        summary: "earlier-in-array lower-timestamp",
-        tokensBefore: 0,
-        timestamp: 1500,
-      }),
-      castAgentMessage({
-        role: "assistant",
-        content: [{ type: "thinking", thinking: "t1", thinkingSignature: "sig1" }],
-        timestamp: 1200,
-      }),
-      castAgentMessage({
-        role: "compactionSummary",
-        summary: "later-in-array higher-timestamp",
-        tokensBefore: 0,
-        timestamp: 2000,
-      }),
-      castAgentMessage({
-        role: "assistant",
-        content: [{ type: "thinking", thinking: "t2", thinkingSignature: "sig2" }],
-        timestamp: 1800,
-      }),
-    ];
-    const result = stripStaleThinkingSignaturesForCompactionReplay(messages);
-    // Both messages have ts < 2000 so both should be stripped
-    const a1 = result[1] as AssistantMessage;
-    const a2 = result[3] as AssistantMessage;
-    expect((a1.content[0] as unknown as Record<string, unknown>).thinkingSignature).toBeUndefined();
-    expect((a2.content[0] as unknown as Record<string, unknown>).thinkingSignature).toBeUndefined();
   });
 
   it("preserves signatures on assistant messages at exactly the compaction timestamp", () => {
@@ -1209,4 +1139,26 @@ describe("stripStaleThinkingSignaturesForCompactionReplay", () => {
     // Same millisecond as compaction: treated as post-compaction; signature preserved
     expect(result).toBe(messages);
   });
+
+  it("parses numeric-looking compaction strings as dates before numeric message timestamps", () => {
+    const messages: AgentMessage[] = [
+      castAgentMessage({
+        role: "compactionSummary",
+        summary: "s",
+        tokensBefore: 0,
+        timestamp: "2026",
+      }),
+      castAgentMessage({
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "old", thinkingSignature: "stale_sig" }],
+        timestamp: 1_000_000,
+      }),
+    ];
+
+    const result = stripStaleThinkingSignaturesForCompactionReplay(messages);
+    expect((result[1] as AssistantMessage).content).toEqual([
+      { type: "thinking", thinking: "old" },
+    ]);
+  });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

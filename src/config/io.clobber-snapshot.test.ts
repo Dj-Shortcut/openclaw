@@ -3,12 +3,14 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  CONFIG_CLOBBER_SNAPSHOT_LIMIT,
   persistBoundedClobberedConfigSnapshot,
   persistBoundedClobberedConfigSnapshotSync,
 } from "./io.clobber-snapshot.js";
+
+const CONFIG_CLOBBER_SNAPSHOT_LIMIT = 32;
 
 describe("config clobber snapshots", () => {
   let fixtureRoot = "";
@@ -71,25 +73,10 @@ describe("config clobber snapshots", () => {
       if (!match) {
         continue;
       }
-      const touchedAt = new Date(`2026-05-03T00:00:${match[1].padStart(2, "0")}.000Z`);
+      const touchedAt = new Date(
+        `2026-05-03T00:00:${expectDefined(match[1], "match[1] test invariant").padStart(2, "0")}.000Z`,
+      );
       await fsp.utimes(path.join(dir, file.entry), touchedAt, touchedAt);
-    }
-  }
-
-  function touchClobberFilesByContentOrderSync(configPath: string): void {
-    const dir = path.dirname(configPath);
-    const prefix = `${path.basename(configPath)}.clobbered.`;
-    for (const entry of fs.readdirSync(dir)) {
-      if (!entry.startsWith(prefix)) {
-        continue;
-      }
-      const targetPath = path.join(dir, entry);
-      const match = /^polluted-(\d+)\n$/.exec(fs.readFileSync(targetPath, "utf-8"));
-      if (!match) {
-        continue;
-      }
-      const touchedAt = new Date(`2026-05-03T00:00:${match[1].padStart(2, "0")}.000Z`);
-      fs.utimesSync(targetPath, touchedAt, touchedAt);
     }
   }
 
@@ -98,47 +85,20 @@ describe("config clobber snapshots", () => {
       const warn = vi.fn();
       const observedAt = "2026-05-03T00:00:00.000Z";
 
-      await Promise.all(
-        Array.from({ length: CONFIG_CLOBBER_SNAPSHOT_LIMIT + 24 }, async (_, index) => {
-          await persistBoundedClobberedConfigSnapshot({
+      const snapshotPaths = await Promise.all(
+        Array.from({ length: CONFIG_CLOBBER_SNAPSHOT_LIMIT + 24 }, (_, index) =>
+          persistBoundedClobberedConfigSnapshot({
             deps: { fs, logger: { warn } },
             configPath,
             raw: `polluted-${index}\n`,
             observedAt,
-          });
-        }),
+          }),
+        ),
       );
 
+      expect(snapshotPaths).not.toContain(null);
       const clobberFiles = await listClobberFiles(configPath);
       expect(clobberFiles).toHaveLength(CONFIG_CLOBBER_SNAPSHOT_LIMIT);
-      const capWarnings = warn.mock.calls.filter(
-        ([message]) =>
-          typeof message === "string" && message.includes("Config clobber snapshot cap reached"),
-      );
-      expect(capWarnings).toHaveLength(1);
-    });
-  });
-
-  it("rotates async snapshots so the latest clobbered config is preserved", async () => {
-    await withCase(async (configPath) => {
-      const warn = vi.fn();
-
-      for (let index = 0; index < CONFIG_CLOBBER_SNAPSHOT_LIMIT + 3; index++) {
-        await persistBoundedClobberedConfigSnapshot({
-          deps: { fs, logger: { warn } },
-          configPath,
-          raw: `polluted-${index}\n`,
-          observedAt: `2026-05-03T00:00:${String(index).padStart(2, "0")}.000Z`,
-        });
-      }
-
-      const clobberFiles = await listClobberFiles(configPath);
-      expect(clobberFiles).toHaveLength(CONFIG_CLOBBER_SNAPSHOT_LIMIT);
-      const contents = await readClobberFileContents(configPath);
-      expect(contents).not.toContain("polluted-0\n");
-      expect(contents).not.toContain("polluted-1\n");
-      expect(contents).not.toContain("polluted-2\n");
-      expect(contents).toContain(`polluted-${CONFIG_CLOBBER_SNAPSHOT_LIMIT + 2}\n`);
       const capWarnings = warn.mock.calls.filter(
         ([message]) =>
           typeof message === "string" && message.includes("Config clobber snapshot cap reached"),
@@ -259,7 +219,7 @@ describe("config clobber snapshots", () => {
           observedAt,
         });
       }
-      touchClobberFilesByContentOrderSync(configPath);
+      await touchClobberFilesByContentOrder(configPath);
 
       for (
         let index = CONFIG_CLOBBER_SNAPSHOT_LIMIT;

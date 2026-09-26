@@ -1,16 +1,14 @@
-// Telegram helper module supports network config behavior.
 import * as dns from "node:dns";
 import process from "node:process";
 import type { TelegramNetworkConfig } from "openclaw/plugin-sdk/config-contracts";
 import { isTruthyEnvValue, isWSL2Sync } from "openclaw/plugin-sdk/runtime-env";
 import { normalizeOptionalLowercaseString } from "openclaw/plugin-sdk/string-coerce-runtime";
 
-export const TELEGRAM_DISABLE_AUTO_SELECT_FAMILY_ENV =
-  "OPENCLAW_TELEGRAM_DISABLE_AUTO_SELECT_FAMILY";
-export const TELEGRAM_ENABLE_AUTO_SELECT_FAMILY_ENV = "OPENCLAW_TELEGRAM_ENABLE_AUTO_SELECT_FAMILY";
+const TELEGRAM_DISABLE_AUTO_SELECT_FAMILY_ENV = "OPENCLAW_TELEGRAM_DISABLE_AUTO_SELECT_FAMILY";
+const TELEGRAM_ENABLE_AUTO_SELECT_FAMILY_ENV = "OPENCLAW_TELEGRAM_ENABLE_AUTO_SELECT_FAMILY";
 export const TELEGRAM_DNS_RESULT_ORDER_ENV = "OPENCLAW_TELEGRAM_DNS_RESULT_ORDER";
 
-export type TelegramAutoSelectFamilyDecision = {
+type TelegramAutoSelectFamilyDecision = {
   value: boolean | null;
   source?: string;
 };
@@ -18,15 +16,11 @@ export type TelegramAutoSelectFamilyDecision = {
 let wsl2SyncCache: boolean | undefined;
 
 function isWSL2SyncCached(): boolean {
-  if (typeof wsl2SyncCache === "boolean") {
-    return wsl2SyncCache;
-  }
-  wsl2SyncCache = isWSL2Sync();
-  return wsl2SyncCache;
+  return (wsl2SyncCache ??= isWSL2Sync());
 }
 
-export type TelegramDnsResultOrderDecision = {
-  value: string | null;
+type TelegramDnsResultOrderDecision = {
+  value: "ipv4first" | "verbatim" | null;
   source?: string;
 };
 
@@ -83,16 +77,12 @@ export function resolveTelegramDnsResultOrderDecision(params?: {
       ? params.nodeMajor
       : Number(process.versions.node.split(".")[0]);
 
-  // Check environment variable
   const envValue = normalizeOptionalLowercaseString(env[TELEGRAM_DNS_RESULT_ORDER_ENV]);
   if (envValue === "ipv4first" || envValue === "verbatim") {
     return { value: envValue, source: `env:${TELEGRAM_DNS_RESULT_ORDER_ENV}` };
   }
 
-  // Check config
-  const configValue = normalizeOptionalLowercaseString(
-    (params?.network as { dnsResultOrder?: string } | undefined)?.dnsResultOrder,
-  );
+  const configValue = normalizeOptionalLowercaseString(params?.network?.dnsResultOrder);
   if (configValue === "ipv4first" || configValue === "verbatim") {
     return { value: configValue, source: "config" };
   }
@@ -112,8 +102,4 @@ export function resolveTelegramDnsResultOrderDecision(params?: {
   }
 
   return { value: null };
-}
-
-export function resetTelegramNetworkConfigStateForTests(): void {
-  wsl2SyncCache = undefined;
 }
